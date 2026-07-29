@@ -31,6 +31,7 @@ const { spawnSync, spawn } = require('node:child_process');
 const { createTempProject, cleanup, TOOLS_PATH } = require('./helpers.cjs');
 
 const { routeGithubSyncCommandRouter } = require('../gsd-core/bin/lib/github-sync-command-router.cjs');
+const { PREFLIGHT_REASON } = require('../gsd-core/bin/lib/github-sync-auth.cjs');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -352,7 +353,121 @@ describe('github-sync router: CAP-02 concurrency and interrupt evidence (subproc
   );
 });
 
-// ─── 4. SAFE-02 — every declared contribution carries onError: skip ─────────
+// ─── 4. D-11 containment matrix (throwing injected seams, WR-03) ────────────
+//
+// REVIEW.md WR-03: `activeCheck(...)` (call site A) and `auth.runPreflight(cwd)`
+// (call site B) are called with no local try/catch. Neither throws today, but
+// if either did, the exception would reach command-routing-hub.cjs's
+// dispatch(), become a HandlerFailure, and set a non-zero exit code —
+// contradicting D-11/SAFE-01's universal exit-0 contract. These tests inject
+// throwing seams at both call sites and assert the containment holds for an
+// Error, a bare string, and undefined alike, and that a distinctive marker
+// carried in the thrown value never leaks into stdout or stderr.
+
+/** Normalize a buffer-form or string-form fs.writeSync call to the chunk it emits. */
+function chunkOfWriteSyncArgs(data, offset, length) {
+  if (Buffer.isBuffer(data)) {
+    const start = offset ?? 0;
+    const end = length === undefined ? data.length : start + length;
+    return data.subarray(start, end).toString('utf8');
+  }
+  return String(data);
+}
+
+describe('github-sync router: D-11 containment matrix (throwing injected seams)', () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  // One array so a thrown Error, a bare string, and undefined are each
+  // exercised on both guarded call sites — the non-Error cases are not an
+  // afterthought.
+  const THROW_VARIANTS = [
+    { label: 'Error', throwIt: (marker) => { throw new Error(marker); } },
+    { label: 'bare string', throwIt: (marker) => { throw marker; } },
+    { label: 'undefined', throwIt: () => { throw undefined; } },
+  ];
+
+  for (const { label, throwIt } of THROW_VARIANTS) {
+    test(`capability-state resolution throwing a ${label}: exits 0, one stderr line, never reaches error() or _auth.runPreflight, no marker leak (WR-03/D-11)`, () => {
+      const marker = `MARKER_CAP_STATE_${label.replace(/\s+/g, '_')}`;
+      const stderrChunks = [];
+      mock.method(process.stderr, 'write', (chunk) => { stderrChunks.push(String(chunk)); return true; });
+
+      let errorCalled = false;
+      let preflightCalled = false;
+      process.exitCode = 0;
+
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'preflight'],
+        cwd: '/fake/cwd',
+        raw: false,
+        error: () => { errorCalled = true; },
+        _isCapabilityActive: () => { throwIt(marker); },
+        _auth: { runPreflight() { preflightCalled = true; return { ok: true, reason: PREFLIGHT_REASON.OK, message: 'x' }; } },
+      });
+
+      assert.strictEqual(process.exitCode, 0, `${label}: process.exitCode must stay 0`);
+      assert.strictEqual(stderrChunks.length, 1, `${label}: exactly one stderr write; got: ${JSON.stringify(stderrChunks)}`);
+      assert.strictEqual(errorCalled, false, `${label}: the injected error() callback must never be called`);
+      assert.strictEqual(preflightCalled, false, `${label}: the injected _auth.runPreflight must never be called`);
+
+      const stderrText = stderrChunks.join('');
+      assert.ok(!stderrText.includes('github_sync.enabled'),
+        `${label}: the containment message must be distinguishable from the ordinary disabled message; got: ${stderrText}`);
+      assert.ok(!stderrText.includes(marker),
+        `${label}: the thrown value's marker must never leak into stderr (binding-less catch); got: ${stderrText}`);
+    });
+  }
+
+  for (const { label, throwIt } of THROW_VARIANTS) {
+    test(`preflight call throwing a ${label}: exits 0, output has ok:false reason:OUTAGE, no marker leak (WR-03/D-11)`, () => {
+      const marker = `MARKER_PREFLIGHT_${label.replace(/\s+/g, '_')}`;
+      const stderrChunks = [];
+      mock.method(process.stderr, 'write', (chunk) => { stderrChunks.push(String(chunk)); return true; });
+
+      const stdoutChunks = [];
+      mock.method(fs, 'writeSync', (fd, data, offset, length) => {
+        const chunk = chunkOfWriteSyncArgs(data, offset, length);
+        stdoutChunks.push(chunk);
+        return Buffer.byteLength(chunk, 'utf8');
+      });
+
+      let errorCalled = false;
+      process.exitCode = 0;
+
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'preflight'],
+        cwd: '/fake/cwd',
+        raw: false,
+        error: () => { errorCalled = true; },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight() { throwIt(marker); } },
+      });
+
+      assert.strictEqual(process.exitCode, 0, `${label}: process.exitCode must stay 0`);
+      assert.strictEqual(errorCalled, false, `${label}: the injected error() callback must never be called — containment happens inside the handler`);
+
+      const stdoutText = stdoutChunks.join('');
+      let parsed;
+      assert.doesNotThrow(() => { parsed = JSON.parse(stdoutText); },
+        `${label}: output(...) must still emit valid JSON; got: ${stdoutText}`);
+      assert.strictEqual(parsed.ok, false, `${label}: output object's ok must be strictly false; got: ${JSON.stringify(parsed)}`);
+      assert.strictEqual(parsed.reason, PREFLIGHT_REASON.OUTAGE,
+        `${label}: output object's reason must be strictly PREFLIGHT_REASON.OUTAGE; got: ${JSON.stringify(parsed)}`);
+      assert.ok(typeof parsed.message === 'string' && parsed.message.length > 0,
+        `${label}: output object's message must be a non-empty string; got: ${JSON.stringify(parsed)}`);
+
+      const stderrText = stderrChunks.join('');
+      assert.ok(!stdoutText.includes(marker),
+        `${label}: the thrown value's marker must never leak into stdout (binding-less catch); got: ${stdoutText}`);
+      assert.ok(!stderrText.includes(marker),
+        `${label}: the thrown value's marker must never leak into stderr (binding-less catch); got: ${stderrText}`);
+    });
+  }
+});
+
+// ─── 5. SAFE-02 — every declared contribution carries onError: skip ─────────
 
 describe('github-sync capability manifest: SAFE-02 structural rule', () => {
   test('hooks and contributions are arrays; every contribution declares onError: skip', () => {
