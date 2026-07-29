@@ -26,7 +26,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const childProcess = require('node:child_process');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, spawn } = require('node:child_process');
 
 const { createTempProject, cleanup, TOOLS_PATH } = require('./helpers.cjs');
 
@@ -81,6 +81,36 @@ function runGithubSync(args, cwd, envOverrides = {}) {
     stdout: (result.stdout || '').trim(),
     stderr: (result.stderr || '').trim(),
   };
+}
+
+/**
+ * Async, non-blocking counterpart to `runGithubSync()`. Uses `spawn` (not
+ * `spawnSync`) so multiple children can run concurrently — calling
+ * `runGithubSync` in a loop would serialize the seven invocations and prove
+ * nothing about concurrency (CAP-02).
+ *
+ * Returns `{ child, promise }`: `child` is the live handle (needed by the
+ * interrupt test to send SIGTERM); `promise` resolves on the child's `close`
+ * event with `{ status, signal, stdout, stderr }`. Never shells out via the
+ * `shell` spawn option, and never invokes the GNU `timeout` binary — both are
+ * non-portable on macOS/Windows.
+ */
+function spawnGithubSyncAsync(args, cwd) {
+  const child = spawn(process.execPath, [TOOLS_PATH, ...args], {
+    cwd,
+    env: process.env,
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const promise = new Promise((resolve, reject) => {
+    child.on('error', reject);
+    child.on('close', (status, signal) => {
+      resolve({ status, signal, stdout, stderr });
+    });
+  });
+  return { child, promise };
 }
 
 function enableGithubSync(planningDir) {
@@ -229,7 +259,100 @@ describe('github-sync command family: subprocess disabled/enabled matrix', () =>
   });
 });
 
-// ─── 3. SAFE-02 — every declared contribution carries onError: skip ─────────
+// ─── 3. CAP-02 concurrency and interrupt evidence (subprocess) ───────────────
+//
+// Plan 01-03's must-have "Concurrent or interrupted github-sync invocations
+// while disabled leave no file written and no partial state" was authored
+// with `verification: backstop` — proven only by inference (zero I/O per
+// single invocation implies safety under concurrency), never by an actual
+// concurrent run. This block replaces the inference with a real one: seven
+// children spawned essentially simultaneously (including a byte-identical
+// duplicate `preflight` pair — the adjacency case — and the empty-string and
+// no-subcommand-at-all degenerate cases), plus one child interrupted with
+// SIGTERM mid-flight. No ordering is asserted across children; only each
+// child's own content and the shared project's file listing are.
+
+describe('github-sync router: CAP-02 concurrency and interrupt evidence (subprocess)', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  // One array so a future subcommand string is one element away. `preflight`
+  // appears twice on purpose — two byte-identical simultaneous invocations
+  // are the collision case the guarantee has to survive.
+  const CONCURRENT_ARGS_CASES = [
+    ['github-sync', 'preflight'],
+    ['github-sync', 'preflight'],
+    ['github-sync', 'init'],
+    ['github-sync', 'sync'],
+    ['github-sync', 'status'],
+    ['github-sync', ''],
+    ['github-sync'],
+  ];
+
+  test(
+    'seven concurrent disabled invocations (including a byte-identical duplicate pair): all exit 0, byte-identical stderr, unchanged file tree (CAP-02)',
+    { timeout: 60000 },
+    async () => {
+      const before = listFilesRecursive(tmpDir);
+
+      // Start all seven children first, THEN await together — starting one
+      // and awaiting it before starting the next would reintroduce the
+      // serialization this test exists to eliminate.
+      const spawned = CONCURRENT_ARGS_CASES.map((args) => spawnGithubSyncAsync(args, tmpDir));
+      const results = await Promise.all(spawned.map((s) => s.promise));
+
+      for (const [index, result] of results.entries()) {
+        assert.strictEqual(result.status, 0,
+          `CAP-02: child ${index} (args=${JSON.stringify(CONCURRENT_ARGS_CASES[index])}) must exit 0; stderr: ${result.stderr}`);
+        assert.ok(result.stderr.trim().length > 0,
+          `CAP-02: child ${index} must write a non-empty stderr line; got: "${result.stderr}"`);
+      }
+
+      // No ordering is asserted between children — only that each child's own
+      // stderr is byte-identical to every other child's, regardless of the
+      // (unspecified, unasserted) order in which they produced it.
+      const firstStderr = results[0].stderr;
+      for (const [index, result] of results.entries()) {
+        assert.strictEqual(result.stderr, firstStderr,
+          `CAP-02: child ${index}'s stderr must be byte-identical to child 0's — the disabled message must not vary with subcommand or concurrency; got: "${result.stderr}"`);
+      }
+
+      const after = listFilesRecursive(tmpDir);
+      assert.deepStrictEqual(after, before,
+        'CAP-02: the shared temp project\'s recursive file listing must be deep-equal before and after seven concurrent disabled invocations');
+    },
+  );
+
+  test(
+    'a disabled invocation interrupted with SIGTERM mid-flight leaves the file tree unchanged, whether it had already exited or not (CAP-02)',
+    { timeout: 60000 },
+    async () => {
+      const before = listFilesRecursive(tmpDir);
+
+      const { child, promise } = spawnGithubSyncAsync(['github-sync', 'preflight'], tmpDir);
+      child.kill('SIGTERM');
+      // Intentionally NOT asserting on result.status/result.signal: whether
+      // the SIGTERM lands before or after the process finishes on its own is
+      // a genuine race, and asserting on it would make this test flaky by
+      // construction while proving nothing extra. The guarantee under test is
+      // about the file tree, and it holds in both outcomes.
+      await promise;
+
+      const after = listFilesRecursive(tmpDir);
+      assert.deepStrictEqual(after, before,
+        'CAP-02: the temp project\'s recursive file listing must be deep-equal before and after a SIGTERM-interrupted disabled invocation, regardless of whether the signal beat the process to exit');
+    },
+  );
+});
+
+// ─── 4. SAFE-02 — every declared contribution carries onError: skip ─────────
 
 describe('github-sync capability manifest: SAFE-02 structural rule', () => {
   test('hooks and contributions are arrays; every contribution declares onError: skip', () => {
