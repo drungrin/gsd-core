@@ -1407,7 +1407,9 @@ const capabilities = {
       ],
       "unsupported": []
     },
-    "skills": [],
+    "skills": [
+      "sync-github"
+    ],
     "agents": [],
     "activationKey": "github_sync.enabled",
     "config": {
@@ -3241,6 +3243,7 @@ const capabilities = {
 const bySkill = {
   "ai-integration-phase": "ai-integration",
   "code-review": "code-review",
+  "sync-github": "github-sync",
   "graphify": "graphify",
   "mempalace-recall": "mempalace",
   "mempalace-capture": "mempalace",
@@ -6086,6 +6089,9 @@ const capabilityClusters = {
   "code-review": [
     "code-review"
   ],
+  "github-sync": [
+    "sync-github"
+  ],
   "graphify": [
     "graphify"
   ],
@@ -6116,6 +6122,12 @@ const profileMembership = {
     ]
   },
   "code-review": {
+    "tier": "full",
+    "profiles": [
+      "full"
+    ]
+  },
+  "github-sync": {
     "tier": "full",
     "profiles": [
       "full"

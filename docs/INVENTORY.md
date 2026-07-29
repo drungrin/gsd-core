@@ -168,6 +168,7 @@ These six routers are descriptor-only entries that the model picks first; the bo
 | `/gsd-surface` | Toggle which skills are surfaced — apply a profile, list, or disable a cluster without reinstall. | [commands/gsd/surface.md](../commands/gsd/surface.md) |
 | `/gsd-update` | Update GSD to latest version; use `--sync` to sync skills across runtimes or `--reapply` to reapply local patches. | [commands/gsd/update.md](../commands/gsd/update.md) |
 | `/gsd-help` | Show available GSD commands and usage guide. | [commands/gsd/help.md](../commands/gsd/help.md) |
+| `/gsd-sync-github` | Mirror `.planning/` phase and plan state into a GitHub Project v2 board (one-way, disk to GitHub); `preflight` verifies `gh` CLI, auth, and `project`-scope access. | [commands/gsd/sync-github.md](../commands/gsd/sync-github.md) |
 
 ---
 

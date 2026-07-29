@@ -15,7 +15,9 @@
     ],
     "unsupported": []
   },
-  "skills": [],
+  "skills": [
+    "sync-github"
+  ],
   "agents": [],
   "activationKey": "github_sync.enabled",
   "config": {
