@@ -9,7 +9,7 @@
  * message text (#2974 precedent).
  */
 
-const { describe, test } = require('node:test');
+const { describe, test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
@@ -17,8 +17,13 @@ const {
   selectPreflightMessage,
   runPreflight,
   PREFLIGHT_REASON,
+  _resetPreflightCacheForTests,
 } = require('../gsd-core/bin/lib/github-sync-auth.cjs');
 const { GH_REASON } = require('../gsd-core/bin/lib/github-sync-gh.cjs');
+
+beforeEach(() => {
+  _resetPreflightCacheForTests();
+});
 
 function ghResult(overrides) {
   return {
@@ -270,5 +275,70 @@ describe('runPreflight message wiring', () => {
       assert.ok(result.reason.length > 0);
       assert.ok(result.message.length > 0);
     }
+  });
+});
+
+/**
+ * Task 3: the once-per-process probe cache and its explicit test-reset
+ * seam (D-12). `beforeEach` above already resets the cache before every
+ * test in this file, so each `describe` block here re-asserts the reset
+ * explicitly where the cache-state assertion is the point of the test.
+ */
+describe('preflight probe cache', () => {
+  function countingGh() {
+    let calls = 0;
+    return {
+      calls: () => calls,
+      probeProjectsV2Scope: () => {
+        calls += 1;
+        return { exitCode: 0, stdout: '{"data":{}}', stderr: '', reason: GH_REASON.OK };
+      },
+    };
+  }
+
+  test('two consecutive runPreflight calls spawn the probe exactly once', () => {
+    const gh = countingGh();
+    runPreflight('/tmp', { _gh: gh });
+    runPreflight('/tmp', { _gh: gh });
+    assert.strictEqual(gh.calls(), 1);
+  });
+
+  test('_resetPreflightCacheForTests() followed by runPreflight spawns the probe again', () => {
+    const gh = countingGh();
+    runPreflight('/tmp', { _gh: gh });
+    runPreflight('/tmp', { _gh: gh });
+    assert.strictEqual(gh.calls(), 1);
+
+    _resetPreflightCacheForTests();
+    runPreflight('/tmp', { _gh: gh });
+    assert.strictEqual(gh.calls(), 2);
+  });
+
+  test('a cached failure result is returned unchanged rather than re-probed', () => {
+    const gh = {
+      calls: 0,
+      probeProjectsV2Scope() {
+        this.calls += 1;
+        return { exitCode: 1, stdout: '', stderr: 'gh: API rate limit exceeded', reason: GH_REASON.EXIT_NONZERO };
+      },
+    };
+
+    const first = runPreflight('/tmp', { _gh: gh });
+    const second = runPreflight('/tmp', { _gh: gh });
+    assert.strictEqual(gh.calls, 1);
+    assert.deepStrictEqual(first, second);
+    assert.strictEqual(first.ok, false);
+    assert.strictEqual(first.reason, PREFLIGHT_REASON.RATE_LIMITED);
+  });
+
+  test('the module performs no filesystem write', () => {
+    const fs = require('node:fs');
+    const source = fs.readFileSync(
+      require.resolve('../gsd-core/bin/lib/github-sync-auth.cjs'),
+      'utf8',
+    );
+    assert.doesNotMatch(source, /writeFileSync/);
+    assert.doesNotMatch(source, /platformWriteSync/);
+    assert.doesNotMatch(source, /require\(["']node:fs["']\)/);
   });
 });
