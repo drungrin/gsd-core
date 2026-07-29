@@ -11,6 +11,8 @@
 
 const { describe, test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const {
   classifyGhResult,
@@ -344,5 +346,89 @@ describe('preflight probe cache', () => {
     assert.doesNotMatch(source, /writeFileSync/);
     assert.doesNotMatch(source, /platformWriteSync/);
     assert.doesNotMatch(source, /require\(["']node:fs["']\)/);
+  });
+});
+
+/**
+ * Task 1 (plan 01-07, REVIEW.md WR-01): pins the two published reason
+ * catalogs -- the hand-written command doc and its generated skill
+ * projection -- to the frozen PREFLIGHT_REASON enum in both directions.
+ * Both files quoted a `preflight_failed` reason value that
+ * `classifyGhResult` can never return; this block makes that impossible to
+ * reintroduce in either direction (a phantom value, or a new enum member
+ * landing undocumented).
+ */
+describe('published reason catalog pin (commands/gsd/sync-github.md + skills/gsd-sync-github/SKILL.md)', () => {
+  const PUBLISHED_FILES = [
+    {
+      label: 'commands/gsd/sync-github.md',
+      filePath: path.join(__dirname, '..', 'commands', 'gsd', 'sync-github.md'),
+    },
+    {
+      label: 'skills/gsd-sync-github/SKILL.md',
+      filePath: path.join(__dirname, '..', 'skills', 'gsd-sync-github', 'SKILL.md'),
+    },
+  ];
+
+  /**
+   * Extracts every JSON-shaped `"reason": "<value>"` capture from `text` and
+   * asserts each is a member of `Object.values(PREFLIGHT_REASON)` -- read at
+   * run time, never hardcoded here. Throws on the first phantom value found,
+   * naming both the value and `label`. Also throws if fewer than two reason
+   * values are captured, so a doc that stops quoting reason shapes entirely
+   * fails the pin rather than passing vacuously.
+   */
+  function assertReasonsAreEnumMembers(text, label) {
+    const validReasons = new Set(Object.values(PREFLIGHT_REASON));
+    const pattern = /"reason"\s*:\s*"([a-z_]+)"/g;
+    const captured = [];
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      captured.push(match[1]);
+    }
+    assert.ok(
+      captured.length >= 2,
+      `expected at least two JSON-shaped reason values in ${label}, found ${captured.length}`,
+    );
+    for (const value of captured) {
+      assert.ok(
+        validReasons.has(value),
+        `${label} quotes reason value "${value}" which is not a member of PREFLIGHT_REASON`,
+      );
+    }
+    return captured;
+  }
+
+  test('Direction 1 -- no phantom reasons: every quoted reason value in each published file is a real enum member', () => {
+    for (const { label, filePath } of PUBLISHED_FILES) {
+      const text = fs.readFileSync(filePath, 'utf8');
+      assertReasonsAreEnumMembers(text, label);
+    }
+  });
+
+  test('Direction 2 -- no undocumented members: every PREFLIGHT_REASON member appears somewhere in each published file', () => {
+    for (const { label, filePath } of PUBLISHED_FILES) {
+      const text = fs.readFileSync(filePath, 'utf8');
+      for (const reason of Object.values(PREFLIGHT_REASON)) {
+        assert.ok(text.includes(reason), `${label} never mentions PREFLIGHT_REASON member "${reason}"`);
+      }
+    }
+  });
+
+  test('fail-first control: the helper throws on an inline fixture carrying a phantom reason value', () => {
+    const phantomFixture =
+      '`{"ok": true, "reason": "ok", ...}` and `{"ok": false, "reason": "preflight_failed", ...}`';
+    assert.throws(() => assertReasonsAreEnumMembers(phantomFixture, 'phantom-fixture'));
+  });
+
+  test('fail-first control: the helper does not throw on an inline fixture carrying only real enum members', () => {
+    const realFixture =
+      '`{"ok": true, "reason": "ok", ...}` and `{"ok": false, "reason": "missing_gh", ...}`';
+    assert.doesNotThrow(() => assertReasonsAreEnumMembers(realFixture, 'real-fixture'));
+  });
+
+  test('non-vacuity control: the helper throws on an inline fixture with zero reason values', () => {
+    const emptyFixture = 'this text quotes no JSON-shaped reason field at all';
+    assert.throws(() => assertReasonsAreEnumMembers(emptyFixture, 'empty-fixture'));
   });
 });
