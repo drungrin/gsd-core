@@ -14,6 +14,8 @@ const assert = require('node:assert/strict');
 
 const {
   classifyGhResult,
+  selectPreflightMessage,
+  runPreflight,
   PREFLIGHT_REASON,
 } = require('../gsd-core/bin/lib/github-sync-auth.cjs');
 const { GH_REASON } = require('../gsd-core/bin/lib/github-sync-gh.cjs');
@@ -131,5 +133,142 @@ describe('classifyGhResult', () => {
     const reason = classifyGhResult(result);
     assert.strictEqual(reason, PREFLIGHT_REASON.OUTAGE);
     assert.notStrictEqual(reason, '');
+  });
+});
+
+/**
+ * Task 2: selectPreflightMessage's message catalog and D-10 environment-
+ * signal remedy selection. All environment inputs are literal objects —
+ * never a mutation of the real process.env.
+ */
+describe('selectPreflightMessage', () => {
+  test('wrong_scope with no env signal selects the developer remedy', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.WRONG_SCOPE, {});
+    assert.match(message, /gh auth refresh -s project/);
+  });
+
+  test('wrong_scope with CI set selects the CI remedy naming GH_TOKEN, not the developer remedy', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.WRONG_SCOPE, { CI: '1' });
+    assert.match(message, /GH_TOKEN/);
+    assert.doesNotMatch(message, /gh auth refresh -s project/);
+  });
+
+  test('wrong_scope with CI set to the empty string selects the developer remedy (empty counts as absent)', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.WRONG_SCOPE, { CI: '' });
+    assert.match(message, /gh auth refresh -s project/);
+  });
+
+  test('wrong_scope with GITHUB_ACTIONS set selects the CI remedy', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.WRONG_SCOPE, { GITHUB_ACTIONS: 'true' });
+    assert.match(message, /GH_TOKEN/);
+  });
+
+  test('wrong_scope with GH_TOKEN set and no CI variable selects the CI remedy', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.WRONG_SCOPE, { GH_TOKEN: 'x' });
+    assert.match(message, /GH_TOKEN/);
+  });
+
+  test('wrong_scope with GITHUB_TOKEN set and no CI variable selects the CI remedy', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.WRONG_SCOPE, { GITHUB_TOKEN: 'x' });
+    assert.match(message, /GH_TOKEN/);
+  });
+
+  test('wrong_scope with GH_TOKEN present but empty selects the developer remedy', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.WRONG_SCOPE, { GH_TOKEN: '' });
+    assert.match(message, /gh auth refresh -s project/);
+  });
+
+  test('CI remedy never suggests adjusting a workflow permissions block', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.WRONG_SCOPE, { CI: '1' });
+    assert.doesNotMatch(message, /permissions:/);
+  });
+
+  test('no_token with CI set also selects the CI remedy naming GH_TOKEN', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.NO_TOKEN, { CI: '1' });
+    assert.match(message, /GH_TOKEN/);
+  });
+
+  test('missing_gh message names installing the GitHub CLI', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.MISSING_GH, {});
+    assert.match(message, /install/i);
+  });
+
+  test('no_token message names authenticating', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.NO_TOKEN, {});
+    assert.match(message, /auth/i);
+  });
+
+  test('rate_limited message names waiting and retrying', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.RATE_LIMITED, {});
+    assert.match(message, /retry|retrying|wait/i);
+  });
+
+  test('outage message names a transient GitHub failure', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.OUTAGE, {});
+    assert.match(message, /transient|temporary|GitHub/i);
+  });
+
+  test('sso_or_null_payload message names SSO authorization as the likely cause', () => {
+    const message = selectPreflightMessage(PREFLIGHT_REASON.SSO_OR_NULL_PAYLOAD, {});
+    assert.match(message, /SSO/);
+  });
+
+  test('every PREFLIGHT_REASON member (including ok) selects a non-empty message', () => {
+    for (const reason of Object.values(PREFLIGHT_REASON)) {
+      const message = selectPreflightMessage(reason, {});
+      assert.strictEqual(typeof message, 'string');
+      assert.ok(message.length > 0, `expected a non-empty message for reason=${reason}`);
+    }
+  });
+});
+
+describe('runPreflight message wiring', () => {
+  test('never leaks raw gh stdout/stderr markers into the returned message', () => {
+    const stdoutMarker = 'zzqx-stdout-marker-9f2a';
+    const stderrMarker = 'zzqx-stderr-marker-7b31';
+    const fakeGh = {
+      probeProjectsV2Scope: () => ({
+        exitCode: 1,
+        stdout: `some payload containing ${stdoutMarker}`,
+        stderr: `gh: failure mentioning ${stderrMarker}`,
+        reason: GH_REASON.EXIT_NONZERO,
+      }),
+    };
+
+    const result = runPreflight('/tmp', { _gh: fakeGh });
+    assert.strictEqual(result.ok, false);
+    assert.doesNotMatch(result.message, new RegExp(stdoutMarker));
+    assert.doesNotMatch(result.message, new RegExp(stderrMarker));
+  });
+
+  test('returns ok:false with a populated reason and message for every failure class, and never throws', () => {
+    const cases = [
+      { reason: GH_REASON.ENOENT, exitCode: 127, stderr: '' },
+      { reason: GH_REASON.TIMEOUT, exitCode: 124, stderr: '' },
+      { reason: GH_REASON.EXIT_NONZERO, exitCode: 1, stderr: 'gh: required scopes missing' },
+      { reason: GH_REASON.EXIT_NONZERO, exitCode: 1, stderr: 'gh: Bad credentials (HTTP 401)' },
+      { reason: GH_REASON.EXIT_NONZERO, exitCode: 1, stderr: 'gh: API rate limit exceeded' },
+      { reason: GH_REASON.EXIT_NONZERO, exitCode: 1, stderr: 'gh: 503 Service Unavailable' },
+      { reason: GH_REASON.OK, exitCode: 0, stderr: '', stdout: '' },
+    ];
+
+    for (const c of cases) {
+      const fakeGh = {
+        probeProjectsV2Scope: () => ({
+          exitCode: c.exitCode,
+          stdout: c.stdout ?? '',
+          stderr: c.stderr,
+          reason: c.reason,
+        }),
+      };
+
+      let result;
+      assert.doesNotThrow(() => {
+        result = runPreflight('/tmp', { _gh: fakeGh });
+      });
+      assert.strictEqual(result.ok, false);
+      assert.ok(result.reason.length > 0);
+      assert.ok(result.message.length > 0);
+    }
   });
 });
