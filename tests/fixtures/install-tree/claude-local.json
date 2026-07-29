@@ -95,6 +95,7 @@
   "commands/gsd-spike.md",
   "commands/gsd-stats.md",
   "commands/gsd-surface.md",
+  "commands/gsd-sync-github.md",
   "commands/gsd-thread.md",
   "commands/gsd-ui-phase.md",
   "commands/gsd-ui-review.md",

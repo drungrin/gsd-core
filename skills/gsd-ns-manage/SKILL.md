@@ -22,6 +22,7 @@ Route to the appropriate management skill based on the user's intent.
 | Update the GSD installation | gsd-update |
 | Ship completed work | gsd-ship |
 | Process inbox items | gsd-inbox |
+| Mirror .planning/ state to a GitHub Project v2 board | gsd-sync-github |
 | Create a clean PR branch | gsd-pr-branch |
 | Undo the last GSD action | gsd-undo |
 | Archive accumulated phase directories | gsd-cleanup |

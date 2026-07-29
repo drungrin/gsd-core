@@ -60,6 +60,7 @@
   ".agents/skills/gsd-spike/SKILL.md",
   ".agents/skills/gsd-stats/SKILL.md",
   ".agents/skills/gsd-surface/SKILL.md",
+  ".agents/skills/gsd-sync-github/SKILL.md",
   ".agents/skills/gsd-thread/SKILL.md",
   ".agents/skills/gsd-ui-phase/SKILL.md",
   ".agents/skills/gsd-ui-review/SKILL.md",

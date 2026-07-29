@@ -501,6 +501,11 @@ const KNOWN_SKILLS = new Set([
   'spike.md',
   'stats.md',
   'surface.md',
+  // Phase 01-04 (CAP-01/CAP-05): the first user-invocable surface of the
+  // github-sync capability — a genuinely new command, not a consolidation
+  // candidate of existing functionality, so it is registered here rather
+  // than folded away.
+  'sync-github.md',
   'thread.md',
   'ui-phase.md',
   'ui-review.md',

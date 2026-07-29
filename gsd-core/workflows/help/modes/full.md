@@ -665,6 +665,7 @@ The commands above cover the most common day-to-day flows. Every command listed 
 ### Repository Integration
 
 - **`/gsd:inbox [--issues] [--prs] [--label] [--close-incomplete] [--repo owner/repo]`** — Triage and review open GitHub issues and PRs against project templates and contribution guidelines.
+- **`/gsd:sync-github [preflight]`** — Mirror `.planning/` phase and plan state into a GitHub Project v2 board (one-way, disk to GitHub). `preflight` is the only subcommand shipped so far.
 
 ### Namespace Routers (model-facing meta-skills)
 

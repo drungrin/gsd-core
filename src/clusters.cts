@@ -79,6 +79,7 @@ export const CLUSTERS: ClusterMap = Object.freeze({
     'thread',
     'capture',
     'inbox',
+    'sync-github',
   ]),
 
   docs: Object.freeze([
