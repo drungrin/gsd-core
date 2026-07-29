@@ -25,8 +25,8 @@ interface GhResult {
   exitCode: number;
   stdout: string;
   stderr: string;
-  signal: NodeJS.Signals | null;
-  error: Error | null;
+  reason: string;
+  timeout_ms?: number;
 }
 
 interface GhModule {

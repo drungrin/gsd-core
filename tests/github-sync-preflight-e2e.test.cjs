@@ -102,7 +102,6 @@ describe('github-sync preflight — end to end', () => {
   });
 
   test('registry dispatch: github-sync family resolves to the command router module', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const registry = require('../gsd-core/bin/lib/capability-registry.cjs');
     const entry = registry.commandFamilies['github-sync'];
     assert.ok(entry, 'registry.commandFamilies must include a "github-sync" entry');
