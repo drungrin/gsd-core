@@ -130,8 +130,8 @@ function routeGithubSyncCommandRouter({
         // means the D-11 exit-0 contract no longer rests on that module
         // continuing not to throw. The result is constructed locally on a
         // throw so the untouched lines below (stderr write + output()) carry
-        // the same exit-0/JSON-shape contract as an ordinary preflight
-        // failure.
+        // the same exit-0/JSON-shape contract that an ordinary preflight
+        // failure carries.
         let result: PreflightResult;
         try {
           result = auth.runPreflight(cwd);
