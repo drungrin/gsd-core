@@ -1390,6 +1390,45 @@ const capabilities = {
       }
     ]
   },
+  "github-sync": {
+    "id": "github-sync",
+    "role": "feature",
+    "version": "1.8.0",
+    "title": "GitHub Project mirror",
+    "description": "Mirrors `.planning/` phase and plan state into a GitHub Project v2 board, one-way (disk → GitHub). Default-off. Phase 1 ships only the capability shell and an auth preflight (`gsd-tools github-sync preflight`); the sync engine, bootstrap, and issue/sub-issue writes land in later phases.",
+    "tier": "full",
+    "requires": [],
+    "engines": {
+      "gsd": ">=1.7.0"
+    },
+    "runtimeCompat": {
+      "supported": [
+        "*"
+      ],
+      "unsupported": []
+    },
+    "skills": [],
+    "agents": [],
+    "activationKey": "github_sync.enabled",
+    "config": {
+      "github_sync.enabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable the github-sync GitHub Project v2 mirror capability."
+      }
+    },
+    "commands": [
+      {
+        "family": "github-sync",
+        "module": "github-sync-command-router.cjs",
+        "router": "routeGithubSyncCommandRouter"
+      }
+    ],
+    "hooks": [],
+    "steps": [],
+    "contributions": [],
+    "gates": []
+  },
   "graphify": {
     "id": "graphify",
     "role": "feature",
@@ -3809,6 +3848,7 @@ const configKeys = {
   "external_job.submit_timeout_ms": "external-job",
   "external_job.poll_timeout_ms": "external-job",
   "workflow.post_planning_gaps": "gap-analysis",
+  "github_sync.enabled": "github-sync",
   "graphify.enabled": "graphify",
   "intel.enabled": "intel",
   "mempalace.enabled": "mempalace",
@@ -3966,6 +4006,12 @@ const configSchema = {
     "type": "boolean",
     "default": true,
     "description": "Run the post-planning gap analysis report after plans are generated."
+  },
+  "github_sync.enabled": {
+    "owner": "github-sync",
+    "type": "boolean",
+    "default": false,
+    "description": "Enable the github-sync GitHub Project v2 mirror capability."
   },
   "graphify.enabled": {
     "owner": "graphify",
@@ -5996,6 +6042,11 @@ const commandFamilies = {
     "module": "profile-pipeline-command-router.cjs",
     "router": "routeGenerateDevPreferences"
   },
+  "github-sync": {
+    "capId": "github-sync",
+    "module": "github-sync-command-router.cjs",
+    "router": "routeGithubSyncCommandRouter"
+  },
   "graphify": {
     "capId": "graphify",
     "module": "graphify-command-router.cjs",
@@ -6126,6 +6177,7 @@ const _requiresGraph = {
   "drift": [],
   "external-job": [],
   "gap-analysis": [],
+  "github-sync": [],
   "graphify": [],
   "hermes": [],
   "intel": [],

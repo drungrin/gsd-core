@@ -1,0 +1,39 @@
+{
+  "id": "github-sync",
+  "role": "feature",
+  "version": "1.8.0",
+  "title": "GitHub Project mirror",
+  "description": "Mirrors `.planning/` phase and plan state into a GitHub Project v2 board, one-way (disk → GitHub). Default-off. Phase 1 ships only the capability shell and an auth preflight (`gsd-tools github-sync preflight`); the sync engine, bootstrap, and issue/sub-issue writes land in later phases.",
+  "tier": "full",
+  "requires": [],
+  "engines": {
+    "gsd": ">=1.7.0"
+  },
+  "runtimeCompat": {
+    "supported": [
+      "*"
+    ],
+    "unsupported": []
+  },
+  "skills": [],
+  "agents": [],
+  "activationKey": "github_sync.enabled",
+  "config": {
+    "github_sync.enabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable the github-sync GitHub Project v2 mirror capability."
+    }
+  },
+  "commands": [
+    {
+      "family": "github-sync",
+      "module": "github-sync-command-router.cjs",
+      "router": "routeGithubSyncCommandRouter"
+    }
+  ],
+  "hooks": [],
+  "steps": [],
+  "contributions": [],
+  "gates": []
+}
