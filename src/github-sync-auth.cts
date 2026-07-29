@@ -132,8 +132,8 @@ function isSuccessfulGraphqlResponse(stdout: string): boolean {
  * rather than being mistaken for `ok`.
  */
 function classifyGhResult(result: GhResult): string {
-  if (result.reason === 'gh_not_found') return PREFLIGHT_REASON.MISSING_GH;
-  if (result.reason === 'gh_timed_out') return PREFLIGHT_REASON.OUTAGE;
+  if (result.reason === ghMod.GH_REASON.ENOENT) return PREFLIGHT_REASON.MISSING_GH;
+  if (result.reason === ghMod.GH_REASON.TIMEOUT) return PREFLIGHT_REASON.OUTAGE;
 
   if (result.exitCode === 0) {
     return isSuccessfulGraphqlResponse(result.stdout)
