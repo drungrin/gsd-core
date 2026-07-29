@@ -39,6 +39,21 @@ interface PreflightResult {
   message: string;
 }
 
+/**
+ * Frozen enum of typed preflight classification reasons, modeled on
+ * GRAPHIFY_REASON in src/graphify.cts (#2974). Tests assert on the returned
+ * reason constant, never on message text.
+ */
+const PREFLIGHT_REASON = Object.freeze({
+  OK: 'ok',
+  MISSING_GH: 'missing_gh',
+  NO_TOKEN: 'no_token',
+  WRONG_SCOPE: 'wrong_scope',
+  OUTAGE: 'outage',
+  RATE_LIMITED: 'rate_limited',
+  SSO_OR_NULL_PAYLOAD: 'sso_or_null_payload',
+} as const);
+
 const MESSAGES = {
   MISSING_GH:
     'github-sync preflight: the `gh` CLI was not found on PATH. Install it from ' +
@@ -69,6 +84,52 @@ function isSuccessfulGraphqlResponse(stdout: string): boolean {
 }
 
 /**
+ * Classify a structured `GhResult` into one of `PREFLIGHT_REASON`'s seven
+ * members. Pure: no I/O, no environment reads, no side effects.
+ *
+ * Precedence is fixed and documented (Pitfall 2, 01-RESEARCH.md): missing
+ * binary, then timeout, then wrong scope, then no token, then rate limited,
+ * then outage. Evaluated in that exact order so a response matching more
+ * than one signal (e.g. both a rate-limit phrase and a required-scopes
+ * phrase) always resolves the same way, and repeated calls on identical
+ * input always return an identical reason.
+ *
+ * GitHub's scope-error text is community-observed, not a documented
+ * contract — stderr signals are matched as case-insensitive substrings
+ * only, never as an anchored or exact-equality comparison, so an
+ * unrecognized failure falls through to the `outage` defensive default
+ * rather than being mistaken for `ok`.
+ */
+function classifyGhResult(result: GhResult): string {
+  if (result.reason === 'gh_not_found') return PREFLIGHT_REASON.MISSING_GH;
+  if (result.reason === 'gh_timed_out') return PREFLIGHT_REASON.OUTAGE;
+
+  if (result.exitCode === 0) {
+    return isSuccessfulGraphqlResponse(result.stdout)
+      ? PREFLIGHT_REASON.OK
+      : PREFLIGHT_REASON.SSO_OR_NULL_PAYLOAD;
+  }
+
+  const stderr = (result.stderr || '').toLowerCase();
+
+  if (stderr.includes('required scopes') || stderr.includes('not been granted')) {
+    return PREFLIGHT_REASON.WRONG_SCOPE;
+  }
+
+  if (stderr.includes('bad credentials') || stderr.includes('401')) {
+    return PREFLIGHT_REASON.NO_TOKEN;
+  }
+
+  if (stderr.includes('rate limit')) {
+    return PREFLIGHT_REASON.RATE_LIMITED;
+  }
+
+  // HTTP 5xx / bad gateway / service unavailability, and every other
+  // unrecognized non-zero failure, land here — the safe defensive default.
+  return PREFLIGHT_REASON.OUTAGE;
+}
+
+/**
  * Run the auth preflight: probe `projectsV2` (AUTH-02) and classify the
  * result. Never throws.
  */
@@ -89,4 +150,6 @@ function runPreflight(cwd: string, opts: { _gh?: GhModule } = {}): PreflightResu
 
 export = {
   runPreflight,
+  classifyGhResult,
+  PREFLIGHT_REASON,
 };
