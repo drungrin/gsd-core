@@ -7,15 +7,19 @@
  * D-11/SAFE-01: this module never throws. Every failure — missing `gh`
  * binary, no token, wrong scope, GitHub outage, rate limit — collapses to
  * a structured `{ ok: false, reason, message }` with a fixed, actionable
- * message. Task 1 implements only the two-way split the tracer's
- * `<verify>` proves (missing_gh vs. everything-else); the five-way
- * classification (no_token / wrong_scope / outage / rate_limited) lands in
- * plan 01-02 and expands the `preflight_failed` branch below without
- * touching this shape.
+ * message.
  *
- * Every message is composed from a fixed string this module owns — never
- * from interpolated raw `gh` stdout/stderr — so a GraphQL error payload can
- * never leak into a message shown to a developer or CI log.
+ * Every message is composed only from catalog literals — never from
+ * interpolated raw `gh` stdout/stderr — so a GraphQL error payload can
+ * never leak into a message shown to a developer or CI log (T-1-06).
+ *
+ * D-10: the `wrong_scope` and `no_token` messages are selected between a
+ * developer remedy (`gh auth refresh -s project`) and a CI remedy (the
+ * classic PAT exported as `GH_TOKEN`) by a presence-only read of `CI`,
+ * `GITHUB_ACTIONS`, `GH_TOKEN` and `GITHUB_TOKEN` — never the value itself
+ * (T-1-07). Per 01-RESEARCH.md Pitfall 3, the CI remedy never suggests
+ * adjusting a workflow permissions block: the default Actions token cannot
+ * reach Projects v2 under any permissions combination.
  */
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -54,15 +58,42 @@ const PREFLIGHT_REASON = Object.freeze({
   SSO_OR_NULL_PAYLOAD: 'sso_or_null_payload',
 } as const);
 
-const MESSAGES = {
-  MISSING_GH:
+/**
+ * Fixed, reviewed catalog literals. Never built by interpolating any value
+ * that originated in a `gh` response — see the module header (T-1-06).
+ */
+const DEVELOPER_WRONG_SCOPE_MESSAGE =
+  'github-sync preflight: your GitHub token is missing the `project` scope. Run ' +
+  '`gh auth refresh -s project`, then re-run `gsd-tools github-sync preflight`.';
+
+const CI_SCOPE_REMEDY_MESSAGE =
+  'github-sync preflight: this token cannot reach GitHub Projects v2. Export a classic ' +
+  'personal access token with the `project` scope as `GH_TOKEN` in this CI environment — ' +
+  'the default GITHUB_TOKEN cannot reach Projects v2 no matter how the workflow is set ' +
+  'up. Then re-run `gsd-tools github-sync preflight`.';
+
+const DEVELOPER_NO_TOKEN_MESSAGE =
+  'github-sync preflight: no valid GitHub credentials were found. Authenticate with ' +
+  '`gh auth login`, then re-run `gsd-tools github-sync preflight`.';
+
+const MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  [PREFLIGHT_REASON.OK]:
+    'github-sync preflight: connected to GitHub Projects v2 successfully.',
+  [PREFLIGHT_REASON.MISSING_GH]:
     'github-sync preflight: the `gh` CLI was not found on PATH. Install it from ' +
     'https://cli.github.com, then re-run `gsd-tools github-sync preflight`.',
-  PREFLIGHT_FAILED:
-    'github-sync preflight failed — the GitHub Projects v2 probe did not succeed. ' +
-    'Run `gh auth status` to check your GitHub CLI authentication and scopes, then ' +
-    'retry `gsd-tools github-sync preflight`.',
-} as const;
+  [PREFLIGHT_REASON.RATE_LIMITED]:
+    'github-sync preflight: GitHub is rate-limiting this token right now. Wait a few ' +
+    'minutes, then retry `gsd-tools github-sync preflight`.',
+  [PREFLIGHT_REASON.OUTAGE]:
+    'github-sync preflight: GitHub appears to be experiencing a transient failure. ' +
+    'Retry `gsd-tools github-sync preflight` shortly; check ' +
+    'https://www.githubstatus.com if the problem persists.',
+  [PREFLIGHT_REASON.SSO_OR_NULL_PAYLOAD]:
+    'github-sync preflight: GitHub returned no usable data — this usually means your ' +
+    'token needs SSO authorization for this organization. Authorize the token for SSO ' +
+    'at https://github.com/settings/tokens, then retry.',
+});
 
 /**
  * Returns true when `stdout` is parseable JSON whose top-level shape carries
@@ -130,26 +161,59 @@ function classifyGhResult(result: GhResult): string {
 }
 
 /**
- * Run the auth preflight: probe `projectsV2` (AUTH-02) and classify the
- * result. Never throws.
+ * D-10: presence-only environment signal deciding which remedy to show.
+ * True when any of `CI`, `GITHUB_ACTIONS`, `GH_TOKEN` or `GITHUB_TOKEN` is
+ * present in `env` with a non-empty value — an empty-valued variable counts
+ * as absent. Reads presence and emptiness only: never the value, never a
+ * length beyond the empty check, never a hash, never a log (T-1-07).
+ */
+function hasCiOrTokenEnvSignal(env: NodeJS.ProcessEnv): boolean {
+  return ['CI', 'GITHUB_ACTIONS', 'GH_TOKEN', 'GITHUB_TOKEN'].some((key) => {
+    const value = env[key];
+    return typeof value === 'string' && value.length > 0;
+  });
+}
+
+/**
+ * Select the fixed, reviewed message for `reason` given the environment.
+ * Pure: the environment is injected as a parameter so tests never mutate
+ * `process.env`. Composed only from catalog literals — never from a `gh`
+ * response value. Total: returns a non-empty string for every
+ * `PREFLIGHT_REASON` member, including `ok`.
+ */
+function selectPreflightMessage(reason: string, env: NodeJS.ProcessEnv): string {
+  const ciSignal = hasCiOrTokenEnvSignal(env);
+
+  if (reason === PREFLIGHT_REASON.WRONG_SCOPE) {
+    return ciSignal ? CI_SCOPE_REMEDY_MESSAGE : DEVELOPER_WRONG_SCOPE_MESSAGE;
+  }
+
+  if (reason === PREFLIGHT_REASON.NO_TOKEN) {
+    return ciSignal ? CI_SCOPE_REMEDY_MESSAGE : DEVELOPER_NO_TOKEN_MESSAGE;
+  }
+
+  return MESSAGES[reason] ?? MESSAGES[PREFLIGHT_REASON.OUTAGE];
+}
+
+/**
+ * Run the auth preflight: probe `projectsV2` (AUTH-02), classify the
+ * result, and select an actionable message. Never throws; `ok` is false
+ * with a populated `reason` and `message` for every non-`ok` reason, which
+ * is what makes the router's universal exit-0 contract (D-11) hold end to
+ * end.
  */
 function runPreflight(cwd: string, opts: { _gh?: GhModule } = {}): PreflightResult {
   const gh: GhModule = opts._gh ?? ghMod;
   const result = gh.probeProjectsV2Scope(cwd);
+  const reason = classifyGhResult(result);
+  const message = selectPreflightMessage(reason, process.env);
 
-  if (result.exitCode === 127) {
-    return { ok: false, reason: 'missing_gh', message: MESSAGES.MISSING_GH };
-  }
-
-  if (result.exitCode === 0 && isSuccessfulGraphqlResponse(result.stdout)) {
-    return { ok: true, reason: 'ok', message: '' };
-  }
-
-  return { ok: false, reason: 'preflight_failed', message: MESSAGES.PREFLIGHT_FAILED };
+  return { ok: reason === PREFLIGHT_REASON.OK, reason, message };
 }
 
 export = {
   runPreflight,
   classifyGhResult,
+  selectPreflightMessage,
   PREFLIGHT_REASON,
 };
