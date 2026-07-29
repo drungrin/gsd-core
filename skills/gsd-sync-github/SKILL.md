@@ -105,8 +105,12 @@ Parse the JSON output on stdout:
 - `{"ok": true, "reason": "ok", ...}` -- preflight passed, GitHub access is ready
 - `{"ok": false, "reason": "missing_gh", ...}` -- the `gh` CLI is not installed; display the
   actionable stderr message
-- `{"ok": false, "reason": "preflight_failed", ...}` -- `gh` ran but the probe failed (missing
-  auth, missing `project` scope, outage, or rate limit); display the actionable stderr message
+- `{"ok": false, "reason": "no_token", ...}` -- no valid GitHub credentials were found
+- `gh` ran but the probe failed for another reason: `reason` is one of `wrong_scope`
+  (token exists but lacks the `project` scope), `outage` (transient GitHub failure),
+  `rate_limited` (this token is being throttled), or `sso_or_null_payload` (the response needs SSO
+  authorization or returned no usable data). Do not branch on which of these five it is -- display
+  the `message` field verbatim; the remedy differences between them are already encoded there.
 
 Display the stderr message verbatim if present -- it is already written to be actionable and
 never embeds raw `gh` output.
