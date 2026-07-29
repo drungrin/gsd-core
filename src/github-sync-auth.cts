@@ -196,19 +196,51 @@ function selectPreflightMessage(reason: string, env: NodeJS.ProcessEnv): string 
 }
 
 /**
+ * D-12: the once-per-process probe cache. This is the single documented
+ * exception to the project's no-module-level-mutable-state rule (per
+ * active-workstream-store.cts's cachedControllingTtyToken /
+ * didProbeControllingTtyToken shape): a sync run pays one extra `gh` API
+ * call regardless of how many mutations follow, nothing is ever persisted
+ * to disk, and a fresh process invocation always re-probes so a token
+ * fixed between runs is picked up immediately. The two-variable shape
+ * (rather than a single nullable slot) means a cached falsy/failure
+ * result is still recognized as cached, not re-probed as if unset.
+ */
+let _cachedPreflightResult: PreflightResult | undefined;
+let _didProbePreflight = false;
+
+/** Test-only seam: clear the memoized once-per-process preflight cache (D-12). */
+function _resetPreflightCacheForTests(): void {
+  _cachedPreflightResult = undefined;
+  _didProbePreflight = false;
+}
+
+/**
  * Run the auth preflight: probe `projectsV2` (AUTH-02), classify the
  * result, and select an actionable message. Never throws; `ok` is false
  * with a populated `reason` and `message` for every non-`ok` reason, which
  * is what makes the router's universal exit-0 contract (D-11) hold end to
  * end.
+ *
+ * The probe runs at most once per process (D-12): a cached result,
+ * including a cached failure, is returned unchanged on every subsequent
+ * call until `_resetPreflightCacheForTests()` clears it.
  */
 function runPreflight(cwd: string, opts: { _gh?: GhModule } = {}): PreflightResult {
+  if (_didProbePreflight && _cachedPreflightResult !== undefined) {
+    return _cachedPreflightResult;
+  }
+
   const gh: GhModule = opts._gh ?? ghMod;
   const result = gh.probeProjectsV2Scope(cwd);
   const reason = classifyGhResult(result);
   const message = selectPreflightMessage(reason, process.env);
+  const preflightResult: PreflightResult = { ok: reason === PREFLIGHT_REASON.OK, reason, message };
 
-  return { ok: reason === PREFLIGHT_REASON.OK, reason, message };
+  _didProbePreflight = true;
+  _cachedPreflightResult = preflightResult;
+
+  return preflightResult;
 }
 
 export = {
@@ -216,4 +248,5 @@ export = {
   classifyGhResult,
   selectPreflightMessage,
   PREFLIGHT_REASON,
+  _resetPreflightCacheForTests,
 };

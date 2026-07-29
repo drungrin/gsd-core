@@ -258,6 +258,10 @@ describe('runPreflight message wiring', () => {
     ];
 
     for (const c of cases) {
+      // D-12's per-process cache would otherwise return the first
+      // iteration's cached result for every subsequent case.
+      _resetPreflightCacheForTests();
+
       const fakeGh = {
         probeProjectsV2Scope: () => ({
           exitCode: c.exitCode,
