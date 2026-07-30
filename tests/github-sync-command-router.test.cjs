@@ -73,7 +73,7 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
     });
   } finally { mock.restoreAll(); }
   assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['remote', '/fixture'], ['map', '/fixture'], ['reconcile', 3], ['apply', 'phase:01', null]]);
-  assert.deepEqual(chunks, ['{"kind":"completed"}']);
+  assert.deepEqual(chunks, ['{\n  "kind": "completed"\n}']);
 });
 
 test('enabled sync stops at preflight or unavailable desired state without reaching later seams', () => {

@@ -34,6 +34,8 @@ import reconcileMod = require('./github-sync-reconcile.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import statusMod = require('./github-sync-status.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import applyMod = require('./github-sync-apply.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import io = require('./io.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import cjsCommandRouterAdapter = require('./cjs-command-router-adapter.cjs');
@@ -87,6 +89,7 @@ interface RemoteModule { readRemoteSnapshot(options: { cwd: string; owner: strin
 interface MapModule { readSyncMapStrict(cwd: string, repository: { owner: string; repo: string; number: number }): unknown; }
 interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
 interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
+interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string; map: unknown }): unknown; }
 
 interface RouteGithubSyncCommandRouterOptions {
   args: string[];
@@ -102,6 +105,7 @@ interface RouteGithubSyncCommandRouterOptions {
   _map?: MapModule;
   _reconcile?: ReconcileModule;
   _status?: StatusModule;
+  _apply?: ApplyModule;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -118,6 +122,7 @@ function routeGithubSyncCommandRouter({
   _map,
   _reconcile,
   _status,
+  _apply,
 }: RouteGithubSyncCommandRouterOptions): void {
   const activeCheck = _isCapabilityActive ?? isCapabilityActive;
 
@@ -152,11 +157,12 @@ function routeGithubSyncCommandRouter({
   const map: MapModule = _map ?? mapMod;
   const reconcile: ReconcileModule = _reconcile ?? reconcileMod;
   const status: StatusModule = _status ?? statusMod;
+  const apply: ApplyModule = _apply ?? applyMod;
 
   routeHubCommandFamily({
     family: 'github-sync',
     args,
-    subcommands: ['preflight', 'status'],
+    subcommands: ['preflight', 'status', 'sync'],
     handlers: {
       preflight: () => {
         // WR-03: auth.runPreflight(cwd) is documented not to throw
@@ -194,6 +200,41 @@ function routeGithubSyncCommandRouter({
           dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
         }
         output(dto, raw, status.renderStatusV1(dto, raw));
+      },
+      sync: () => {
+        let result: unknown;
+        try {
+          const preflight = auth.runPreflight(cwd);
+          if (!preflight.ok) {
+            result = { kind: 'blocked', reason: 'preflight_unavailable' };
+          } else {
+            const desiredState = desired.readDesiredState(cwd) as { available?: unknown };
+            if (desiredState?.available !== true) {
+              result = { kind: 'blocked', reason: 'local_unavailable' };
+            } else {
+              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: '', repo: '', projectNumber: 1 }) as { available?: unknown };
+              if (remoteSnapshot?.available !== true) {
+                result = { kind: 'uncertain', reason: 'remote_unavailable' };
+              } else {
+                const strictMap = map.readSyncMapStrict(cwd, { owner: '', repo: '', number: 1 }) as {
+                  kind?: unknown; map?: unknown;
+                };
+                if (strictMap?.kind === 'blocking') {
+                  result = { kind: 'blocked', reason: 'sync_map_blocking' };
+                } else {
+                  const plan = reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap);
+                  result = apply.applyMutationPlan(plan, {
+                    cwd,
+                    map: strictMap?.kind === 'valid' ? strictMap.map ?? null : null,
+                  });
+                }
+              }
+            }
+          }
+        } catch {
+          result = { kind: 'uncertain', reason: 'sync_unavailable' };
+        }
+        output(result, raw);
       },
     },
     unknownMessage: (subcommand: string, available: string[]) =>
