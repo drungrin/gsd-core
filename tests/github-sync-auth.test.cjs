@@ -432,3 +432,146 @@ describe('published reason catalog pin (commands/gsd/sync-github.md + skills/gsd
     assert.throws(() => assertReasonsAreEnumMembers(emptyFixture, 'empty-fixture'));
   });
 });
+
+/**
+ * Plan 01-09 (REVIEW.md CR-01): classification fixtures built from
+ * byte-verbatim observed `gh` output for all three auth-failure forms, not
+ * from a paraphrase of the classifier's own assumed phrasing. Re-observed
+ * live against `gh version 2.96.0` by the executor of plan 01-09 (see
+ * 01-09-SUMMARY.md for the full transcription).
+ *
+ * Written as plain single-quoted string concatenation, never a template
+ * literal: Form B's doubled-brace `${{ github.token }}` GitHub Actions
+ * expression would otherwise be swallowed by interpolation.
+ */
+const GH_NO_CREDENTIALS_STDERR =
+  'To get started with GitHub CLI, please run:  gh auth login\n' +
+  'Alternatively, populate the GH_TOKEN environment variable with a GitHub API ' +
+  'authentication token.';
+
+const GH_ACTIONS_NO_TOKEN_STDERR =
+  'gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment ' +
+  'variable. Example:\n' +
+  '  env:\n' +
+  '    GH_TOKEN: ${{ github.token }}';
+
+const GH_INVALID_TOKEN_STDERR = 'gh: Bad credentials (HTTP 401)';
+
+/**
+ * `gh`'s own `exitAuthError` exit code (its `exitAuthError`), observed live
+ * against `gh version 2.96.0`. Not imported: src/github-sync-auth.cts's
+ * `GH_AUTH_EXIT_CODE` is a module-internal constant, not part of the
+ * module's exported surface (see the interfaces block in 01-09-PLAN.md).
+ */
+const GH_AUTH_EXIT_CODE = 4;
+
+describe('classifyGhResult — no_token exit-code promotion (CR-01, plan 01-09)', () => {
+  test('fixtures are pure printable ASCII plus newlines', () => {
+    const asciiPlusNewlines = /^[\x20-\x7E\n]*$/;
+    assert.match(GH_NO_CREDENTIALS_STDERR, asciiPlusNewlines);
+    assert.match(GH_ACTIONS_NO_TOKEN_STDERR, asciiPlusNewlines);
+    assert.match(GH_INVALID_TOKEN_STDERR, asciiPlusNewlines);
+  });
+
+  test('Form B fixture preserves the doubled-brace GitHub Actions token expression verbatim', () => {
+    assert.ok(
+      GH_ACTIONS_NO_TOKEN_STDERR.includes('${{ github.token }}'),
+      'Form B fixture must contain the literal doubled-brace expression, unswallowed by interpolation',
+    );
+  });
+
+  test('Form A fixture (interactive, no credentials) classifies as no_token', () => {
+    const result = ghResult({
+      exitCode: GH_AUTH_EXIT_CODE,
+      stderr: GH_NO_CREDENTIALS_STDERR,
+      reason: GH_REASON.EXIT_NONZERO,
+    });
+    assert.strictEqual(classifyGhResult(result), PREFLIGHT_REASON.NO_TOKEN);
+  });
+
+  test('Form B fixture (GitHub Actions, no credentials) classifies as no_token', () => {
+    const result = ghResult({
+      exitCode: GH_AUTH_EXIT_CODE,
+      stderr: GH_ACTIONS_NO_TOKEN_STDERR,
+      reason: GH_REASON.EXIT_NONZERO,
+    });
+    assert.strictEqual(classifyGhResult(result), PREFLIGHT_REASON.NO_TOKEN);
+  });
+
+  test('the auth exit code with completely empty stderr and stdout classifies as no_token (exit code alone suffices)', () => {
+    const result = ghResult({
+      exitCode: GH_AUTH_EXIT_CODE,
+      stdout: '',
+      stderr: '',
+      reason: GH_REASON.EXIT_NONZERO,
+    });
+    assert.strictEqual(classifyGhResult(result), PREFLIGHT_REASON.NO_TOKEN);
+  });
+
+  test('Form C fixture (invalid token, exit code 1) classifies as no_token through the phrase backstop alone', () => {
+    const result = ghResult({ exitCode: 1, stderr: GH_INVALID_TOKEN_STDERR, reason: GH_REASON.EXIT_NONZERO });
+    assert.strictEqual(classifyGhResult(result), PREFLIGHT_REASON.NO_TOKEN);
+  });
+
+  test('Form A phrase upper-cased still classifies as no_token (case-insensitive match, not luck of observed casing)', () => {
+    const result = ghResult({
+      exitCode: 1,
+      stderr: GH_NO_CREDENTIALS_STDERR.toUpperCase(),
+      reason: GH_REASON.EXIT_NONZERO,
+    });
+    assert.strictEqual(classifyGhResult(result), PREFLIGHT_REASON.NO_TOKEN);
+  });
+
+  test('precedence: the auth exit code together with a required-scopes phrase classifies as wrong_scope, not no_token', () => {
+    const result = ghResult({
+      exitCode: GH_AUTH_EXIT_CODE,
+      stderr: 'gh: Your token has not been granted the required scopes to execute this query.',
+      reason: GH_REASON.EXIT_NONZERO,
+    });
+    assert.strictEqual(
+      classifyGhResult(result),
+      PREFLIGHT_REASON.WRONG_SCOPE,
+      'the AUTH-01 `gh auth refresh -s project` remedy must not be captured by the new exit-code branch',
+    );
+  });
+
+  test('non-regression: exit 1 with unrecognized stderr still classifies as outage (WR-01(current) 403/SAML sub-case remains deferred)', () => {
+    const result = ghResult({ exitCode: 1, stderr: 'gh: some completely unrecognized failure text', reason: GH_REASON.EXIT_NONZERO });
+    assert.strictEqual(
+      classifyGhResult(result),
+      PREFLIGHT_REASON.OUTAGE,
+      'WR-01(current): the deferred SAML/403 sub-case must land on the defensive default, unchanged by this branch',
+    );
+  });
+
+  test('PREFLIGHT_REASON still has exactly seven members — no new reason was minted', () => {
+    assert.strictEqual(Object.keys(PREFLIGHT_REASON).length, 7);
+  });
+
+  test('AUTH-01: runPreflight with an injected _gh returning the Form A fixture yields a message naming gh auth login', () => {
+    _resetPreflightCacheForTests();
+    const fakeGh = {
+      probeProjectsV2Scope: () => ({
+        exitCode: GH_AUTH_EXIT_CODE,
+        stdout: '',
+        stderr: GH_NO_CREDENTIALS_STDERR,
+        reason: GH_REASON.EXIT_NONZERO,
+      }),
+    };
+    const result = runPreflight('/tmp', { _gh: fakeGh });
+    assert.strictEqual(result.reason, PREFLIGHT_REASON.NO_TOKEN);
+    assert.match(result.message, /gh auth login/);
+  });
+
+  test('AUTH-03: the Form B fixture classifies as no_token, and under a CI environment signal the message names GH_TOKEN', () => {
+    const formBResult = ghResult({
+      exitCode: GH_AUTH_EXIT_CODE,
+      stderr: GH_ACTIONS_NO_TOKEN_STDERR,
+      reason: GH_REASON.EXIT_NONZERO,
+    });
+    const reason = classifyGhResult(formBResult);
+    assert.strictEqual(reason, PREFLIGHT_REASON.NO_TOKEN);
+    const message = selectPreflightMessage(reason, { CI: '1' });
+    assert.match(message, /GH_TOKEN/);
+  });
+});
