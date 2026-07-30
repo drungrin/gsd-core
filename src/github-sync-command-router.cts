@@ -104,16 +104,19 @@ function routeGithubSyncCommandRouter({
   // command-routing-hub.cjs's dispatch(), which would convert it into a
   // HandlerFailure and set a non-zero exit code (D-11/SAFE-01 violation).
   let isActive: boolean;
-  let disabledMessage = 'github-sync is disabled — set github_sync.enabled: true in .planning/config.json\n';
+  let capabilityStateUnavailable = false;
   try {
     isActive = activeCheck('github-sync', cwd);
   } catch {
     isActive = false;
-    disabledMessage = CAPABILITY_STATE_UNAVAILABLE_MESSAGE + '\n';
+    capabilityStateUnavailable = true;
   }
 
   if (!isActive) {
-    process.stderr.write(disabledMessage);
+    // D-04 amendment: ordinary disabled commands are a completely silent
+    // family-entry no-op. The exceptional resolution failure remains an
+    // actionable SAFE-01 containment path, distinct from disabled state.
+    if (capabilityStateUnavailable) process.stderr.write(CAPABILITY_STATE_UNAVAILABLE_MESSAGE + '\n');
     return; // Nothing is thrown on this path: process.exitCode stays 0 (D-04/D-11).
   }
 

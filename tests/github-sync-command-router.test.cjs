@@ -13,7 +13,7 @@
  * lookup (D-06) can keep this promise structurally. This file drives seven
  * subcommand strings (registered, unregistered, empty, and absent) through
  * the disabled path with spawn and filesystem-write traps armed, asserting
- * zero calls on both and an identical stderr message across every case.
+ * zero calls on both and no output across every case.
  *
  * Per 01-RESEARCH.md Pitfall 1: none of these disabled-path assertions expect
  * an "unknown subcommand" message — that would validate the wrong behavior.
@@ -66,9 +66,8 @@ function listFilesRecursive(dir) {
 
 /**
  * Direct spawnSync invocation of gsd-tools.cjs (not runGsdTools()) because
- * runGsdTools() discards stderr on a zero-exit process, and the whole point
- * of the disabled-path subprocess case is asserting on the non-empty stderr
- * that accompanies exit 0 (mirrors tests/github-sync-preflight-e2e.test.cjs).
+ * runGsdTools() discards streams on a zero-exit process, and the disabled-path
+ * contract needs byte-accurate assertions that both streams stay empty.
  */
 function runGithubSync(args, cwd, envOverrides = {}) {
   const result = spawnSync(process.execPath, [TOOLS_PATH, ...args], {
@@ -163,7 +162,7 @@ describe('github-sync router: exhaustive disabled-gate proof (in-process)', () =
     };
   }
 
-  test('all seven subcommand strings: identical stderr, zero spawns, zero fs writes, exit stays 0', () => {
+  test('all seven subcommand strings: silent, zero spawns, zero fs writes, exit stays 0', () => {
     const spawnCalls = [];
     mock.method(childProcess, 'spawnSync', (...callArgs) => {
       spawnCalls.push(callArgs);
@@ -184,8 +183,6 @@ describe('github-sync router: exhaustive disabled-gate proof (in-process)', () =
       return true;
     });
 
-    const messagesPerCase = [];
-
     for (const { label, args } of SUBCOMMAND_CASES) {
       stderrChunks.length = 0;
       process.exitCode = 0;
@@ -200,8 +197,7 @@ describe('github-sync router: exhaustive disabled-gate proof (in-process)', () =
       });
 
       assert.strictEqual(process.exitCode, 0, `${label}: process.exitCode must stay 0`);
-      assert.strictEqual(stderrChunks.length, 1, `${label}: exactly one stderr write; got: ${JSON.stringify(stderrChunks)}`);
-      messagesPerCase.push({ label, message: stderrChunks[0] });
+      assert.deepStrictEqual(stderrChunks, [], `${label}: disabled path must not write stderr`);
     }
 
     assert.strictEqual(spawnCalls.length, 0,
@@ -209,16 +205,6 @@ describe('github-sync router: exhaustive disabled-gate proof (in-process)', () =
     assert.strictEqual(fsWriteCalls.length, 0,
       `no filesystem write must occur across all seven disabled cases; got: ${JSON.stringify(fsWriteCalls)}`);
 
-    const [{ label: firstLabel, message: firstMessage }] = messagesPerCase;
-    for (const { label, message } of messagesPerCase) {
-      assert.strictEqual(message, firstMessage,
-        `${label}: disabled stderr message must be byte-identical to the "${firstLabel}" case; got: ${message}`);
-    }
-
-    assert.ok(firstMessage.includes('github_sync.enabled'),
-      `disabled message must name github_sync.enabled; got: ${firstMessage}`);
-    assert.ok(firstMessage.includes('.planning/config.json'),
-      `disabled message must name .planning/config.json; got: ${firstMessage}`);
   });
 });
 
@@ -235,12 +221,13 @@ describe('github-sync command family: subprocess disabled/enabled matrix', () =>
     cleanup(tmpDir);
   });
 
-  test('disabled (key omitted entirely): "github-sync init" exits 0, non-empty stderr, zero filesystem writes', () => {
+  test('disabled (key omitted entirely): "github-sync init" exits 0, is silent, and makes zero filesystem writes', () => {
     const before = listFilesRecursive(tmpDir);
     const result = runGithubSync(['github-sync', 'init'], tmpDir);
 
     assert.strictEqual(result.status, 0, `expected exit 0; stderr: ${result.stderr}`);
-    assert.ok(result.stderr.length > 0, `stderr must be non-empty; got: "${result.stderr}"`);
+    assert.strictEqual(result.stdout, '', `stdout must be empty; got: "${result.stdout}"`);
+    assert.strictEqual(result.stderr, '', `stderr must be empty; got: "${result.stderr}"`);
 
     const after = listFilesRecursive(tmpDir);
     assert.deepStrictEqual(after, before,
@@ -312,17 +299,10 @@ describe('github-sync router: CAP-02 concurrency and interrupt evidence (subproc
       for (const [index, result] of results.entries()) {
         assert.strictEqual(result.status, 0,
           `CAP-02: child ${index} (args=${JSON.stringify(CONCURRENT_ARGS_CASES[index])}) must exit 0; stderr: ${result.stderr}`);
-        assert.ok(result.stderr.trim().length > 0,
-          `CAP-02: child ${index} must write a non-empty stderr line; got: "${result.stderr}"`);
-      }
-
-      // No ordering is asserted between children — only that each child's own
-      // stderr is byte-identical to every other child's, regardless of the
-      // (unspecified, unasserted) order in which they produced it.
-      const firstStderr = results[0].stderr;
-      for (const [index, result] of results.entries()) {
-        assert.strictEqual(result.stderr, firstStderr,
-          `CAP-02: child ${index}'s stderr must be byte-identical to child 0's — the disabled message must not vary with subcommand or concurrency; got: "${result.stderr}"`);
+        assert.strictEqual(result.stdout, '',
+          `CAP-02: child ${index} must keep stdout empty; got: "${result.stdout}"`);
+        assert.strictEqual(result.stderr, '',
+          `CAP-02: child ${index} must keep stderr empty; got: "${result.stderr}"`);
       }
 
       const after = listFilesRecursive(tmpDir);

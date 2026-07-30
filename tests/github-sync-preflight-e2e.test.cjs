@@ -112,21 +112,15 @@ describe('github-sync preflight — end to end', () => {
     }
   });
 
-  test('capability disabled: exits 0, stderr names github_sync.enabled and .planning/config.json', () => {
+  test('capability disabled: exits 0 with empty stdout and stderr', () => {
     const tmpDir = createTempProject();
     try {
       // github_sync.enabled is intentionally absent from .planning/config.json.
       const result = runPreflight(tmpDir, { PATH: noGhPath() });
 
       assert.strictEqual(result.status, 0, `expected exit 0, got ${result.status}. stderr: ${result.stderr}`);
-      assert.ok(
-        result.stderr.includes('github_sync.enabled'),
-        `stderr must name github_sync.enabled, got: "${result.stderr}"`,
-      );
-      assert.ok(
-        result.stderr.includes('.planning/config.json'),
-        `stderr must name .planning/config.json, got: "${result.stderr}"`,
-      );
+      assert.strictEqual(result.stdout, '', `stdout must be empty, got: "${result.stdout}"`);
+      assert.strictEqual(result.stderr, '', `stderr must be empty, got: "${result.stderr}"`);
     } finally {
       cleanup(tmpDir);
     }
