@@ -52,6 +52,7 @@ test('readSyncMapStrict returns a valid map bound to the requested repository', 
   t.after(() => cleanup(repoDir));
   writeMap(repoDir, {
     version: '1',
+    repository: REPOSITORY,
     completions: { 'phase:02': makeCompletion() },
   });
 
@@ -77,8 +78,10 @@ test('readSyncMapStrict blocks malformed and unsupported map state without repla
 test('readSyncMapStrict blocks a map for another repository', (t) => {
   const repoDir = createTempDir('github-sync-map-foreign-');
   t.after(() => cleanup(repoDir));
+  const foreignRepository = { ...REPOSITORY, repo: 'other-repo' };
   writeMap(repoDir, {
     version: '1',
+    repository: foreignRepository,
     completions: { 'phase:02': makeCompletion({ repo: 'other-repo' }) },
   });
 
@@ -92,6 +95,7 @@ test('readSyncMapStrict rejects credential-shaped and unknown values before use'
   t.after(() => cleanup(repoDir));
   writeMap(repoDir, {
     version: '1',
+    repository: REPOSITORY,
     completions: {
       'phase:02': makeCompletion({ token: 'ghp_secret' }),
     },
