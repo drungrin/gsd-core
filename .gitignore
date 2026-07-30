@@ -162,6 +162,7 @@ build/
 /gsd-core/bin/lib/graphify.cjs
 /gsd-core/bin/lib/graphify-command-router.cjs
 /gsd-core/bin/lib/github-sync-gh.cjs
+/gsd-core/bin/lib/github-sync-remote.cjs
 /gsd-core/bin/lib/github-sync-auth.cjs
 /gsd-core/bin/lib/github-sync-command-router.cjs
 /gsd-core/bin/lib/audit-command-router.cjs
