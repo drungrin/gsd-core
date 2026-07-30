@@ -167,6 +167,7 @@ build/
 /gsd-core/bin/lib/github-sync-desired.cjs
 /gsd-core/bin/lib/github-sync-reconcile.cjs
 /gsd-core/bin/lib/github-sync-status.cjs
+/gsd-core/bin/lib/github-sync-apply.cjs
 /gsd-core/bin/lib/github-sync-auth.cjs
 /gsd-core/bin/lib/github-sync-command-router.cjs
 /gsd-core/bin/lib/audit-command-router.cjs
