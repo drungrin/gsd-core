@@ -8,7 +8,7 @@
   },
   "cases": {
     "header-present": {
-      "stdout": "HTTP/2 200 OK\\r\\ncontent-type: application/json\\r\\nx-ratelimit-remaining: 42\\r\\n\\r\\n{\"data\":{}}",
+      "stdout": "HTTP/2 200 OK\r\ncontent-type: application/json\r\nx-ratelimit-remaining: 42\r\n\r\n{\"data\":{}}",
       "status": 200,
       "retry_after_seconds": null
     },
@@ -18,12 +18,12 @@
       "retry_after_seconds": null
     },
     "malformed": {
-      "stdout": "HTTP/2 two hundred OK\\r\\nretry-after: nope\\r\\n\\r\\n{\"data\":{}}",
+      "stdout": "HTTP/2 two hundred OK\r\nretry-after: nope\r\n\r\n{\"data\":{}}",
       "status": null,
       "retry_after_seconds": null
     },
     "retry-after": {
-      "stdout": "HTTP/1.1 429 Too Many Requests\\r\\nretry-after: 17\\r\\n\\r\\n{\"data\":{}}",
+      "stdout": "HTTP/1.1 429 Too Many Requests\r\nretry-after: 17\r\n\r\n{\"data\":{}}",
       "status": 429,
       "retry_after_seconds": 17
     }
