@@ -25,6 +25,10 @@
       "type": "boolean",
       "default": false,
       "description": "Enable the github-sync GitHub Project v2 mirror capability."
+    },
+    "github_sync.target": {
+      "type": "object",
+      "description": "Closed GitHub repository and Project v2 identity: owner, repo, repository_number, and project_number."
     }
   },
   "commands": [

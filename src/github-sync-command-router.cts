@@ -36,6 +36,8 @@ import statusMod = require('./github-sync-status.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import applyMod = require('./github-sync-apply.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import targetMod = require('./github-sync-target.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import io = require('./io.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import cjsCommandRouterAdapter = require('./cjs-command-router-adapter.cjs');
@@ -90,6 +92,8 @@ interface MapModule { readSyncMapStrict(cwd: string, repository: { owner: string
 interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
 interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
 interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string; map: unknown }): unknown; }
+interface TargetReadResult { available: boolean; target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number }; }
+interface TargetModule { readSyncTarget(cwd: string): TargetReadResult; }
 
 interface RouteGithubSyncCommandRouterOptions {
   args: string[];
@@ -106,6 +110,7 @@ interface RouteGithubSyncCommandRouterOptions {
   _reconcile?: ReconcileModule;
   _status?: StatusModule;
   _apply?: ApplyModule;
+  _target?: TargetModule;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -123,6 +128,7 @@ function routeGithubSyncCommandRouter({
   _reconcile,
   _status,
   _apply,
+  _target,
 }: RouteGithubSyncCommandRouterOptions): void {
   const activeCheck = _isCapabilityActive ?? isCapabilityActive;
 
@@ -158,6 +164,7 @@ function routeGithubSyncCommandRouter({
   const reconcile: ReconcileModule = _reconcile ?? reconcileMod;
   const status: StatusModule = _status ?? statusMod;
   const apply: ApplyModule = _apply ?? applyMod;
+  const target: TargetModule = _target ?? targetMod;
 
   routeHubCommandFamily({
     family: 'github-sync',
@@ -191,10 +198,14 @@ function routeGithubSyncCommandRouter({
         let dto: unknown;
         try {
           const desiredState = desired.readDesiredState(cwd);
-          // Project selection is intentionally conservative until bootstrap owns
-          // persisted Project identity. Remote failure remains a safe status DTO.
-          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: '', repo: '', projectNumber: 1 });
-          const strictMap = map.readSyncMapStrict(cwd, { owner: '', repo: '', number: 1 });
+          const resolvedTarget = target.readSyncTarget(cwd);
+          if (!resolvedTarget.available || !resolvedTarget.target) {
+            dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
+            output(dto, raw, status.renderStatusV1(dto, raw));
+            return;
+          }
+          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, projectNumber: resolvedTarget.target.projectNumber });
+          const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber });
           dto = status.buildStatusV1(remoteSnapshot, reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap));
         } catch {
           dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
@@ -212,11 +223,17 @@ function routeGithubSyncCommandRouter({
             if (desiredState?.available !== true) {
               result = { kind: 'blocked', reason: 'local_unavailable' };
             } else {
-              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: '', repo: '', projectNumber: 1 }) as { available?: unknown };
+              const resolvedTarget = target.readSyncTarget(cwd);
+              if (!resolvedTarget.available || !resolvedTarget.target) {
+                result = { kind: 'blocked', reason: 'target_unavailable' };
+                output(result, raw);
+                return;
+              }
+              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, projectNumber: resolvedTarget.target.projectNumber }) as { available?: unknown };
               if (remoteSnapshot?.available !== true) {
                 result = { kind: 'uncertain', reason: 'remote_unavailable' };
               } else {
-                const strictMap = map.readSyncMapStrict(cwd, { owner: '', repo: '', number: 1 }) as {
+                const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber }) as {
                   kind?: unknown; map?: unknown;
                 };
                 if (strictMap?.kind === 'blocking') {
