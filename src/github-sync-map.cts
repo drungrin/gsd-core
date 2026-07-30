@@ -7,6 +7,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 export const SYNC_MAP_FILE_NAME = '.github-sync.json';
 export const SYNC_MAP_VERSION = '1';
@@ -111,4 +112,80 @@ export function readSyncMapStrict(repoDir: string, repository: RepositoryIdentit
   if (!isSyncMap(parsed)) return { kind: 'blocking', reason: 'invalid_schema' };
   if (!sameRepository(parsed.repository, repository)) return { kind: 'blocking', reason: 'repository_mismatch' };
   return { kind: 'valid', map: parsed };
+}
+
+/**
+ * Return a complete new checkpoint from trusted completed-operation data. The
+ * input is intentionally the narrow SyncCompletion shape rather than a remote
+ * response, so transport payloads and credentials have no persistence path.
+ */
+export function recordCompletion(current: SyncMap | null, completion: SyncCompletion): SyncMap {
+  const repository: RepositoryIdentity = current?.repository ?? {
+    owner: completion.owner,
+    repo: completion.repo,
+    number: completion.repositoryNumber,
+  };
+  if (!isCompletion(completion) || !sameRepository(repository, {
+    owner: completion.owner,
+    repo: completion.repo,
+    number: completion.repositoryNumber,
+  })) {
+    throw new Error('Cannot record a completion that is not bound to the current repository.');
+  }
+  return {
+    version: SYNC_MAP_VERSION,
+    repository: { ...repository },
+    completions: { ...(current?.completions ?? {}), [completion.logicalKey]: { ...completion } },
+  };
+}
+
+function fsyncContainingDir(filePath: string): void {
+  let dirFd: number | null = null;
+  try {
+    dirFd = fs.openSync(path.dirname(filePath), 'r');
+    fs.fsyncSync(dirFd);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EISDIR' || code === 'EPERM' || code === 'EINVAL' || code === 'EBADF') return;
+    throw new Error(`Directory fsync for ${path.dirname(filePath)} failed; checkpoint durability is uncertain: ${(err as Error).message}`);
+  } finally {
+    if (dirFd !== null) {
+      try { fs.closeSync(dirFd); } catch { /* best effort after directory fsync */ }
+    }
+  }
+}
+
+/**
+ * Replace the complete map with a same-directory, exclusive temporary file.
+ * No installed map is edited in place; a failed pre-rename step leaves the
+ * previous checkpoint available for repair/reconciliation.
+ */
+export function writeSyncMapAtomically(repoDir: string, map: SyncMap): void {
+  if (!isSyncMap(map)) throw new Error('Refusing to persist an invalid sync map.');
+  const planningDir = path.join(repoDir, '.planning');
+  const filePath = path.join(planningDir, SYNC_MAP_FILE_NAME);
+  fs.mkdirSync(planningDir, { recursive: true });
+  const tmpPath = `${filePath}.tmp.${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  const fd = fs.openSync(tmpPath, 'wx');
+  let writeError: Error | null = null;
+  try {
+    fs.writeFileSync(fd, JSON.stringify(map, null, 2) + '\n');
+    fs.fsyncSync(fd);
+  } catch (err) {
+    writeError = err instanceof Error ? err : new Error(String(err));
+  } finally {
+    let closeError: Error | null = null;
+    try { fs.closeSync(fd); } catch (err) { closeError = err instanceof Error ? err : new Error(String(err)); }
+    if (writeError !== null || closeError !== null) {
+      try { fs.unlinkSync(tmpPath); } catch { /* best effort temp cleanup */ }
+      throw writeError ?? closeError;
+    }
+  }
+  try {
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch { /* best effort temp cleanup */ }
+    throw err;
+  }
+  fsyncContainingDir(filePath);
 }

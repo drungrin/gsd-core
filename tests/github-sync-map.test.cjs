@@ -146,6 +146,11 @@ for (const fault of ['writeFileSync', 'fsyncSync', 'closeSync', 'renameSync']) {
 
     assert.throws(() => writeSyncMapAtomically(repoDir, next), /injected/);
     assert.deepEqual(JSON.parse(fs.readFileSync(mapPath(repoDir), 'utf8')), prior);
+    assert.deepEqual(
+      fs.readdirSync(path.dirname(mapPath(repoDir))).filter((name) => name.includes('.tmp.')),
+      [],
+      'failed writes must clean up their same-directory temporary map',
+    );
   });
 }
 
