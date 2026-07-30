@@ -55,6 +55,50 @@ test('enabled status composes only read seams and never receives a write adapter
   assert.deepEqual(outputChunks, ['{"version":1,"available":true}']);
 });
 
+test('enabled sync preflights, composes authoritative inputs, and passes the reconciler plan to the applier', () => {
+  const calls = [];
+  const chunks = [];
+  mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+  try {
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight(cwd) { calls.push(['preflight', cwd]); return { ok: true, reason: 'ok', message: 'ok' }; } },
+      _desired: { readDesiredState(cwd) { calls.push(['desired', cwd]); return { available: true }; } },
+      _remote: { readRemoteSnapshot(options) { calls.push(['remote', options.cwd]); return { available: true }; } },
+      _map: { readSyncMapStrict(cwd) { calls.push(['map', cwd]); return { kind: 'absent' }; } },
+      _reconcile: { planReconciliation(...inputs) { calls.push(['reconcile', inputs.length]); return { operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [] }; } },
+      _apply: { applyMutationPlan(plan, options) { calls.push(['apply', plan.operations[0].logicalKey, options.map]); return { kind: 'completed' }; } },
+    });
+  } finally { mock.restoreAll(); }
+  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['remote', '/fixture'], ['map', '/fixture'], ['reconcile', 3], ['apply', 'phase:01', null]]);
+  assert.deepEqual(chunks, ['{"kind":"completed"}']);
+});
+
+test('enabled sync stops at preflight or unavailable desired state without reaching later seams', () => {
+  const calls = [];
+  const makeOptions = (preflight) => ({
+    args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+    error: (message) => { throw new Error(message); },
+    _isCapabilityActive: () => true,
+    _auth: { runPreflight() { calls.push('preflight'); return preflight; } },
+    _desired: { readDesiredState() { calls.push('desired'); return { available: false, reason: 'local_unavailable' }; } },
+    _remote: { readRemoteSnapshot() { throw new Error('remote must not run'); } },
+    _map: { readSyncMapStrict() { throw new Error('map must not run'); } },
+    _reconcile: { planReconciliation() { throw new Error('reconcile must not run'); } },
+    _apply: { applyMutationPlan() { throw new Error('apply must not run'); } },
+  });
+  mock.method(fs, 'writeSync', () => 1);
+  try {
+    routeGithubSyncCommandRouter(makeOptions({ ok: false, reason: 'outage', message: 'fixed preflight failure' }));
+    assert.deepEqual(calls, ['preflight']);
+    calls.length = 0;
+    routeGithubSyncCommandRouter(makeOptions({ ok: true, reason: 'ok', message: 'ok' }));
+    assert.deepEqual(calls, ['preflight', 'desired']);
+  } finally { mock.restoreAll(); }
+});
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 /**
