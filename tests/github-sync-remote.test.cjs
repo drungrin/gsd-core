@@ -33,7 +33,7 @@ function fixtureExec(fixture) {
 describe('readRemoteSnapshot', () => {
   test('exhausts independent item, field, and sub-issue cursors in stable order', () => {
     const fake = fixtureExec(fixtures['two-pages']);
-    const result = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', projectNumber: 1, execGh: fake.execGh });
+    const result = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', projectNumber: 1, subIssueNumber: 101, execGh: fake.execGh });
 
     assert.strictEqual(result.available, true);
     assert.deepStrictEqual(result.items.map((node) => node.id), ['ITEM-1', 'ITEM-2']);
