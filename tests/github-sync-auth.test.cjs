@@ -38,8 +38,8 @@ function ghResult(overrides) {
 }
 
 describe('classifyGhResult', () => {
-  test('exit 0 with a data-bearing stdout classifies as ok', () => {
-    const result = ghResult({ exitCode: 0, stdout: '{"data":{"viewer":{}}}', reason: GH_REASON.OK });
+  test('exit 0 with a complete Projects v2 response classifies as ok', () => {
+    const result = ghResult({ exitCode: 0, stdout: '{"data":{"viewer":{"projectsV2":{"totalCount":0}}}}', reason: GH_REASON.OK });
     assert.strictEqual(classifyGhResult(result), PREFLIGHT_REASON.OK);
   });
 
@@ -141,6 +141,41 @@ describe('classifyGhResult', () => {
     assert.strictEqual(reason, PREFLIGHT_REASON.OUTAGE);
     assert.notStrictEqual(reason, '');
   });
+});
+
+describe('runPreflight Projects v2 response-envelope validation', () => {
+  const validPayload = { data: { viewer: { projectsV2: { totalCount: 0 } } } };
+  const invalidPayloads = [
+    ['null projectsV2', { data: { viewer: { projectsV2: null } } }],
+    ['missing viewer', { data: {} }],
+    ['missing totalCount', { data: { viewer: { projectsV2: {} } } }],
+    ['non-numeric totalCount', { data: { viewer: { projectsV2: { totalCount: '0' } } } }],
+    ['GraphQL errors alongside data', { ...validPayload, errors: [{ message: 'not authorized' }] }],
+  ];
+
+  function runPayload(payload) {
+    _resetPreflightCacheForTests();
+    return runPreflight('/tmp', { _gh: { probeProjectsV2Scope: () => ({
+      exitCode: 0, stdout: typeof payload === 'string' ? payload : JSON.stringify(payload), stderr: '', reason: GH_REASON.OK,
+    }) } });
+  }
+
+  test('fully valid data and empty errors arrays remain ok', () => {
+    for (const payload of [validPayload, { ...validPayload, errors: [] }]) {
+      const result = runPayload(payload);
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.reason, PREFLIGHT_REASON.OK);
+    }
+  });
+
+  for (const [label, payload] of [...invalidPayloads, ['malformed JSON', '{not JSON}']]) {
+    test(`${label} degrades to the actionable SSO/null-payload result`, () => {
+      const result = runPayload(payload);
+      assert.strictEqual(result.ok, false);
+      assert.strictEqual(result.reason, PREFLIGHT_REASON.SSO_OR_NULL_PAYLOAD);
+      assert.ok(result.message.length > 0);
+    });
+  }
 });
 
 /**

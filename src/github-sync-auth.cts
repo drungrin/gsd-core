@@ -106,7 +106,7 @@ const MESSAGES: Readonly<Record<string, string>> = Object.freeze({
 
 /**
  * Returns true when `stdout` is parseable JSON whose top-level shape carries
- * a non-null `data` object — the successful GraphQL response envelope.
+ * an unambiguous successful Projects v2 response envelope.
  * Never throws on malformed/null input (the SSO-null defensive-design
  * ruling): an unparseable or `null` payload is reported as a failure
  * reason, never dereferenced.
@@ -119,8 +119,16 @@ function isSuccessfulGraphqlResponse(stdout: string): boolean {
     return false;
   }
   if (parsed === null || typeof parsed !== 'object') return false;
-  const data = (parsed as { data?: unknown }).data;
-  return data !== null && typeof data === 'object';
+  const envelope = parsed as { data?: unknown; errors?: unknown };
+  if (envelope.errors !== undefined && (!Array.isArray(envelope.errors) || envelope.errors.length > 0)) return false;
+  const data = envelope.data;
+  if (data === null || typeof data !== 'object') return false;
+  const viewer = (data as { viewer?: unknown }).viewer;
+  if (viewer === null || typeof viewer !== 'object') return false;
+  const projectsV2 = (viewer as { projectsV2?: unknown }).projectsV2;
+  if (projectsV2 === null || typeof projectsV2 !== 'object') return false;
+  const totalCount = (projectsV2 as { totalCount?: unknown }).totalCount;
+  return typeof totalCount === 'number' && Number.isFinite(totalCount);
 }
 
 /**
