@@ -33,6 +33,29 @@ const { createTempProject, cleanup, TOOLS_PATH } = require('./helpers.cjs');
 const { routeGithubSyncCommandRouter } = require('../gsd-core/bin/lib/github-sync-command-router.cjs');
 const { PREFLIGHT_REASON } = require('../gsd-core/bin/lib/github-sync-auth.cjs');
 
+test('enabled status composes only read seams and never receives a write adapter', () => {
+  const calls = [];
+  const stdout = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { stdout.push(String(chunk)); return true; };
+  try {
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _desired: { readDesiredState(cwd) { calls.push(['desired', cwd]); return { available: true }; } },
+      _remote: { readRemoteSnapshot(options) { calls.push(['remote', options.cwd]); return { available: true }; } },
+      _map: { readSyncMapStrict(cwd) { calls.push(['map', cwd]); return { kind: 'absent' }; }, writeSyncMapAtomically() { throw new Error('status must not write map'); } },
+      _reconcile: { planReconciliation(...inputs) { calls.push(['reconcile', inputs.length]); return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
+      _status: { buildStatusV1(remote, plan) { calls.push(['status', remote.available, plan.operations.length]); return { version: 1, available: true }; }, renderStatusV1(dto) { return JSON.stringify(dto); } },
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  assert.deepEqual(calls, [['desired', '/fixture'], ['remote', '/fixture'], ['map', '/fixture'], ['reconcile', 3], ['status', true, 0]]);
+  assert.equal(stdout.join(''), '{"version":1,"available":true}');
+});
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 /**
