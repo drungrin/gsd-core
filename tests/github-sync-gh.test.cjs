@@ -11,8 +11,14 @@
 const { describe, test, afterEach, mock } = require('node:test');
 const assert = require('node:assert/strict');
 const childProcess = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const { execGh, probeProjectsV2Scope, GH_REASON } = require('../gsd-core/bin/lib/github-sync-gh.cjs');
+
+const headerFraming = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/header-framing.json'), 'utf8'),
+);
 
 describe('execGh', () => {
   afterEach(() => {
@@ -118,6 +124,46 @@ describe('execGh', () => {
     for (const arg of capturedArgs) {
       assert.ok(typeof arg === 'string', 'every argv element must be a string, not a shell-composed fragment');
     }
+  });
+});
+
+describe('execGh include-header framing', () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  for (const [name, fixture] of Object.entries(headerFraming.cases)) {
+    test(`${name} fixture exposes only unambiguous status and numeric Retry-After metadata`, () => {
+      mock.method(childProcess, 'spawnSync', () => ({
+        status: 0,
+        stdout: fixture.stdout,
+        stderr: '',
+        error: undefined,
+        signal: null,
+      }));
+
+      const result = execGh(['api', '--include', '/rate_limit'], { includeHeaders: true });
+      assert.deepStrictEqual(result.response, {
+        available: fixture.status !== null,
+        status: fixture.status,
+        retry_after_seconds: fixture.retry_after_seconds,
+      });
+    });
+  }
+
+  test('include-header parsing remains opt-in and does not alter normal body stdout', () => {
+    const fixture = headerFraming.cases['header-present'];
+    mock.method(childProcess, 'spawnSync', () => ({
+      status: 0,
+      stdout: fixture.stdout,
+      stderr: '',
+      error: undefined,
+      signal: null,
+    }));
+
+    const result = execGh(['api', '/rate_limit']);
+    assert.strictEqual(result.response, undefined);
+    assert.strictEqual(result.stdout, fixture.stdout);
   });
 });
 

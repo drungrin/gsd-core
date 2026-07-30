@@ -1,0 +1,31 @@
+{
+  "probe": {
+    "command": ["gh", "api", "--include", "/rate_limit"],
+    "gh_version": "2.96.0",
+    "auth": "no token environment variables present",
+    "observed": "2026-07-30",
+    "outcome": "transport failure produced no stdout headers; fixtures below are sanitized supported framing records"
+  },
+  "cases": {
+    "header-present": {
+      "stdout": "HTTP/2 200 OK\\r\\ncontent-type: application/json\\r\\nx-ratelimit-remaining: 42\\r\\n\\r\\n{\"data\":{}}",
+      "status": 200,
+      "retry_after_seconds": null
+    },
+    "header-absent": {
+      "stdout": "{\"data\":{}}",
+      "status": null,
+      "retry_after_seconds": null
+    },
+    "malformed": {
+      "stdout": "HTTP/2 two hundred OK\\r\\nretry-after: nope\\r\\n\\r\\n{\"data\":{}}",
+      "status": null,
+      "retry_after_seconds": null
+    },
+    "retry-after": {
+      "stdout": "HTTP/1.1 429 Too Many Requests\\r\\nretry-after: 17\\r\\n\\r\\n{\"data\":{}}",
+      "status": 429,
+      "retry_after_seconds": 17
+    }
+  }
+}
