@@ -76,6 +76,15 @@ const DEVELOPER_NO_TOKEN_MESSAGE =
   'github-sync preflight: no valid GitHub credentials were found. Authenticate with ' +
   '`gh auth login`, then re-run `gsd-tools github-sync preflight`.';
 
+/**
+ * `gh`'s own `exitAuthError` exit code, raised before any HTTP request is
+ * issued whenever no credentials are configured at all — which is why the
+ * no-credentials path never produces an HTTP status phrase for
+ * `classifyGhResult`'s stderr checks to match. Observed live against
+ * `gh version 2.96.0` during plan 01-09 (REVIEW.md CR-01).
+ */
+const GH_AUTH_EXIT_CODE = 4;
+
 const MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   [PREFLIGHT_REASON.OK]:
     'github-sync preflight: connected to GitHub Projects v2 successfully.',
@@ -121,15 +130,29 @@ function isSuccessfulGraphqlResponse(stdout: string): boolean {
  * Precedence is fixed and documented (Pitfall 2, 01-RESEARCH.md): missing
  * binary, then timeout, then wrong scope, then no token, then rate limited,
  * then outage. Evaluated in that exact order so a response matching more
- * than one signal (e.g. both a rate-limit phrase and a required-scopes
+ * than one signal (e.g. both the auth exit code and a required-scopes
  * phrase) always resolves the same way, and repeated calls on identical
- * input always return an identical reason.
+ * input always return an identical reason. In particular, a result carrying
+ * both `GH_AUTH_EXIT_CODE` and a required-scopes phrase still resolves
+ * `wrong_scope` — the AUTH-01 `gh auth refresh -s project` remedy is not
+ * captured by the `no_token` branch below it.
  *
  * GitHub's scope-error text is community-observed, not a documented
  * contract — stderr signals are matched as case-insensitive substrings
  * only, never as an anchored or exact-equality comparison, so an
  * unrecognized failure falls through to the `outage` defensive default
  * rather than being mistaken for `ok`.
+ *
+ * Plan 01-09 (REVIEW.md CR-01): the `no_token` branch has two independently
+ * sufficient signals, because the two failure states it covers carry
+ * *different* exit codes. `GH_AUTH_EXIT_CODE` is the primary signal for the
+ * no-credentials case — `gh` never issues an HTTP request in that state, so
+ * no stderr phrase is guaranteed, and the exit code alone is trusted. The
+ * stderr phrases remain a backstop for the invalid-token case, which exits
+ * 1 (not the auth exit code) and therefore reaches `no_token` only through
+ * the phrase match. This does not touch the deferred WR-01(current)
+ * SAML/403 gap: those shapes exit 1 and carry neither recognized phrase, so
+ * they continue to fall through to the `outage` default exactly as before.
  */
 function classifyGhResult(result: GhResult): string {
   if (result.reason === ghMod.GH_REASON.ENOENT) return PREFLIGHT_REASON.MISSING_GH;
@@ -147,7 +170,13 @@ function classifyGhResult(result: GhResult): string {
     return PREFLIGHT_REASON.WRONG_SCOPE;
   }
 
-  if (stderr.includes('bad credentials') || stderr.includes('401')) {
+  if (
+    result.exitCode === GH_AUTH_EXIT_CODE ||
+    stderr.includes('bad credentials') ||
+    stderr.includes('401') ||
+    stderr.includes('gh auth login') ||
+    stderr.includes('authentication token')
+  ) {
     return PREFLIGHT_REASON.NO_TOKEN;
   }
 
