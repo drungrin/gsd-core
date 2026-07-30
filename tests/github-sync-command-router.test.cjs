@@ -42,16 +42,17 @@ test('enabled status composes only read seams and never receives a write adapter
       args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
       error: (message) => { throw new Error(message); },
       _isCapabilityActive: () => true,
+      _target: { readSyncTarget(cwd) { calls.push(['target', cwd]); return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
       _desired: { readDesiredState(cwd) { calls.push(['desired', cwd]); return { available: true }; } },
-      _remote: { readRemoteSnapshot(options) { calls.push(['remote', options.cwd]); return { available: true }; } },
-      _map: { readSyncMapStrict(cwd) { calls.push(['map', cwd]); return { kind: 'absent' }; }, writeSyncMapAtomically() { throw new Error('status must not write map'); } },
+      _remote: { readRemoteSnapshot(options) { calls.push(['remote', options]); return { available: true }; } },
+      _map: { readSyncMapStrict(cwd, repository) { calls.push(['map', cwd, repository]); return { kind: 'absent' }; }, writeSyncMapAtomically() { throw new Error('status must not write map'); } },
       _reconcile: { planReconciliation(...inputs) { calls.push(['reconcile', inputs.length]); return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
       _status: { buildStatusV1(remote, plan) { calls.push(['status', remote.available, plan.operations.length]); return { version: 1, available: true }; }, renderStatusV1(dto) { return JSON.stringify(dto); } },
     });
   } finally {
     mock.restoreAll();
   }
-  assert.deepEqual(calls, [['desired', '/fixture'], ['remote', '/fixture'], ['map', '/fixture'], ['reconcile', 3], ['status', true, 0]]);
+  assert.deepEqual(calls, [['desired', '/fixture'], ['target', '/fixture'], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', projectNumber: 7 }], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['reconcile', 3], ['status', true, 0]]);
   assert.deepEqual(outputChunks, ['{"version":1,"available":true}']);
 });
 
@@ -64,15 +65,16 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
       args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
       error: (message) => { throw new Error(message); },
       _isCapabilityActive: () => true,
+      _target: { readSyncTarget(cwd) { calls.push(['target', cwd]); return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
       _auth: { runPreflight(cwd) { calls.push(['preflight', cwd]); return { ok: true, reason: 'ok', message: 'ok' }; } },
       _desired: { readDesiredState(cwd) { calls.push(['desired', cwd]); return { available: true }; } },
-      _remote: { readRemoteSnapshot(options) { calls.push(['remote', options.cwd]); return { available: true }; } },
-      _map: { readSyncMapStrict(cwd) { calls.push(['map', cwd]); return { kind: 'absent' }; } },
+      _remote: { readRemoteSnapshot(options) { calls.push(['remote', options]); return { available: true }; } },
+      _map: { readSyncMapStrict(cwd, repository) { calls.push(['map', cwd, repository]); return { kind: 'absent' }; } },
       _reconcile: { planReconciliation(...inputs) { calls.push(['reconcile', inputs.length]); return { operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [] }; } },
       _apply: { applyMutationPlan(plan, options) { calls.push(['apply', plan.operations[0].logicalKey, options.map]); return { kind: 'completed' }; } },
     });
   } finally { mock.restoreAll(); }
-  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['remote', '/fixture'], ['map', '/fixture'], ['reconcile', 3], ['apply', 'phase:01', null]]);
+  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', projectNumber: 7 }], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['reconcile', 3], ['apply', 'phase:01', null]]);
   assert.deepEqual(chunks, ['{\n  "kind": "completed"\n}']);
 });
 
