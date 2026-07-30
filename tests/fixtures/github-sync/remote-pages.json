@@ -1,0 +1,22 @@
+{
+  "two-pages": {
+    "items": [
+      {"nodes": [{"id": "ITEM-1", "content": {"number": 101}}], "pageInfo": {"hasNextPage": true, "endCursor": "item-2"}},
+      {"nodes": [{"id": "ITEM-2", "content": {"number": 102}}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+    ],
+    "fields": [
+      {"nodes": [{"id": "FIELD-1"}], "pageInfo": {"hasNextPage": true, "endCursor": "field-2"}},
+      {"nodes": [{"id": "FIELD-2"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+    ],
+    "subIssues": [
+      {"nodes": [{"id": "SUB-1"}], "pageInfo": {"hasNextPage": true, "endCursor": "sub-2"}},
+      {"nodes": [{"id": "SUB-2"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+    ]
+  },
+  "empty": {
+    "items": [{"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}],
+    "fields": [{"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}],
+    "subIssues": []
+  },
+  "graphql-error": {"errors": [{"message": "sanitized fixture error"}]}
+}
