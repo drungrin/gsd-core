@@ -21,7 +21,7 @@ test('buildStatusV1 groups a complete reconciliation plan into the documented co
     blocked: [{ reason: 'map_blocking', detail: 'repository_mismatch' }],
     uncertain: [{ reason: 'remote_unavailable' }], limitations: [],
   });
-  assert.match(renderStatusV1(result, true), /"version": 1/);
+  assert.equal(JSON.parse(renderStatusV1(result, true)).version, 1);
 });
 
 test('buildStatusV1 produces an actionable fixed unavailable state without raw transport detail', () => {

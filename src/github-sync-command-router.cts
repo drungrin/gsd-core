@@ -24,6 +24,16 @@ import capabilityStateMod = require('./capability-state.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import authMod = require('./github-sync-auth.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import desiredMod = require('./github-sync-desired.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import remoteMod = require('./github-sync-remote.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import mapMod = require('./github-sync-map.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import reconcileMod = require('./github-sync-reconcile.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import statusMod = require('./github-sync-status.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import io = require('./io.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import cjsCommandRouterAdapter = require('./cjs-command-router-adapter.cjs');
@@ -72,6 +82,12 @@ interface AuthModule {
   runPreflight(cwd: string): PreflightResult;
 }
 
+interface DesiredModule { readDesiredState(cwd: string): unknown; }
+interface RemoteModule { readRemoteSnapshot(options: { cwd: string; owner: string; repo: string; projectNumber: number }): unknown; }
+interface MapModule { readSyncMapStrict(cwd: string, repository: { owner: string; repo: string; number: number }): unknown; }
+interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
+interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
+
 interface RouteGithubSyncCommandRouterOptions {
   args: string[];
   cwd: string;
@@ -81,6 +97,11 @@ interface RouteGithubSyncCommandRouterOptions {
   _isCapabilityActive?: typeof isCapabilityActive;
   /** Test seam: inject a mock auth module. Defaults to the real module. */
   _auth?: AuthModule;
+  _desired?: DesiredModule;
+  _remote?: RemoteModule;
+  _map?: MapModule;
+  _reconcile?: ReconcileModule;
+  _status?: StatusModule;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -92,6 +113,11 @@ function routeGithubSyncCommandRouter({
   error,
   _isCapabilityActive,
   _auth,
+  _desired,
+  _remote,
+  _map,
+  _reconcile,
+  _status,
 }: RouteGithubSyncCommandRouterOptions): void {
   const activeCheck = _isCapabilityActive ?? isCapabilityActive;
 
@@ -121,11 +147,16 @@ function routeGithubSyncCommandRouter({
   }
 
   const auth: AuthModule = _auth ?? authMod;
+  const desired: DesiredModule = _desired ?? desiredMod;
+  const remote: RemoteModule = _remote ?? remoteMod;
+  const map: MapModule = _map ?? mapMod;
+  const reconcile: ReconcileModule = _reconcile ?? reconcileMod;
+  const status: StatusModule = _status ?? statusMod;
 
   routeHubCommandFamily({
     family: 'github-sync',
     args,
-    subcommands: ['preflight'],
+    subcommands: ['preflight', 'status'],
     handlers: {
       preflight: () => {
         // WR-03: auth.runPreflight(cwd) is documented not to throw
@@ -149,6 +180,20 @@ function routeGithubSyncCommandRouter({
           process.stderr.write(result.message + '\n');
         }
         output(result, raw);
+      },
+      status: () => {
+        let dto: unknown;
+        try {
+          const desiredState = desired.readDesiredState(cwd);
+          // Project selection is intentionally conservative until bootstrap owns
+          // persisted Project identity. Remote failure remains a safe status DTO.
+          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: '', repo: '', projectNumber: 1 });
+          const strictMap = map.readSyncMapStrict(cwd, { owner: '', repo: '', number: 1 });
+          dto = status.buildStatusV1(remoteSnapshot, reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap));
+        } catch {
+          dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
+        }
+        output(dto, raw, status.renderStatusV1(dto, raw));
       },
     },
     unknownMessage: (subcommand: string, available: string[]) =>

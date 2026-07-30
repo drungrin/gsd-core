@@ -35,9 +35,8 @@ const { PREFLIGHT_REASON } = require('../gsd-core/bin/lib/github-sync-auth.cjs')
 
 test('enabled status composes only read seams and never receives a write adapter', () => {
   const calls = [];
-  const stdout = [];
-  const originalWrite = process.stdout.write;
-  process.stdout.write = (chunk) => { stdout.push(String(chunk)); return true; };
+  const outputChunks = [];
+  mock.method(fs, 'writeSync', (_fd, chunk) => { outputChunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
   try {
     routeGithubSyncCommandRouter({
       args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
@@ -50,10 +49,10 @@ test('enabled status composes only read seams and never receives a write adapter
       _status: { buildStatusV1(remote, plan) { calls.push(['status', remote.available, plan.operations.length]); return { version: 1, available: true }; }, renderStatusV1(dto) { return JSON.stringify(dto); } },
     });
   } finally {
-    process.stdout.write = originalWrite;
+    mock.restoreAll();
   }
   assert.deepEqual(calls, [['desired', '/fixture'], ['remote', '/fixture'], ['map', '/fixture'], ['reconcile', 3], ['status', true, 0]]);
-  assert.equal(stdout.join(''), '{"version":1,"available":true}');
+  assert.deepEqual(outputChunks, ['{"version":1,"available":true}']);
 });
 
 // ─── helpers ────────────────────────────────────────────────────────────────
