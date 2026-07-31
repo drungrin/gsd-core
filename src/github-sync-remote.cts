@@ -34,6 +34,7 @@ interface ReadRemoteSnapshotOptions {
 interface RemoteSnapshot {
   available: boolean;
   reason: RemoteReason;
+  target?: { owner: string; repo: string; projectNumber: number };
   items: RemoteNode[];
   fields: RemoteNode[];
   subIssues: RemoteNode[];
@@ -115,6 +116,21 @@ function readConnection(
   }
 }
 
+function collectIssueNumbers(items: RemoteNode[]): number[] | null {
+  const numbers = new Set<number>();
+  for (const item of items) {
+    if (!Object.hasOwn(item, 'content')) return null;
+    const content = item.content;
+    if (content === null) continue;
+    if (typeof content !== 'object' || Array.isArray(content)) return null;
+    const number = (content as Record<string, unknown>).number;
+    if (number === undefined) continue;
+    if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) return null;
+    numbers.add(number);
+  }
+  return [...numbers].sort((left, right) => left - right);
+}
+
 function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot {
   const items = readConnection(
     'items',
@@ -132,17 +148,21 @@ function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot 
   );
   if (!fields) return unavailable();
 
-  const subIssues = options.subIssueNumber === undefined
-    ? []
-    : readConnection(
+  const issueNumbers = collectIssueNumbers(items);
+  if (!issueNumbers) return unavailable();
+  const subIssues: RemoteNode[] = [];
+  for (const issueNumber of issueNumbers) {
+    const children = readConnection(
       'subIssues',
       ['repository', 'issue', 'subIssues'],
-      ['-F', `owner=${options.owner}`, '-F', `repo=${options.repo}`, '-F', `issueNumber=${options.subIssueNumber}`],
+      ['-F', `owner=${options.owner}`, '-F', `repo=${options.repo}`, '-F', `issueNumber=${issueNumber}`],
       options,
     );
-  if (!subIssues) return unavailable();
+    if (!children) return unavailable();
+    subIssues.push(...children.map((child) => ({ ...child, parentIssueNumber: issueNumber })));
+  }
 
-  return { available: true, reason: REMOTE_REASON.OK, items, fields, subIssues };
+  return { available: true, reason: REMOTE_REASON.OK, target: { owner: options.owner, repo: options.repo, projectNumber: options.projectNumber }, items, fields, subIssues };
 }
 
 export = {

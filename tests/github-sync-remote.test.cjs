@@ -18,13 +18,18 @@ function envelope(connection, page) {
 function fixtureExec(fixture) {
   const calls = [];
   const cursors = { items: 0, fields: 0, subIssues: 0 };
+  const subIssueCursors = new Map();
   return {
     calls,
     execGh(args) {
       const query = args.find((arg) => arg.startsWith('query='));
       const connection = ['items', 'fields', 'subIssues'].find((name) => query.includes(`github-sync:${name}`));
       calls.push({ connection, args });
-      const page = fixture[connection][cursors[connection]++];
+      const issueArg = args.find((arg) => arg.startsWith('issueNumber='));
+      const issueNumber = issueArg ? Number(issueArg.slice('issueNumber='.length)) : null;
+      const cursor = connection === 'subIssues' ? (subIssueCursors.get(issueNumber) ?? 0) : cursors[connection]++;
+      if (connection === 'subIssues') subIssueCursors.set(issueNumber, cursor + 1);
+      const page = fixture[connection][cursor];
       return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope(connection, page)), stderr: '' };
     },
   };
@@ -75,8 +80,8 @@ describe('readRemoteSnapshot', () => {
     assert.equal(result.items.length, 101);
     assert.equal(result.fields.length, 2);
     assert.equal(result.subIssues.length, 102);
-    assert.deepEqual(result.subIssues.filter((entry) => entry.parentIssueNumber === 101).map((entry) => entry.node.id), subNodes.map((node) => node.id));
-    assert.deepEqual(result.subIssues.filter((entry) => entry.parentIssueNumber === 202).map((entry) => entry.node.id), ['SUB-202-1']);
+    assert.deepEqual(result.subIssues.filter((entry) => entry.parentIssueNumber === 101).map((entry) => entry.id), subNodes.map((node) => node.id));
+    assert.deepEqual(result.subIssues.filter((entry) => entry.parentIssueNumber === 202).map((entry) => entry.id), ['SUB-202-1']);
     assert.deepEqual(calls.map(({ connection, parent }) => [connection, parent]), [['items', null], ['items', null], ['fields', null], ['fields', null], ['subIssues', 101], ['subIssues', 101], ['subIssues', 202]]);
     for (const call of calls) {
       assert.ok(call.args.includes('owner=octo') || call.connection !== 'subIssues');
@@ -92,8 +97,8 @@ describe('readRemoteSnapshot', () => {
     assert.strictEqual(result.available, true);
     assert.deepStrictEqual(result.items.map((node) => node.id), ['ITEM-1', 'ITEM-2']);
     assert.deepStrictEqual(result.fields.map((node) => node.id), ['FIELD-1', 'FIELD-2']);
-    assert.deepStrictEqual(result.subIssues.map((node) => node.id), ['SUB-1', 'SUB-2']);
-    assert.deepStrictEqual(fake.calls.map((call) => call.connection), ['items', 'items', 'fields', 'fields', 'subIssues', 'subIssues']);
+    assert.deepStrictEqual(result.subIssues.map((node) => node.id), ['SUB-1', 'SUB-2', 'SUB-1', 'SUB-2']);
+    assert.deepStrictEqual(fake.calls.map((call) => call.connection), ['items', 'items', 'fields', 'fields', 'subIssues', 'subIssues', 'subIssues', 'subIssues']);
   });
 
   test('returns stable empty arrays when all fixture connections are empty', () => {
@@ -103,6 +108,7 @@ describe('readRemoteSnapshot', () => {
     assert.deepStrictEqual(result, {
       available: true,
       reason: REMOTE_REASON.OK,
+      target: { owner: 'octo', repo: 'example', projectNumber: 1 },
       items: [],
       fields: [],
       subIssues: [],
