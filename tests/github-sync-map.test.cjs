@@ -110,6 +110,25 @@ test('readSyncMapStrict rejects credential-shaped and unknown values before use'
   assert.deepEqual(result, { kind: 'blocking', reason: 'invalid_schema' });
 });
 
+test('recordCompletion rejects credential and GraphQL payload-shaped inputs before persistence', () => {
+  assert.throws(() => recordCompletion(null, makeCompletion({ token: 'ghp_secret' })), /Cannot record/);
+  assert.throws(() => recordCompletion(null, makeCompletion({ data: { viewer: { login: 'octo' } } })), /Cannot record/);
+  assert.throws(() => recordCompletion(null, makeCompletion({ errors: [{ message: 'captured GraphQL error' }] })), /Cannot record/);
+});
+
+test('an actual persisted map contains only repository identity and strict completion fields', (t) => {
+  const repoDir = createTempDir('github-sync-map-persisted-closed-');
+  t.after(() => cleanup(repoDir));
+  writeSyncMapAtomically(repoDir, recordCompletion(null, makeCompletion()));
+
+  const document = JSON.parse(fs.readFileSync(mapPath(repoDir), 'utf8'));
+  assert.deepEqual(Object.keys(document).sort(), ['completions', 'repository', 'version']);
+  assert.deepEqual(Object.keys(document.repository).sort(), ['number', 'owner', 'repo']);
+  assert.deepEqual(Object.keys(document.completions['phase:02']).sort(), [
+    'completedAt', 'issueNumber', 'logicalKey', 'nodeId', 'owner', 'repo', 'repositoryNumber',
+  ]);
+});
+
 test('recordCompletion returns the next complete map without mutating the prior checkpoint', () => {
   const prior = makeMap({ 'phase:01': makeCompletion({ logicalKey: 'phase:01' }) });
 

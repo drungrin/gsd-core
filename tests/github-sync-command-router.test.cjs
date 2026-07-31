@@ -56,6 +56,38 @@ test('enabled status composes only read seams and never receives a write adapter
   assert.deepEqual(outputChunks, ['{"version":1,"available":true}']);
 });
 
+test('enabled status propagates its resolved target yet cannot apply or persist on available and unavailable paths', () => {
+  const calls = [];
+  mock.method(fs, 'writeSync', () => 1);
+  try {
+    for (const available of [true, false]) {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
+        _desired: { readDesiredState() { return { available: true }; } },
+        _remote: { readRemoteSnapshot(options) { calls.push(['remote', available, options]); return { available, reason: available ? 'ok' : 'remote_unavailable' }; } },
+        _map: {
+          readSyncMapStrict(cwd, repository) { calls.push(['map', available, cwd, repository]); return { kind: 'absent' }; },
+          writeSyncMapAtomically() { throw new Error('status must never persist a map'); },
+        },
+        _reconcile: { planReconciliation() { calls.push(['reconcile', available]); return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
+        _status: { buildStatusV1(remote, plan) { calls.push(['status', available, remote.available, plan]); return { version: 1, available: remote.available }; }, renderStatusV1(dto) { return JSON.stringify(dto); } },
+        _apply: { applyMutationPlan() { throw new Error('status must never apply mutations'); } },
+      });
+    }
+  } finally { mock.restoreAll(); }
+  assert.deepEqual(calls, [
+    ['remote', true, { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 }],
+    ['map', true, '/fixture', { owner: 'octo', repo: 'example', number: 42 }],
+    ['reconcile', true], ['status', true, true, { operations: [], noops: [], blocked: [], uncertain: [] }],
+    ['remote', false, { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 }],
+    ['map', false, '/fixture', { owner: 'octo', repo: 'example', number: 42 }],
+    ['reconcile', false], ['status', false, false, { operations: [], noops: [], blocked: [], uncertain: [] }],
+  ]);
+});
+
 test('enabled sync preflights, composes authoritative inputs, and passes the reconciler plan to the applier', () => {
   const calls = [];
   const chunks = [];
