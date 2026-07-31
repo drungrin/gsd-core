@@ -18,5 +18,6 @@
     "fields": [{"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}],
     "subIssues": []
   },
-  "graphql-error": {"errors": [{"message": "sanitized fixture error"}]}
+  "graphql-error": {"errors": [{"message": "sanitized fixture error"}]},
+  "over-100-pages": {"generated": true}
 }
