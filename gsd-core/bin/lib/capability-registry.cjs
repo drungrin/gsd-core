@@ -1417,6 +1417,26 @@ const capabilities = {
         "type": "boolean",
         "default": false,
         "description": "Enable the github-sync GitHub Project v2 mirror capability."
+      },
+      "github_sync.target.owner": {
+        "type": "string",
+        "default": "",
+        "description": "GitHub repository owner for the closed github-sync target."
+      },
+      "github_sync.target.repo": {
+        "type": "string",
+        "default": "",
+        "description": "GitHub repository name for the closed github-sync target."
+      },
+      "github_sync.target.repository_number": {
+        "type": "number",
+        "default": 0,
+        "description": "Positive GitHub repository number for the closed github-sync target."
+      },
+      "github_sync.target.project_number": {
+        "type": "number",
+        "default": 0,
+        "description": "Positive GitHub Project v2 number for the closed github-sync target."
       }
     },
     "commands": [
@@ -3852,6 +3872,10 @@ const configKeys = {
   "external_job.poll_timeout_ms": "external-job",
   "workflow.post_planning_gaps": "gap-analysis",
   "github_sync.enabled": "github-sync",
+  "github_sync.target.owner": "github-sync",
+  "github_sync.target.repo": "github-sync",
+  "github_sync.target.repository_number": "github-sync",
+  "github_sync.target.project_number": "github-sync",
   "graphify.enabled": "graphify",
   "intel.enabled": "intel",
   "mempalace.enabled": "mempalace",
@@ -4015,6 +4039,30 @@ const configSchema = {
     "type": "boolean",
     "default": false,
     "description": "Enable the github-sync GitHub Project v2 mirror capability."
+  },
+  "github_sync.target.owner": {
+    "owner": "github-sync",
+    "type": "string",
+    "default": "",
+    "description": "GitHub repository owner for the closed github-sync target."
+  },
+  "github_sync.target.repo": {
+    "owner": "github-sync",
+    "type": "string",
+    "default": "",
+    "description": "GitHub repository name for the closed github-sync target."
+  },
+  "github_sync.target.repository_number": {
+    "owner": "github-sync",
+    "type": "number",
+    "default": 0,
+    "description": "Positive GitHub repository number for the closed github-sync target."
+  },
+  "github_sync.target.project_number": {
+    "owner": "github-sync",
+    "type": "number",
+    "default": 0,
+    "description": "Positive GitHub Project v2 number for the closed github-sync target."
   },
   "graphify.enabled": {
     "owner": "graphify",

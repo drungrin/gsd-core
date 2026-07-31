@@ -26,9 +26,25 @@
       "default": false,
       "description": "Enable the github-sync GitHub Project v2 mirror capability."
     },
-    "github_sync.target": {
-      "type": "object",
-      "description": "Closed GitHub repository and Project v2 identity: owner, repo, repository_number, and project_number."
+    "github_sync.target.owner": {
+      "type": "string",
+      "default": "",
+      "description": "GitHub repository owner for the closed github-sync target."
+    },
+    "github_sync.target.repo": {
+      "type": "string",
+      "default": "",
+      "description": "GitHub repository name for the closed github-sync target."
+    },
+    "github_sync.target.repository_number": {
+      "type": "number",
+      "default": 0,
+      "description": "Positive GitHub repository number for the closed github-sync target."
+    },
+    "github_sync.target.project_number": {
+      "type": "number",
+      "default": 0,
+      "description": "Positive GitHub Project v2 number for the closed github-sync target."
     }
   },
   "commands": [
