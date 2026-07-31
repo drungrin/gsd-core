@@ -47,32 +47,39 @@ interface GhResponseMetadata {
  * output is transport data, not operator output: callers get only allowlisted
  * metadata and retain raw output solely inside the transport seam.
  */
-function parseIncludedResponse(stdout: string): GhResponseMetadata {
+function splitIncludedResponse(stdout: string): { response: GhResponseMetadata; body: string } {
   const unavailable: GhResponseMetadata = { available: false, status: null, retry_after_seconds: null };
   const separator = stdout.match(/\r?\n\r?\n/);
-  if (!separator || separator.index === undefined) return unavailable;
+  if (!separator || separator.index === undefined) return { response: unavailable, body: stdout };
 
   const headerBlock = stdout.slice(0, separator.index);
   const bodyStart = separator.index + separator[0].length;
-  if (/^HTTP\/(?:1\.1|2)\s/.test(stdout.slice(bodyStart))) return unavailable;
+  if (/^HTTP\/(?:1\.1|2)\s/.test(stdout.slice(bodyStart))) return { response: unavailable, body: stdout };
   const lines = headerBlock.split(/\r?\n/);
   const statusMatch = /^HTTP\/(?:1\.1|2) ([1-5][0-9]{2})\b/.exec(lines[0] ?? '');
-  if (!statusMatch) return unavailable;
+  if (!statusMatch) return { response: unavailable, body: stdout };
 
   const retryAfterValues = lines
     .slice(1)
     .filter((line) => /^retry-after:/i.test(line))
     .map((line) => line.slice(line.indexOf(':') + 1).trim());
-  if (retryAfterValues.length > 1) return unavailable;
+  if (retryAfterValues.length > 1) return { response: unavailable, body: stdout };
 
   const retryAfter = retryAfterValues[0];
-  if (retryAfter !== undefined && !/^[0-9]+$/.test(retryAfter)) return unavailable;
+  if (retryAfter !== undefined && !/^[0-9]+$/.test(retryAfter)) return { response: unavailable, body: stdout };
 
   return {
-    available: true,
-    status: Number(statusMatch[1]),
-    retry_after_seconds: retryAfter === undefined ? null : Number(retryAfter),
+    response: {
+      available: true,
+      status: Number(statusMatch[1]),
+      retry_after_seconds: retryAfter === undefined ? null : Number(retryAfter),
+    },
+    body: stdout.slice(bodyStart),
   };
+}
+
+function parseIncludedResponse(stdout: string): GhResponseMetadata {
+  return splitIncludedResponse(stdout).response;
 }
 
 /**
@@ -89,36 +96,37 @@ function parseIncludedResponse(stdout: string): GhResponseMetadata {
  */
 function execGh(args: string[], opts: { cwd?: string; timeout?: number; includeHeaders?: boolean } = {}): GhResult {
   const timeout = opts.timeout ?? 15000;
-  const result = execTool('gh', args, { cwd: opts.cwd, timeout });
+  const invocationArgs = opts.includeHeaders && !args.includes('--include') ? [...args, '--include'] : args;
+  const result = execTool('gh', invocationArgs, { cwd: opts.cwd, timeout });
+  const included = opts.includeHeaders ? splitIncludedResponse(result.stdout) : undefined;
 
   if (result.error && (result.error as NodeJS.ErrnoException).code === 'ENOENT') {
     return {
       exitCode: 127,
-      stdout: result.stdout,
+      stdout: included?.body ?? result.stdout,
       stderr: result.stderr,
       reason: GH_REASON.ENOENT,
-      ...(opts.includeHeaders ? { response: parseIncludedResponse(result.stdout) } : {}),
+      ...(included ? { response: included.response } : {}),
     };
   }
 
   if (result.signal === 'SIGTERM') {
     return {
       exitCode: 124,
-      stdout: result.stdout,
+      stdout: included?.body ?? result.stdout,
       stderr: result.stderr,
       reason: GH_REASON.TIMEOUT,
       timeout_ms: timeout,
-      ...(opts.includeHeaders ? { response: parseIncludedResponse(result.stdout) } : {}),
+      ...(included ? { response: included.response } : {}),
     };
   }
 
-  const response = opts.includeHeaders ? parseIncludedResponse(result.stdout) : undefined;
   return {
     exitCode: result.exitCode,
-    stdout: result.stdout,
+    stdout: included?.body ?? result.stdout,
     stderr: result.stderr,
     reason: result.exitCode === 0 ? GH_REASON.OK : GH_REASON.EXIT_NONZERO,
-    ...(response ? { response } : {}),
+    ...(included ? { response: included.response } : {}),
   };
 }
 
