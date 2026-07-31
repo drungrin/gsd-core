@@ -4,6 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { makeFakeClock } = require('./helpers/clock.cjs');
 const { applyMutationPlan, POINTS_RESERVE, parseRateLimit, decodeConfirmedCompletion } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
+const { planReconciliation } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
 
 function operation(key, kind = 'update') {
   return {
@@ -62,6 +63,17 @@ test('applies operations serially and checkpoints response-derived completion be
   assert.equal(result.kind, 'completed');
   assert.deepEqual(setup.calls.map((call) => call[0]), ['exec', 'record', 'write', 'exec', 'record', 'write']);
   assert.equal(setup.calls[1][1].nodeId, 'one-node');
+});
+
+test('accepts a real pure reconciler operation at the applier boundary', () => {
+  const plan = planReconciliation(
+    { available: true, reason: 'ok', phases: [{ id: '01', title: 'One', goal: 'one' }] },
+    { available: true, reason: 'ok', target: { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 }, items: [], fields: [], subIssues: [] },
+    { kind: 'absent' },
+  );
+  const setup = makeAdapters([success({ nodeId: 'from-real-plan' })]);
+  assert.equal(applyMutationPlan(plan, { cwd: '/repo', map: null, ...setup.adapters }).kind, 'completed');
+  assert.equal(setup.calls[1][1].nodeId, 'from-real-plan');
 });
 
 test('uses the 100-point reserve and reset time for the next dispatch, independently of content pacing', () => {
