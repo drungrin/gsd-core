@@ -165,6 +165,20 @@ describe('execGh include-header framing', () => {
     assert.strictEqual(result.response, undefined);
     assert.strictEqual(result.stdout, fixture.stdout);
   });
+
+  test('includeHeaders requests one header block and returns body-only JSON to GraphQL consumers', () => {
+    let capturedArgs;
+    const fixture = headerFraming.cases['retry-after'];
+    mock.method(childProcess, 'spawnSync', (_program, args) => {
+      capturedArgs = args;
+      return { status: 1, stdout: fixture.stdout, stderr: '', error: undefined, signal: null };
+    });
+
+    const result = execGh(['api', 'graphql', '--include'], { includeHeaders: true });
+    assert.equal(capturedArgs.filter((arg) => arg === '--include').length, 1);
+    assert.equal(result.stdout, '{"data":{}}');
+    assert.deepEqual(result.response, { available: true, status: 429, retry_after_seconds: 17 });
+  });
 });
 
 describe('probeProjectsV2Scope', () => {
