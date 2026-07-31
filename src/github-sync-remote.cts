@@ -26,6 +26,7 @@ interface ReadRemoteSnapshotOptions {
   cwd: string;
   owner: string;
   repo: string;
+  repositoryNumber: number;
   projectNumber: number;
   subIssueNumber?: number;
   execGh?: (args: string[], opts: { cwd?: string }) => GhResult;
@@ -34,7 +35,7 @@ interface ReadRemoteSnapshotOptions {
 interface RemoteSnapshot {
   available: boolean;
   reason: RemoteReason;
-  target?: { owner: string; repo: string; projectNumber: number };
+  target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number };
   items: RemoteNode[];
   fields: RemoteNode[];
   subIssues: RemoteNode[];
@@ -162,7 +163,19 @@ function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot 
     subIssues.push(...children.map((child) => ({ ...child, parentIssueNumber: issueNumber })));
   }
 
-  return { available: true, reason: REMOTE_REASON.OK, target: { owner: options.owner, repo: options.repo, projectNumber: options.projectNumber }, items, fields, subIssues };
+  return {
+    available: true,
+    reason: REMOTE_REASON.OK,
+    target: {
+      owner: options.owner,
+      repo: options.repo,
+      repositoryNumber: options.repositoryNumber,
+      projectNumber: options.projectNumber,
+    },
+    items,
+    fields,
+    subIssues,
+  };
 }
 
 export = {

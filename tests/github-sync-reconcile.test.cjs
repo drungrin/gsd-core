@@ -47,7 +47,8 @@ test('planReconciliation emits a complete, array-only mutation operation from de
   const query = operation.args.find((arg) => arg.startsWith('query='));
   assert.ok(query?.startsWith('query=mutation'));
   assert.match(query, /rateLimit \{ cost remaining resetAt \}/);
-  assert.match(query, /addProjectV2Item \{ projectV2Item \{ id content \{ \.\.\. on Issue \{ number \} \} \} \}/);
+  assert.match(query, /addProjectV2Item\(input:/);
+  assert.match(query, /projectV2Item \{ id content \{ \.\.\. on Issue \{ number \} \} \}/);
   assert.ok(operation.args.some((arg) => arg === '-F'));
   assert.ok(operation.args.includes('projectId=7'));
 });

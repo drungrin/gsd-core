@@ -63,7 +63,7 @@ describe('readRemoteSnapshot', () => {
     };
     const cursors = { items: 0, fields: 0, 101: 0, 202: 0 };
     const result = readRemoteSnapshot({
-      cwd: '/tmp', owner: 'octo', repo: 'example', projectNumber: 7,
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7,
       execGh(args) {
         const query = args.find((arg) => arg.startsWith('query='));
         const connection = ['items', 'fields', 'subIssues'].find((name) => query.includes(`github-sync:${name}`));
@@ -76,7 +76,7 @@ describe('readRemoteSnapshot', () => {
     });
 
     assert.equal(result.available, true);
-    assert.deepEqual(result.target, { owner: 'octo', repo: 'example', projectNumber: 7 });
+    assert.deepEqual(result.target, { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 });
     assert.equal(result.items.length, 101);
     assert.equal(result.fields.length, 2);
     assert.equal(result.subIssues.length, 102);
@@ -92,7 +92,7 @@ describe('readRemoteSnapshot', () => {
 
   test('exhausts independent item, field, and sub-issue cursors in stable order', () => {
     const fake = fixtureExec(fixtures['two-pages']);
-    const result = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', projectNumber: 1, subIssueNumber: 101, execGh: fake.execGh });
+    const result = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1, subIssueNumber: 101, execGh: fake.execGh });
 
     assert.strictEqual(result.available, true);
     assert.deepStrictEqual(result.items.map((node) => node.id), ['ITEM-1', 'ITEM-2']);
@@ -103,12 +103,12 @@ describe('readRemoteSnapshot', () => {
 
   test('returns stable empty arrays when all fixture connections are empty', () => {
     const fake = fixtureExec(fixtures.empty);
-    const result = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', projectNumber: 1, execGh: fake.execGh });
+    const result = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1, execGh: fake.execGh });
 
     assert.deepStrictEqual(result, {
       available: true,
       reason: REMOTE_REASON.OK,
-      target: { owner: 'octo', repo: 'example', projectNumber: 1 },
+      target: { owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1 },
       items: [],
       fields: [],
       subIssues: [],
@@ -120,6 +120,7 @@ describe('readRemoteSnapshot', () => {
       cwd: '/tmp',
       owner: 'octo',
       repo: 'example',
+      repositoryNumber: 1,
       projectNumber: 1,
       execGh: () => ({ exitCode: 0, reason: 'ok', stdout: JSON.stringify(fixtures['graphql-error']), stderr: 'secret raw output' }),
     });
@@ -135,6 +136,7 @@ describe('readRemoteSnapshot', () => {
       cwd: '/tmp',
       owner: 'octo',
       repo: 'example',
+      repositoryNumber: 1,
       projectNumber: 1,
       execGh: () => ({ exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('items', {
         nodes: [{ id: 'ITEM-1', content: { number: 101 } }],

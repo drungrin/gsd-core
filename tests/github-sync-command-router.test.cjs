@@ -52,7 +52,7 @@ test('enabled status composes only read seams and never receives a write adapter
   } finally {
     mock.restoreAll();
   }
-  assert.deepEqual(calls, [['desired', '/fixture'], ['target', '/fixture'], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', projectNumber: 7 }], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['reconcile', 3], ['status', true, 0]]);
+  assert.deepEqual(calls, [['desired', '/fixture'], ['target', '/fixture'], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 }], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['reconcile', 3], ['status', true, 0]]);
   assert.deepEqual(outputChunks, ['{"version":1,"available":true}']);
 });
 
@@ -74,7 +74,7 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
       _apply: { applyMutationPlan(plan, options) { calls.push(['apply', plan.operations[0].logicalKey, options.map]); return { kind: 'completed' }; } },
     });
   } finally { mock.restoreAll(); }
-  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', projectNumber: 7 }], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['reconcile', 3], ['apply', 'phase:01', null]]);
+  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 }], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['reconcile', 3], ['apply', 'phase:01', null]]);
   assert.deepEqual(chunks, ['{\n  "kind": "completed"\n}']);
 });
 

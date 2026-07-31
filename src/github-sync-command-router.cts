@@ -87,7 +87,7 @@ interface AuthModule {
 }
 
 interface DesiredModule { readDesiredState(cwd: string): unknown; }
-interface RemoteModule { readRemoteSnapshot(options: { cwd: string; owner: string; repo: string; projectNumber: number }): unknown; }
+interface RemoteModule { readRemoteSnapshot(options: { cwd: string; owner: string; repo: string; repositoryNumber: number; projectNumber: number }): unknown; }
 interface MapModule { readSyncMapStrict(cwd: string, repository: { owner: string; repo: string; number: number }): unknown; }
 interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
 interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
@@ -204,7 +204,7 @@ function routeGithubSyncCommandRouter({
             output(dto, raw, status.renderStatusV1(dto, raw));
             return;
           }
-          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, projectNumber: resolvedTarget.target.projectNumber });
+          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber });
           const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber });
           dto = status.buildStatusV1(remoteSnapshot, reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap));
         } catch {
@@ -229,7 +229,7 @@ function routeGithubSyncCommandRouter({
                 output(result, raw);
                 return;
               }
-              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, projectNumber: resolvedTarget.target.projectNumber }) as { available?: unknown };
+              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber }) as { available?: unknown };
               if (remoteSnapshot?.available !== true) {
                 result = { kind: 'uncertain', reason: 'remote_unavailable' };
               } else {
