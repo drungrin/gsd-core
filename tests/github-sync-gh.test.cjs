@@ -209,21 +209,20 @@ describe('execGh include-header framing', () => {
     assert.strictEqual(result.stdout, fixture.stdout);
   });
 
-  test('the header allowlist is unchanged: extra headers on the live 200 response never leak into the returned metadata', () => {
-    const fixture = headerFraming.cases['live-200'];
+  test('the header allowlist is unchanged: five additional distinctive-valued headers never leak into the returned metadata', () => {
+    const fixture = headerFraming.cases['extra-headers-distinctive'];
     const result = runIncluded(fixture.stdout);
 
     assert.deepStrictEqual(Object.keys(result.response).sort(), ['available', 'retry_after_seconds', 'status'].sort());
 
     const headerBlock = fixture.stdout.slice(0, fixture.stdout.search(/\r?\n\r?\n/));
     const headerLines = headerBlock.split(/\r?\n/).slice(1); // drop the status line itself
+    assert.strictEqual(headerLines.length, 5, 'fixture must carry exactly five additional headers');
     const serialized = JSON.stringify(result.response);
     for (const line of headerLines) {
       const colonIndex = line.indexOf(':');
-      if (colonIndex === -1) continue;
       const name = line.slice(0, colonIndex).trim();
       const value = line.slice(colonIndex + 1).trim();
-      if (!value || /^retry-after$/i.test(name)) continue;
       assert.ok(!serialized.includes(value), `header value for "${name}" (${value}) must not appear in the returned metadata`);
     }
   });

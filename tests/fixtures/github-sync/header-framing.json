@@ -26,10 +26,10 @@
       "provenance": "synthetic: status line copied from the live 200 case above; 429 not reproducible on demand without deliberately abusing the API, which the never-gate-the-loop posture forbids"
     },
     "stacked-blocks": {
-      "stdout": "HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{}}\r\n\r\nHTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{}}",
+      "stdout": "HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\nHTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n{\"data\":{}}",
       "status": null,
       "retry_after_seconds": null,
-      "provenance": "synthetic: two stacked response blocks, framing derived from the live 200 case above, exercising the two-block guard so include mode and pagination mode are never silently combined"
+      "provenance": "synthetic: a second status line immediately after the first blank-line separator, exercising the two-block guard so include mode and pagination mode are never silently combined"
     },
     "not-a-status-line": {
       "stdout": "not a status line at all\r\n\r\n{\"data\":{}}",
@@ -66,6 +66,12 @@
       "status": null,
       "retry_after_seconds": null,
       "provenance": "synthetic: hostile input, non-numeric Retry-After value"
+    },
+    "extra-headers-distinctive": {
+      "stdout": "HTTP/2.0 200 OK\r\nx-request-id: req-9f8e7d6c5b4a\r\nx-secret-canary: do-not-leak-canary-value\r\nx-github-sso: required; url=https://github.com/orgs/example/sso\r\nx-oauth-scopes: gist, project, read:org, repo\r\netag: W/\"deadbeefcafef00d\"\r\n\r\n{\"data\":{}}",
+      "status": 200,
+      "retry_after_seconds": null,
+      "provenance": "synthetic: five additional headers with distinctive values, none of which may appear in the returned metadata"
     }
   }
 }

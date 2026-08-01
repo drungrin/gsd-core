@@ -43,6 +43,19 @@ interface GhResponseMetadata {
 }
 
 /**
+ * Observed live: `gh api --include /rate_limit` on gh 2.96.0 (2026-08-01)
+ * emits "HTTP/2.0 200 OK" — the protocol token carries an explicit ".0"
+ * minor-version suffix that the previous pattern, which required a literal
+ * space immediately after the major-version digit, never matched. This
+ * pattern accepts that optional minor-version suffix so both framing shapes
+ * are recognized identically; it does not relax the required space or widen
+ * the 1xx-5xx code range. One shared constant drives both the two-block
+ * guard and the status capture below, so both recognize the same set of
+ * lines.
+ */
+const HTTP_STATUS_LINE = /^HTTP\/[0-9](?:\.[0-9])? ([1-5][0-9]{2})\b/;
+
+/**
  * Accept exactly one leading HTTP response header block. The CLI's --include
  * output is transport data, not operator output: callers get only allowlisted
  * metadata and retain raw output solely inside the transport seam.
@@ -54,9 +67,9 @@ function splitIncludedResponse(stdout: string): { response: GhResponseMetadata; 
 
   const headerBlock = stdout.slice(0, separator.index);
   const bodyStart = separator.index + separator[0].length;
-  if (/^HTTP\/(?:1\.1|2)\s/.test(stdout.slice(bodyStart))) return { response: unavailable, body: stdout };
+  if (HTTP_STATUS_LINE.test(stdout.slice(bodyStart))) return { response: unavailable, body: stdout };
   const lines = headerBlock.split(/\r?\n/);
-  const statusMatch = /^HTTP\/(?:1\.1|2) ([1-5][0-9]{2})\b/.exec(lines[0] ?? '');
+  const statusMatch = HTTP_STATUS_LINE.exec(lines[0] ?? '');
   if (!statusMatch) return { response: unavailable, body: stdout };
 
   const retryAfterValues = lines
