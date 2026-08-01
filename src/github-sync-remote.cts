@@ -52,7 +52,12 @@ interface Page {
 const DOCUMENTS = Object.freeze({
   project: 'query($projectNumber:Int!) { # github-sync:project\n viewer { projectV2(number:$projectNumber) { id } } }',
   items: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:items\n viewer { projectV2(number:$projectNumber) { items(first:100,after:$endCursor) { nodes { id content { ... on Issue { id number } } } pageInfo { hasNextPage endCursor } } } } }',
-  fields: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:fields\n viewer { projectV2(number:$projectNumber) { fields(first:100,after:$endCursor) { nodes { id name } pageInfo { hasNextPage endCursor } } } } }',
+  // ProjectV2.fields.nodes resolves to the ProjectV2FieldConfiguration union
+  // (ProjectV2Field | ProjectV2IterationField | ProjectV2SingleSelectField).
+  // Scalars can't be selected directly on a union (GitHub rejects it live with
+  // selectionMismatch); select through an inline fragment on ProjectV2FieldCommon,
+  // the interface every member of the union implements (G-02-7).
+  fields: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:fields\n viewer { projectV2(number:$projectNumber) { fields(first:100,after:$endCursor) { nodes { ... on ProjectV2FieldCommon { id name } } pageInfo { hasNextPage endCursor } } } } }',
   subIssues: 'query($owner:String!,$repo:String!,$issueNumber:Int!,$endCursor:String) { # github-sync:subIssues\n repository(owner:$owner,name:$repo) { issue(number:$issueNumber) { subIssues(first:100,after:$endCursor) { nodes { id number } pageInfo { hasNextPage endCursor } } } } }',
   issueId: 'query($owner:String!,$repo:String!,$issueNumber:Int!) { # github-sync:issueId\n repository(owner:$owner,name:$repo) { issue(number:$issueNumber) { id } } }',
 });
