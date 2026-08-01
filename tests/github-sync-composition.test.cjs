@@ -9,7 +9,7 @@ const { planReconciliation } = require('../gsd-core/bin/lib/github-sync-reconcil
 const { applyMutationPlan } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
 const { readSyncMapStrict, recordCompletion, writeSyncMapAtomically } = require('../gsd-core/bin/lib/github-sync-map.cjs');
 
-const TARGET = { owner: 'octo', repo: 'roadmap', repositoryNumber: 42, projectNumber: 7 };
+const TARGET = { owner: 'octo', repo: 'roadmap', repositoryNumber: 42, projectNumber: 7, projectNodeId: 'PVT_proj_node_1' };
 const REPOSITORY = { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber };
 const FIXED_NOW = '2026-07-30T21:00:00.000Z';
 
@@ -24,8 +24,16 @@ function desired() {
   };
 }
 
-function remote() {
-  return { available: true, reason: 'ok', target: TARGET, items: [], fields: [], subIssues: [] };
+function remote(items = []) {
+  return {
+    available: true,
+    reason: 'ok',
+    target: TARGET,
+    items,
+    fields: [],
+    subIssues: [],
+    issueNodeIds: { 101: 'ISSUE_NODE_101', 102: 'ISSUE_NODE_102' },
+  };
 }
 
 function response(nodeId, issueNumber) {
@@ -46,12 +54,36 @@ test('real reconciler, applier, and strict map resume each response-validated ch
   const clock = makeFakeClock(Date.parse(FIXED_NOW));
   clock.nowIso = () => FIXED_NOW;
   const argv = [];
+  const initialMap = {
+    version: '1',
+    repository: REPOSITORY,
+    completions: {
+      'phase:01': {
+        logicalKey: 'phase:01',
+        nodeId: 'ISSUE_NODE_101',
+        issueNumber: 101,
+        completedAt: FIXED_NOW,
+        owner: TARGET.owner,
+        repo: TARGET.repo,
+        repositoryNumber: TARGET.repositoryNumber,
+      },
+      'phase:02': {
+        logicalKey: 'phase:02',
+        nodeId: 'ISSUE_NODE_102',
+        issueNumber: 102,
+        completedAt: FIXED_NOW,
+        owner: TARGET.owner,
+        repo: TARGET.repo,
+        repositoryNumber: TARGET.repositoryNumber,
+      },
+    },
+  };
 
-  const firstPlan = planReconciliation(desired(), remote(), readSyncMapStrict(cwd, REPOSITORY));
+  const firstPlan = planReconciliation(desired(), remote(), { kind: 'valid', map: initialMap });
   assert.equal(firstPlan.operations.length, 2);
   const firstRun = applyMutationPlan(firstPlan, {
     cwd,
-    map: null,
+    map: initialMap,
     clock,
     execGh(args) {
       argv.push(args);
@@ -73,7 +105,11 @@ test('real reconciler, applier, and strict map resume each response-validated ch
     owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber,
   });
 
-  const resumedPlan = planReconciliation(desired(), remote(), reopened);
+  const resumedPlan = planReconciliation(
+    desired(),
+    remote([{ id: 'PVT_item_one', content: { id: 'ISSUE_NODE_101', number: 101 } }]),
+    reopened,
+  );
   assert.deepEqual(resumedPlan.operations.map((operation) => operation.logicalKey), ['phase:02']);
   const firstArgv = argv[0];
   const resumed = applyMutationPlan(resumedPlan, {
@@ -88,12 +124,19 @@ test('real reconciler, applier, and strict map resume each response-validated ch
     writeSyncMapAtomically,
   });
   assert.equal(resumed.kind, 'completed');
-  assert.deepEqual(argv.map((args) => args.at(-1)), ['contentId=01', 'contentId=02', 'contentId=02']);
+  assert.deepEqual(argv.map((args) => args.at(-1)), ['contentId=ISSUE_NODE_101', 'contentId=ISSUE_NODE_102', 'contentId=ISSUE_NODE_102']);
   assert.notDeepEqual(firstArgv, argv[2], 'the resumed operation must not duplicate the confirmed first-run argv');
 
   const unchanged = readSyncMapStrict(cwd, REPOSITORY);
   assert.equal(unchanged.kind, 'valid');
-  const unchangedPlan = planReconciliation(desired(), remote(), unchanged);
+  const unchangedPlan = planReconciliation(
+    desired(),
+    remote([
+      { id: 'PVT_item_one', content: { id: 'ISSUE_NODE_101', number: 101 } },
+      { id: 'PVT_item_two', content: { id: 'ISSUE_NODE_102', number: 102 } },
+    ]),
+    unchanged,
+  );
   assert.equal(unchangedPlan.operations.length, 0);
   let unexpectedCalls = 0;
   assert.equal(applyMutationPlan(unchangedPlan, {
