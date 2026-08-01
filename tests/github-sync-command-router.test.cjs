@@ -32,6 +32,9 @@ const { createTempProject, cleanup, TOOLS_PATH } = require('./helpers.cjs');
 
 const { routeGithubSyncCommandRouter } = require('../gsd-core/bin/lib/github-sync-command-router.cjs');
 const { PREFLIGHT_REASON } = require('../gsd-core/bin/lib/github-sync-auth.cjs');
+// G-02-2: the real compiled status module, not an injected renderer stub — a
+// stub cannot prove the default-path/--raw wiring these tests exist to check.
+const realStatus = require('../gsd-core/bin/lib/github-sync-status.cjs');
 
 test('enabled status composes only read seams and never receives a write adapter', () => {
   const calls = [];
@@ -131,6 +134,104 @@ test('enabled sync stops at preflight or unavailable desired state without reach
     routeGithubSyncCommandRouter(makeOptions({ ok: true, reason: 'ok', message: 'ok' }));
     assert.deepEqual(calls, ['preflight', 'desired']);
   } finally { mock.restoreAll(); }
+});
+
+// ─── G-02-2: default status path renders human, --raw stays JSON ────────────
+//
+// The pre-existing two tests above inject a stub `renderStatusV1` and drive
+// only `raw: true` — they prove composition, not the human/machine split.
+// These three tests drive the real compiled status module (`realStatus`,
+// imported above) as `_status` so the router's actual wiring is exercised:
+// an injected renderer stub could pass even if the default path were still
+// stranded on JSON, which is exactly how G-02-2 shipped broken.
+
+describe('github-sync status: G-02-2 default-path/--raw wiring (real status module)', () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, data, offset, length) => {
+      const chunk = chunkOfWriteSyncArgs(data, offset, length);
+      chunks.push(chunk);
+      return Buffer.byteLength(chunk, 'utf8');
+    });
+    return chunks;
+  }
+
+  const AVAILABLE_TARGET = { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 };
+
+  function makeAvailableOptions(raw) {
+    return {
+      args: ['github-sync', 'status'], cwd: '/fixture', raw,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _status: realStatus,
+      _target: { readSyncTarget() { return { available: true, target: AVAILABLE_TARGET }; } },
+      _desired: { readDesiredState() { return { available: true }; } },
+      _remote: { readRemoteSnapshot() { return { available: true, reason: 'ok' }; } },
+      _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+      _reconcile: {
+        planReconciliation() {
+          return {
+            operations: [{ kind: 'create', logicalKey: 'phase:02' }],
+            noops: [{ logicalKey: 'phase:01' }],
+            blocked: [], uncertain: [],
+          };
+        },
+      },
+    };
+  }
+
+  test('default path (raw: false) prints the human summary — stdout does not parse as JSON and names the planned keys', () => {
+    const chunks = captureStdout();
+    try {
+      routeGithubSyncCommandRouter(makeAvailableOptions(false));
+    } finally { mock.restoreAll(); }
+    const stdout = chunks.join('');
+    assert.throws(() => JSON.parse(stdout), 'default status stdout must NOT parse as JSON (G-02-2)');
+    assert.match(stdout, /github-sync status/);
+    assert.match(stdout, /phase:02/, 'planned create must be named by its logical key');
+    assert.match(stdout, /phase:01/, 'existing no-op must be named by its logical key');
+  });
+
+  test('--raw path (raw: true) still emits the unchanged compact v1 JSON', () => {
+    const chunks = captureStdout();
+    try {
+      routeGithubSyncCommandRouter(makeAvailableOptions(true));
+    } finally { mock.restoreAll(); }
+    const stdout = chunks.join('');
+    let parsed;
+    assert.doesNotThrow(() => { parsed = JSON.parse(stdout); }, `--raw stdout must parse as JSON; got: ${stdout}`);
+    assert.strictEqual(parsed.version, 1);
+    assert.strictEqual(parsed.available, true);
+    assert.deepEqual(parsed.creates, ['phase:02']);
+    assert.deepEqual(parsed.updates, []);
+    assert.deepEqual(parsed.noops, ['phase:01']);
+  });
+
+  test('unavailable remote on the default path (raw: false) prints the operator-facing message, not JSON, and leaves exit code untouched (D-16)', () => {
+    const chunks = captureStdout();
+    process.exitCode = 0;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: false,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _status: realStatus,
+        _target: { readSyncTarget() { return { available: true, target: AVAILABLE_TARGET }; } },
+        _desired: { readDesiredState() { return { available: true }; } },
+        _remote: { readRemoteSnapshot() { return { available: false, reason: 'remote_unavailable' }; } },
+        _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+        _reconcile: { planReconciliation() { return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
+      });
+    } finally { mock.restoreAll(); }
+    assert.strictEqual(process.exitCode, 0, 'D-16: unavailable status must not gate the loop');
+    const stdout = chunks.join('');
+    assert.throws(() => JSON.parse(stdout), 'unavailable default-path stdout must NOT parse as JSON');
+    assert.match(stdout, /github-sync status is unavailable/);
+  });
 });
 
 // ─── helpers ────────────────────────────────────────────────────────────────
