@@ -10,10 +10,19 @@ const fixtures = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/remote-pages.json'), 'utf8'),
 );
 
+// D-12/D-13: project/items/fields are now scoped through repositoryOwner,
+// not the viewer — see the matching decode-path change in
+// src/github-sync-remote.cts.
 function envelope(connection, page) {
   if (connection === 'issueId') return { data: { repository: { issue: page } } };
-  if (connection === 'project') return { data: { viewer: { projectV2: page } } };
+  if (connection === 'project') return { data: { repositoryOwner: { projectV2: page } } };
   if (connection === 'subIssues') return { data: { repository: { issue: { subIssues: page } } } };
+  return { data: { repositoryOwner: { projectV2: { [connection]: page } } } };
+}
+
+/** The pre-generalization, viewer-rooted response shape — must decode to nothing (cycle-2 HIGH-H). */
+function viewerRootedEnvelope(connection, page) {
+  if (connection === 'project') return { data: { viewer: { projectV2: page } } };
   return { data: { viewer: { projectV2: { [connection]: page } } } };
 }
 
@@ -265,6 +274,115 @@ describe('readRemoteSnapshot', () => {
     });
     assert.strictEqual(stalled.available, false);
     assert.strictEqual(stalled.reason, REMOTE_REASON.UNAVAILABLE);
+  });
+
+  // ─── D-13: owner-scoping — organization/user parity and decoder-drift gate ─
+
+  test('a project read whose response resolves an organization-kind owner and one whose response resolves a user-kind owner yield the same project node id, with the same call count', () => {
+    const userFake = fixtureExec(fixtures['two-pages']);
+    const userResult = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo-user', repo: 'example', repositoryNumber: 1, projectNumber: 1, execGh: userFake.execGh });
+
+    const orgFake = fixtureExec(fixtures['two-pages-organization']);
+    const orgResult = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo-org', repo: 'example', repositoryNumber: 1, projectNumber: 1, execGh: orgFake.execGh });
+
+    assert.equal(userResult.available, true);
+    assert.equal(orgResult.available, true);
+    assert.equal(userFake.calls.length, orgFake.calls.length);
+    assert.equal(userFake.calls.filter((call) => call.connection === 'project').length, 1);
+    assert.equal(orgFake.calls.filter((call) => call.connection === 'project').length, 1);
+  });
+
+  test('an items read and a fields read whose responses resolve an organization-kind owner decode into the same node arrays their user-kind equivalents produce, exhausting a two-page cursor identically', () => {
+    const userFake = fixtureExec(fixtures['two-pages']);
+    const userResult = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo-user', repo: 'example', repositoryNumber: 1, projectNumber: 1, execGh: userFake.execGh });
+
+    const orgFake = fixtureExec(fixtures['two-pages-organization']);
+    const orgResult = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo-org', repo: 'example', repositoryNumber: 1, projectNumber: 1, execGh: orgFake.execGh });
+
+    assert.deepStrictEqual(orgResult.items.map((node) => node.id), userResult.items.map((node) => node.id));
+    assert.deepStrictEqual(orgResult.fields.map((node) => node.id), userResult.fields.map((node) => node.id));
+    assert.equal(orgFake.calls.filter((call) => call.connection === 'items').length, 2, 'a two-page items connection must exhaust both pages for an organization-kind owner too');
+    assert.equal(orgFake.calls.filter((call) => call.connection === 'fields').length, 2, 'a two-page fields connection must exhaust both pages for an organization-kind owner too');
+  });
+
+  test('a project read whose owner resolves but whose project is null yields the existing unavailable result, distinct from a transport failure', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 999,
+      execGh: (args) => {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify({ data: { repositoryOwner: { projectV2: null } } }), stderr: '' };
+        }
+        throw new Error('a null project must short-circuit before any connection read');
+      },
+    });
+    assert.equal(result.available, false);
+    assert.equal(result.reason, REMOTE_REASON.UNAVAILABLE);
+  });
+
+  test('a response still shaped the OLD way — rooted at the viewer rather than the owner — decodes to null/unavailable for the project, items, and fields reads (the HIGH-H gate)', () => {
+    const viewerRootedProject = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh: () => ({ exitCode: 0, reason: 'ok', stdout: JSON.stringify(viewerRootedEnvelope('project', { id: 'PVT_should_not_decode' })), stderr: '' }),
+    });
+    assert.equal(viewerRootedProject.available, false);
+    assert.equal(viewerRootedProject.reason, REMOTE_REASON.UNAVAILABLE);
+
+    const viewerRootedItems = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh: (args) => {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('project', { id: 'PVT_ok' })), stderr: '' };
+        }
+        if (query.includes('github-sync:items')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(viewerRootedEnvelope('items', { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } })), stderr: '' };
+        }
+        throw new Error('an unavailable items read must short-circuit before the fields read');
+      },
+    });
+    assert.equal(viewerRootedItems.available, false);
+    assert.equal(viewerRootedItems.reason, REMOTE_REASON.UNAVAILABLE);
+
+    const viewerRootedFields = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh: (args) => {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('project', { id: 'PVT_ok' })), stderr: '' };
+        }
+        if (query.includes('github-sync:items')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('items', { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } })), stderr: '' };
+        }
+        if (query.includes('github-sync:fields')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(viewerRootedEnvelope('fields', { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } })), stderr: '' };
+        }
+        throw new Error(`unexpected query: ${query}`);
+      },
+    });
+    assert.equal(viewerRootedFields.available, false);
+    assert.equal(viewerRootedFields.reason, REMOTE_REASON.UNAVAILABLE);
+  });
+
+  test("each generalized document's argv carries the login value immediately after a raw -f flag and the project number immediately after a typed -F flag, on every page of a connection read", () => {
+    const fake = fixtureExec(fixtures['two-pages']);
+    readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1, execGh: fake.execGh });
+    for (const call of fake.calls) {
+      if (call.connection !== 'project' && call.connection !== 'items' && call.connection !== 'fields') continue;
+      const loginIndex = call.args.findIndex((arg) => arg.startsWith('login='));
+      assert.ok(loginIndex > 0, `${call.connection} call must carry a login= argument`);
+      assert.equal(call.args[loginIndex - 1], '-f', `${call.connection} call's login must ride the raw -f flag`);
+      assert.equal(call.args[loginIndex].slice('login='.length), 'octo');
+      const projectIndex = call.args.findIndex((arg) => arg.startsWith('projectNumber='));
+      assert.ok(projectIndex > 0, `${call.connection} call must carry a projectNumber= argument`);
+      assert.equal(call.args[projectIndex - 1], '-F', `${call.connection} call's projectNumber must ride the typed -F flag`);
+    }
+    const itemsCalls = fake.calls.filter((call) => call.connection === 'items');
+    const fieldsCalls = fake.calls.filter((call) => call.connection === 'fields');
+    assert.equal(itemsCalls.length, 2, 'the items connection must have dispatched a second page in this fixture');
+    assert.equal(fieldsCalls.length, 2, 'the fields connection must have dispatched a second page in this fixture');
+    assert.ok(itemsCalls[1].args.some((arg) => arg === 'login=octo' || arg.startsWith('login=')), 'the login argument must be present on the second page request, not only the first');
+    assert.ok(fieldsCalls[1].args.some((arg) => arg.startsWith('login=')), 'the login argument must be present on the second page request, not only the first');
   });
 });
 
@@ -537,6 +655,16 @@ describe('gh field-flag safety (no local-file read via -F)', () => {
       const index = args.findIndex((arg) => arg.startsWith('owner='));
       if (index === -1) continue;
       assert.equal(args[index - 1], '-f', 'an @-prefixed owner must be dispatched with -f so gh sends it verbatim instead of reading the named file');
+    }
+
+    // T-03-29: the same @-prefixed owner value also feeds the project/items/
+    // fields documents' login variable, which must ride -f for the same reason.
+    const loginArgs = dispatched.flatMap((args) => args.filter((arg) => arg.startsWith('login=')));
+    assert.ok(loginArgs.length > 0, 'expected at least one login argument to be dispatched');
+    for (const args of dispatched) {
+      const index = args.findIndex((arg) => arg.startsWith('login='));
+      if (index === -1) continue;
+      assert.equal(args[index - 1], '-f', 'an @-prefixed login must be dispatched with -f so gh sends it verbatim instead of reading the named file');
     }
   });
 });

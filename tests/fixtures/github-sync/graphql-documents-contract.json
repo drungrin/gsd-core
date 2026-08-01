@@ -1,5 +1,5 @@
 {
-  "provenance": "Schema facts probed live against drungrin/gsd-core Project v2 #9 and #10 with `project` scope, 2026-08-01 (.planning/phases/02-sync-engine-core/02-UAT.md gap G-02-7 evidence). Re-verify against the live schema before editing this file rather than guessing.",
+  "provenance": "Schema facts probed live against drungrin/gsd-core Project v2 #9 and #10 with `project` scope, 2026-08-01 (.planning/phases/02-sync-engine-core/02-UAT.md gap G-02-7 evidence). Re-verify against the live schema before editing this file rather than guessing. Updated 2026-08-01 (phase 03 plan 03, D-13): project/items/fields re-scoped from `viewer` to `repositoryOwner(login:) { ... on ProjectV2Owner { ... } }` so an organization-owned board is visible; each leaf selection's own node kind/fragment/selects are unchanged, recorded via the added `scopedVia` field.",
   "documents": {
     "project": {
       "connection": null,
@@ -7,23 +7,26 @@
       "nodeKind": "OBJECT",
       "fragmentTargets": [],
       "selects": ["id"],
-      "paginated": false
+      "paginated": false,
+      "scopedVia": "repositoryOwner(login:) { ... on ProjectV2Owner { projectV2(number:) } }"
     },
     "items": {
-      "connection": ["viewer", "projectV2", "items"],
+      "connection": ["repositoryOwner", "projectV2", "items"],
       "nodeType": "ProjectV2Item",
       "nodeKind": "OBJECT",
       "fragmentTargets": [],
       "selects": ["id", "content"],
-      "paginated": true
+      "paginated": true,
+      "scopedVia": "repositoryOwner(login:) { ... on ProjectV2Owner { projectV2(number:) { items } } }"
     },
     "fields": {
-      "connection": ["viewer", "projectV2", "fields"],
+      "connection": ["repositoryOwner", "projectV2", "fields"],
       "nodeType": "ProjectV2FieldConfiguration",
       "nodeKind": "UNION",
       "fragmentTargets": ["ProjectV2FieldCommon"],
       "selects": ["id", "name"],
-      "paginated": true
+      "paginated": true,
+      "scopedVia": "repositoryOwner(login:) { ... on ProjectV2Owner { projectV2(number:) { fields } } }"
     },
     "subIssues": {
       "connection": ["repository", "issue", "subIssues"],

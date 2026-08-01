@@ -14,6 +14,21 @@
       {"nodes": [{"id": "SUB-2", "number": 2}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
     ]
   },
+  "two-pages-organization": {
+    "project": {"id": "PVT_proj_node_org_1"},
+    "items": [
+      {"nodes": [{"id": "ITEM-1", "content": {"id": "ISSUE_NODE_101", "number": 101}}], "pageInfo": {"hasNextPage": true, "endCursor": "item-2"}},
+      {"nodes": [{"id": "ITEM-2", "content": {"id": "ISSUE_NODE_102", "number": 102}}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+    ],
+    "fields": [
+      {"nodes": [{"id": "PVTF_field_1", "name": "Status"}], "pageInfo": {"hasNextPage": true, "endCursor": "field-2"}},
+      {"nodes": [{"id": "PVTSSF_field_2", "name": "Title"}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+    ],
+    "subIssues": [
+      {"nodes": [{"id": "SUB-1", "number": 1}], "pageInfo": {"hasNextPage": true, "endCursor": "sub-2"}},
+      {"nodes": [{"id": "SUB-2", "number": 2}], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+    ]
+  },
   "empty": {
     "project": {"id": "PVT_proj_node_empty"},
     "items": [{"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}],
