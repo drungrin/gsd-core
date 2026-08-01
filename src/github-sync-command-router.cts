@@ -92,7 +92,7 @@ interface MapModule { readSyncMapStrict(cwd: string, repository: { owner: string
 interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
 interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
 interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string; map: unknown }): unknown; }
-interface TargetReadResult { available: boolean; target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number }; }
+interface TargetReadResult { available: boolean; reason?: string; field?: string; target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number }; }
 interface TargetModule { readSyncTarget(cwd: string): TargetReadResult; }
 
 // G-02-2: emitStatus() is a deliberate, local inversion of the family
@@ -228,7 +228,10 @@ function routeGithubSyncCommandRouter({
           const desiredState = desired.readDesiredState(cwd);
           const resolvedTarget = target.readSyncTarget(cwd);
           if (!resolvedTarget.available || !resolvedTarget.target) {
-            dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
+            // G-02-4: propagate the target's own diagnosis (reason + field)
+            // instead of collapsing it into the hardcoded remote-outage
+            // reason — a local config fault is not a GitHub outage.
+            dto = status.buildStatusV1({ available: false, reason: resolvedTarget.reason ?? 'target_unavailable', field: resolvedTarget.field }, null);
             emitStatus(dto, raw, status);
             return;
           }

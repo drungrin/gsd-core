@@ -26,14 +26,19 @@ test('readSyncTarget accepts exactly the closed positive github_sync.target iden
 });
 
 test('readSyncTarget rejects absent, unknown-shaped, and invalid identity without placeholders', () => {
-  for (const config of [
-    {},
-    { github_sync: { target: { owner: 'octo', repo: 'example', repository_number: 42, project_number: 7, extra: true } } },
-    { github_sync: { target: { owner: '', repo: 'example', repository_number: 1, project_number: 1 } } },
-    { github_sync: { target: { owner: 'octo', repo: 'example', repository_number: 0, project_number: 1 } } },
+  // G-02-4: readSyncTarget now also reports which field it blames (Task 1
+  // wires `repository_number` precisely; every other rejection still routes
+  // through the generic `target` fallback until the next task fans the rest
+  // out). The accept/reject decision itself is unchanged from before this
+  // field discriminator existed.
+  for (const [config, field] of [
+    [{}, 'target'],
+    [{ github_sync: { target: { owner: 'octo', repo: 'example', repository_number: 42, project_number: 7, extra: true } } }, 'target'],
+    [{ github_sync: { target: { owner: '', repo: 'example', repository_number: 1, project_number: 1 } } }, 'target'],
+    [{ github_sync: { target: { owner: 'octo', repo: 'example', repository_number: 0, project_number: 1 } } }, 'repository_number'],
   ]) {
     withConfig(config, (cwd) => {
-      assert.deepEqual(readSyncTarget(cwd), { available: false, reason: SYNC_TARGET_REASON.UNAVAILABLE });
+      assert.deepEqual(readSyncTarget(cwd), { available: false, reason: SYNC_TARGET_REASON.UNAVAILABLE, field });
     });
   }
 });

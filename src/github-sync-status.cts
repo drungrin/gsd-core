@@ -4,7 +4,20 @@
 const STATUS_SCHEMA_VERSION = 1;
 const UNAVAILABLE_MESSAGE = 'github-sync status is unavailable because GitHub could not be read. Retry shortly.';
 
-interface StatusInput { available: boolean; reason: string; }
+// G-02-4: a local github_sync.target fault is a local configuration fault,
+// not a GitHub outage — "Retry shortly" is actively wrong advice for it, and
+// no field was ever named. Every entry is a whole fixed literal (D-07/SAFE-04):
+// never assembled from a config value, a caught error, or anything thrown.
+// This task adds only the entries it needs (`target`, `repository_number`);
+// the next task completes the remaining leaf fields (`config`, `owner`,
+// `repo`, `project_number`). An unrecognized or absent field falls back to
+// `target` so the lookup stays total.
+const TARGET_UNAVAILABLE_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  target: 'github-sync status is unavailable because github_sync.target in .planning/config.json is missing or does not declare exactly owner, repo, repository_number, and project_number. Declare all four, then re-run.',
+  repository_number: 'github-sync status is unavailable because github_sync.target.repository_number in .planning/config.json is invalid. Set it to a positive whole number, then re-run.',
+});
+
+interface StatusInput { available: boolean; reason: string; field?: string; }
 interface ReconciliationPlan {
   operations: Array<{ kind: string; logicalKey: string }>;
   noops: Array<{ logicalKey: string }>;
@@ -26,6 +39,22 @@ interface StatusV1 {
 
 function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): StatusV1 {
   if (!remote.available) {
+    // G-02-4: a local github_sync.target fault is diagnosed distinctly from a
+    // remote outage — typed blocker, no `uncertain` entry, no remote read
+    // attempted. Every other reason (including one this module has never
+    // seen) keeps the pre-existing remote-outage branch verbatim: it is the
+    // catch-all for desired/map/remote/reconcile faults and cannot honestly
+    // claim a target diagnosis (this task's prohibitions).
+    if (remote.reason === 'target_unavailable') {
+      const message = (remote.field !== undefined && TARGET_UNAVAILABLE_MESSAGES[remote.field]) || TARGET_UNAVAILABLE_MESSAGES.target;
+      return {
+        version: STATUS_SCHEMA_VERSION, available: false, message,
+        creates: [], updates: [], noops: [],
+        blocked: [remote.field === undefined ? { reason: remote.reason } : { reason: remote.reason, detail: remote.field }],
+        uncertain: [],
+        limitations: ['The local github_sync.target configuration is invalid; no remote read was attempted.'],
+      };
+    }
     return {
       version: STATUS_SCHEMA_VERSION, available: false, message: UNAVAILABLE_MESSAGE,
       creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
