@@ -87,13 +87,23 @@ interface AuthModule {
 }
 
 interface DesiredModule { readDesiredState(cwd: string): unknown; }
-interface RemoteModule { readRemoteSnapshot(options: { cwd: string; owner: string; repo: string; repositoryNumber: number; projectNumber: number }): unknown; }
+interface RemoteModule { readRemoteSnapshot(options: { cwd: string; owner: string; repo: string; repositoryNumber: number; projectNumber: number; issueNodeIdHints?: number[] }): unknown; }
 interface MapModule { readSyncMapStrict(cwd: string, repository: { owner: string; repo: string; number: number }): unknown; }
 interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
 interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
 interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string; map: unknown }): unknown; }
 interface TargetReadResult { available: boolean; target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number }; }
 interface TargetModule { readSyncTarget(cwd: string): TargetReadResult; }
+
+function collectIssueNodeIdHints(strictMap: unknown): number[] {
+  if (strictMap === null || typeof strictMap !== 'object' || (strictMap as { kind?: unknown }).kind !== 'valid') return [];
+  const completions = (strictMap as { map?: { completions?: Record<string, { issueNumber?: unknown }> } }).map?.completions;
+  if (!completions || typeof completions !== 'object') return [];
+  const hints = Object.values(completions)
+    .map((completion) => completion?.issueNumber)
+    .filter((issueNumber): issueNumber is number => typeof issueNumber === 'number' && Number.isSafeInteger(issueNumber) && issueNumber > 0);
+  return [...new Set(hints)].sort((left, right) => left - right);
+}
 
 interface RouteGithubSyncCommandRouterOptions {
   args: string[];
@@ -204,8 +214,8 @@ function routeGithubSyncCommandRouter({
             output(dto, raw, status.renderStatusV1(dto, raw));
             return;
           }
-          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber });
           const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber });
+          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) });
           dto = status.buildStatusV1(remoteSnapshot, reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap));
         } catch {
           dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
@@ -229,13 +239,13 @@ function routeGithubSyncCommandRouter({
                 output(result, raw);
                 return;
               }
-              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber }) as { available?: unknown };
+              const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber }) as {
+                kind?: unknown; map?: unknown;
+              };
+              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) }) as { available?: unknown };
               if (remoteSnapshot?.available !== true) {
                 result = { kind: 'uncertain', reason: 'remote_unavailable' };
               } else {
-                const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber }) as {
-                  kind?: unknown; map?: unknown;
-                };
                 if (strictMap?.kind === 'blocking') {
                   result = { kind: 'blocked', reason: 'sync_map_blocking' };
                 } else {

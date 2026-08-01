@@ -68,8 +68,16 @@ test('applies operations serially and checkpoints response-derived completion be
 test('accepts a real pure reconciler operation at the applier boundary', () => {
   const plan = planReconciliation(
     { available: true, reason: 'ok', phases: [{ id: '01', title: 'One', goal: 'one' }] },
-    { available: true, reason: 'ok', target: { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 }, items: [], fields: [], subIssues: [] },
-    { kind: 'absent' },
+    {
+      available: true,
+      reason: 'ok',
+      target: { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7, projectNodeId: 'PVT_proj_node_1' },
+      items: [],
+      fields: [],
+      subIssues: [],
+      issueNodeIds: { 101: 'ISSUE_NODE_101' },
+    },
+    { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 } } } },
   );
   const setup = makeAdapters([success({ nodeId: 'from-real-plan' })]);
   assert.equal(applyMutationPlan(plan, { cwd: '/repo', map: null, ...setup.adapters }).kind, 'completed');

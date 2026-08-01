@@ -29,6 +29,7 @@ interface ReadRemoteSnapshotOptions {
   repositoryNumber: number;
   projectNumber: number;
   subIssueNumber?: number;
+  issueNodeIdHints?: number[];
   execGh?: (args: string[], opts: { cwd?: string }) => GhResult;
 }
 
@@ -39,6 +40,7 @@ interface RemoteSnapshot {
   items: RemoteNode[];
   fields: RemoteNode[];
   subIssues: RemoteNode[];
+  issueNodeIds?: Record<string, string>;
 }
 
 interface Page {
@@ -52,6 +54,7 @@ const DOCUMENTS = Object.freeze({
   items: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:items\n viewer { projectV2(number:$projectNumber) { items(first:100,after:$endCursor) { nodes { id content { ... on Issue { id number } } } pageInfo { hasNextPage endCursor } } } } }',
   fields: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:fields\n viewer { projectV2(number:$projectNumber) { fields(first:100,after:$endCursor) { nodes { id name } pageInfo { hasNextPage endCursor } } } } }',
   subIssues: 'query($owner:String!,$repo:String!,$issueNumber:Int!,$endCursor:String) { # github-sync:subIssues\n repository(owner:$owner,name:$repo) { issue(number:$issueNumber) { subIssues(first:100,after:$endCursor) { nodes { id number } pageInfo { hasNextPage endCursor } } } } }',
+  issueId: 'query($owner:String!,$repo:String!,$issueNumber:Int!) { # github-sync:issueId\n repository(owner:$owner,name:$repo) { issue(number:$issueNumber) { id } } }',
 });
 
 function unavailable(): RemoteSnapshot {
@@ -113,6 +116,52 @@ function readProjectNodeId(options: ReadRemoteSnapshotOptions): string | null {
   if (project === null || typeof project !== 'object') return null;
   const projectNodeId = (project as { id?: unknown }).id;
   return typeof projectNodeId === 'string' && projectNodeId.length > 0 ? projectNodeId : null;
+}
+
+function normalizeIssueNodeIdHints(hints: number[] | undefined): number[] {
+  if (!Array.isArray(hints)) return [];
+  return [...new Set(hints.filter((hint) => Number.isSafeInteger(hint) && hint > 0))].sort((left, right) => left - right);
+}
+
+function decodeIssueNodeId(result: GhResult): string | null | undefined {
+  if (result.exitCode !== 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object') return undefined;
+  const envelope = parsed as { data?: unknown; errors?: unknown };
+  if (Array.isArray(envelope.errors) && envelope.errors.length > 0) return undefined;
+  const issue = readPath(envelope.data, ['repository', 'issue']);
+  if (issue === null) return null;
+  if (issue === undefined || typeof issue !== 'object') return undefined;
+  const issueNodeId = (issue as { id?: unknown }).id;
+  return typeof issueNodeId === 'string' && issueNodeId.length > 0 ? issueNodeId : undefined;
+}
+
+function readIssueNodeIds(options: ReadRemoteSnapshotOptions): Record<string, string> | null {
+  const hints = normalizeIssueNodeIdHints(options.issueNodeIdHints);
+  if (hints.length === 0) return {};
+
+  const execGh = options.execGh ?? ghMod.execGh;
+  const issueNodeIds: Record<string, string> = {};
+  for (const issueNumber of hints) {
+    const result = execGh(
+      [
+        'api', 'graphql', '-f', `query=${DOCUMENTS.issueId}`,
+        '-F', `owner=${options.owner}`,
+        '-F', `repo=${options.repo}`,
+        '-F', `issueNumber=${issueNumber}`,
+      ],
+      { cwd: options.cwd },
+    );
+    const issueNodeId = decodeIssueNodeId(result);
+    if (issueNodeId === undefined) return null;
+    if (issueNodeId !== null) issueNodeIds[String(issueNumber)] = issueNodeId;
+  }
+  return issueNodeIds;
 }
 
 function readConnection(
@@ -190,6 +239,9 @@ function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot 
     subIssues.push(...children.map((child) => ({ ...child, parentIssueNumber: issueNumber })));
   }
 
+  const issueNodeIds = readIssueNodeIds(options);
+  if (!issueNodeIds) return unavailable();
+
   return {
     available: true,
     reason: REMOTE_REASON.OK,
@@ -203,6 +255,7 @@ function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot 
     items,
     fields,
     subIssues,
+    issueNodeIds,
   };
 }
 

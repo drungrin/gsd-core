@@ -129,6 +129,7 @@ describe('readRemoteSnapshot', () => {
       items: [],
       fields: [],
       subIssues: [],
+      issueNodeIds: {},
     });
   });
 
