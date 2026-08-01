@@ -267,3 +267,172 @@ describe('readRemoteSnapshot', () => {
     assert.strictEqual(stalled.reason, REMOTE_REASON.UNAVAILABLE);
   });
 });
+
+const contract = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/graphql-documents-contract.json'), 'utf8'),
+);
+
+// The repo forbids a new package-manager install for a two-scalar selection-set
+// guard, so these documents are parsed with a small brace-depth walker rather
+// than a GraphQL dependency (T-02-SC).
+function extractSelectionBody(query, anchor) {
+  const anchorIndex = query.indexOf(anchor);
+  if (anchorIndex === -1) return null;
+  const braceStart = query.indexOf('{', anchorIndex);
+  if (braceStart === -1) return null;
+  let depth = 0;
+  let end = -1;
+  for (let i = braceStart; i < query.length; i++) {
+    if (query[i] === '{') depth++;
+    else if (query[i] === '}') {
+      depth--;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+  if (end === -1) return null;
+  return query.slice(braceStart + 1, end);
+}
+
+function collectDepthZeroIdentifiers(text) {
+  const identifiers = [];
+  let depth = 0;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '{') { depth++; i++; continue; }
+    if (ch === '}') { depth--; i++; continue; }
+    if (depth === 0 && /[A-Za-z_]/.test(ch)) {
+      let j = i + 1;
+      while (j < text.length && /[A-Za-z0-9_]/.test(text[j])) j++;
+      identifiers.push(text.slice(i, j));
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return identifiers;
+}
+
+// Returns { fragmentTarget, fields, bareOutsideFragment } for the selection body
+// anchored at `anchor` in `query`. If the body opens with an inline fragment
+// (`... on Type { ... }`), descends into the fragment's balanced body and
+// reports any trailing selection outside it; otherwise reports the depth-zero
+// identifiers of the body directly (a bare, non-fragment selection).
+function parseSelection(query, anchor) {
+  const body = extractSelectionBody(query, anchor);
+  if (body === null) return null;
+  const trimmed = body.trim();
+  const fragmentMatch = trimmed.match(/^\.\.\.\s*on\s+(\w+)\s*\{/);
+  if (!fragmentMatch) {
+    return { fragmentTarget: null, fields: collectDepthZeroIdentifiers(trimmed), bareOutsideFragment: false };
+  }
+  const fragmentStart = fragmentMatch[0].length - 1;
+  let depth = 0;
+  let end = -1;
+  for (let i = fragmentStart; i < trimmed.length; i++) {
+    if (trimmed[i] === '{') depth++;
+    else if (trimmed[i] === '}') {
+      depth--;
+      if (depth === 0) { end = i; break; }
+    }
+  }
+  const inner = trimmed.slice(fragmentStart + 1, end);
+  const rest = trimmed.slice(end + 1).trim();
+  return { fragmentTarget: fragmentMatch[1], fields: collectDepthZeroIdentifiers(inner), bareOutsideFragment: rest.length > 0 };
+}
+
+function selectionAnchor(name, entry) {
+  if (entry.connection) return 'nodes';
+  if (name === 'project') return 'projectV2';
+  return 'issue(number';
+}
+
+// Drives a full readRemoteSnapshot run (one item whose content resolves an
+// issue number, so subIssues dispatches too, plus an issueNodeIdHints entry so
+// issueId dispatches) and returns a Map of connection name -> the exact query
+// text dispatched for it. This is the reader's actual argv, not DOCUMENTS
+// (which stays unexported per this plan's prohibitions) — the guard below can
+// only fail against what the reader really sends.
+function captureDispatchedDocuments() {
+  const calls = [];
+  readRemoteSnapshot({
+    cwd: '/tmp',
+    owner: 'octo',
+    repo: 'example',
+    repositoryNumber: 1,
+    projectNumber: 1,
+    issueNodeIdHints: [101],
+    execGh(args) {
+      const query = args.find((arg) => arg.startsWith('query='));
+      const connection = ['project', 'items', 'fields', 'subIssues', 'issueId'].find((name) => query.includes(`github-sync:${name}`));
+      calls.push({ connection, query: query.slice('query='.length) });
+      const page = connection === 'project'
+        ? { id: 'PVT_proj_node_contract' }
+        : connection === 'items'
+          ? { nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE_NODE_101', number: 101 } }], pageInfo: { hasNextPage: false, endCursor: null } }
+          : connection === 'fields'
+            ? { nodes: [{ id: 'PVTF_contract_1', name: 'Status' }], pageInfo: { hasNextPage: false, endCursor: null } }
+            : connection === 'subIssues'
+              ? { nodes: [{ id: 'SUB-CONTRACT-1', number: 1 }], pageInfo: { hasNextPage: false, endCursor: null } }
+              : { id: 'ISSUE_NODE_101' };
+      return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope(connection, page)), stderr: '' };
+    },
+  });
+  const documents = new Map();
+  for (const call of calls) {
+    if (!documents.has(call.connection)) documents.set(call.connection, call.query);
+  }
+  return documents;
+}
+
+describe('DOCUMENTS schema contract', () => {
+  test('every document actually dispatched has a contract entry, and vice versa (Guard 1: completeness)', () => {
+    const documents = captureDispatchedDocuments();
+    assert.deepStrictEqual([...documents.keys()].sort(), Object.keys(contract.documents).sort());
+  });
+
+  test('every union/interface-typed connection selects only through a recorded inline fragment (Guard 2: union safety)', () => {
+    const documents = captureDispatchedDocuments();
+    for (const [name, entry] of Object.entries(contract.documents)) {
+      if (entry.nodeKind !== 'UNION' && entry.nodeKind !== 'INTERFACE') continue;
+      const selection = parseSelection(documents.get(name), selectionAnchor(name, entry));
+      assert.ok(selection.fragmentTarget, `${name} (nodeKind ${entry.nodeKind}) must select through an inline fragment, not bare scalars on the abstract type`);
+      assert.ok(entry.fragmentTargets.includes(selection.fragmentTarget), `${name} fragment target "${selection.fragmentTarget}" is not one of the recorded valid targets ${JSON.stringify(entry.fragmentTargets)}`);
+      assert.strictEqual(selection.bareOutsideFragment, false, `${name} must not select any field outside its inline fragment`);
+    }
+  });
+
+  test('every dispatched document selects exactly its recorded field set (Guard 3: selection parity)', () => {
+    const documents = captureDispatchedDocuments();
+    for (const [name, entry] of Object.entries(contract.documents)) {
+      const selection = parseSelection(documents.get(name), selectionAnchor(name, entry));
+      assert.deepStrictEqual([...selection.fields].sort(), [...entry.selects].sort(), `${name} selection drifted from the recorded contract`);
+    }
+  });
+
+  test('every paginated document selects pageInfo { hasNextPage endCursor } (Guard 4: pagination, SYNC-04)', () => {
+    const documents = captureDispatchedDocuments();
+    for (const [name, entry] of Object.entries(contract.documents)) {
+      if (!entry.paginated) continue;
+      const pageInfo = parseSelection(documents.get(name), 'pageInfo');
+      assert.ok(pageInfo, `${name} must select pageInfo`);
+      assert.deepStrictEqual([...pageInfo.fields].sort(), ['endCursor', 'hasNextPage']);
+    }
+  });
+
+  test('every recorded fixture node key set equals its document\'s recorded selection (Guard 5: fixture parity, DOC-03)', () => {
+    for (const [name, entry] of Object.entries(contract.documents)) {
+      if (!entry.connection) continue;
+      for (const [fixtureName, fixture] of Object.entries(fixtures)) {
+        const pages = fixture[name];
+        if (!Array.isArray(pages)) continue;
+        for (const page of pages) {
+          for (const node of page.nodes ?? []) {
+            const keys = Object.keys(node).filter((key) => key !== 'parentIssueNumber');
+            assert.deepStrictEqual(keys.sort(), [...entry.selects].sort(), `fixtures.${fixtureName}.${name} node ${JSON.stringify(node)} drifted from the recorded selection ${JSON.stringify(entry.selects)}`);
+          }
+        }
+      }
+    }
+  });
+});

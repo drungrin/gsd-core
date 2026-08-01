@@ -1,0 +1,45 @@
+{
+  "provenance": "Schema facts probed live against drungrin/gsd-core Project v2 #9 and #10 with `project` scope, 2026-08-01 (.planning/phases/02-sync-engine-core/02-UAT.md gap G-02-7 evidence). Re-verify against the live schema before editing this file rather than guessing.",
+  "documents": {
+    "project": {
+      "connection": null,
+      "nodeType": "ProjectV2",
+      "nodeKind": "OBJECT",
+      "fragmentTargets": [],
+      "selects": ["id"],
+      "paginated": false
+    },
+    "items": {
+      "connection": ["viewer", "projectV2", "items"],
+      "nodeType": "ProjectV2Item",
+      "nodeKind": "OBJECT",
+      "fragmentTargets": [],
+      "selects": ["id", "content"],
+      "paginated": true
+    },
+    "fields": {
+      "connection": ["viewer", "projectV2", "fields"],
+      "nodeType": "ProjectV2FieldConfiguration",
+      "nodeKind": "UNION",
+      "fragmentTargets": ["ProjectV2FieldCommon"],
+      "selects": ["id", "name"],
+      "paginated": true
+    },
+    "subIssues": {
+      "connection": ["repository", "issue", "subIssues"],
+      "nodeType": "Issue",
+      "nodeKind": "OBJECT",
+      "fragmentTargets": [],
+      "selects": ["id", "number"],
+      "paginated": true
+    },
+    "issueId": {
+      "connection": null,
+      "nodeType": "Issue",
+      "nodeKind": "OBJECT",
+      "fragmentTargets": [],
+      "selects": ["id"],
+      "paginated": false
+    }
+  }
+}
