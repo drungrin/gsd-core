@@ -18,7 +18,11 @@
     "project": {"id": "PVT_proj_node_empty"},
     "items": [{"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}],
     "fields": [{"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}],
-    "subIssues": []
+    "subIssues": [],
+    "issueIds": {
+      "101": {"id": "ISSUE_NODE_101"},
+      "303": null
+    }
   },
   "project-missing-id": {"project": {"id": ""}},
   "graphql-error": {"errors": [{"message": "sanitized fixture error"}]},

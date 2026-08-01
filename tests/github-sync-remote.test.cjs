@@ -11,6 +11,7 @@ const fixtures = JSON.parse(
 );
 
 function envelope(connection, page) {
+  if (connection === 'issueId') return { data: { repository: { issue: page } } };
   if (connection === 'project') return { data: { viewer: { projectV2: page } } };
   if (connection === 'subIssues') return { data: { repository: { issue: { subIssues: page } } } };
   return { data: { viewer: { projectV2: { [connection]: page } } } };
@@ -24,13 +25,17 @@ function fixtureExec(fixture) {
     calls,
     execGh(args) {
       const query = args.find((arg) => arg.startsWith('query='));
-      const connection = ['project', 'items', 'fields', 'subIssues'].find((name) => query.includes(`github-sync:${name}`));
+      const connection = ['project', 'items', 'fields', 'subIssues', 'issueId'].find((name) => query.includes(`github-sync:${name}`));
       calls.push({ connection, args });
       const issueArg = args.find((arg) => arg.startsWith('issueNumber='));
       const issueNumber = issueArg ? Number(issueArg.slice('issueNumber='.length)) : null;
       const cursor = connection === 'subIssues' ? (subIssueCursors.get(issueNumber) ?? 0) : cursors[connection]++;
       if (connection === 'subIssues') subIssueCursors.set(issueNumber, cursor + 1);
-      const page = connection === 'project' ? fixture.project : fixture[connection][cursor];
+      const page = connection === 'project'
+        ? fixture.project
+        : connection === 'issueId'
+          ? fixture.issueIds[String(issueNumber)]
+          : fixture[connection][cursor];
       return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope(connection, page)), stderr: '' };
     },
   };
@@ -145,6 +150,67 @@ describe('readRemoteSnapshot', () => {
       },
     });
     assert.deepStrictEqual(unavailable, {
+      available: false,
+      reason: REMOTE_REASON.UNAVAILABLE,
+      items: [],
+      fields: [],
+      subIssues: [],
+    });
+  });
+
+  test('resolves deduped ascending issue node ID hints and omits null issues', () => {
+    const fake = fixtureExec(fixtures.empty);
+    const result = readRemoteSnapshot({
+      cwd: '/tmp',
+      owner: 'octo',
+      repo: 'example',
+      repositoryNumber: 1,
+      projectNumber: 1,
+      issueNodeIdHints: [303, 101, 303, 101],
+      execGh: fake.execGh,
+    });
+
+    assert.equal(result.available, true);
+    assert.deepEqual(result.issueNodeIds, { 101: 'ISSUE_NODE_101' });
+    assert.deepEqual(
+      fake.calls.map((call) => [call.connection, call.args.find((arg) => arg.startsWith('issueNumber=')) ?? null]),
+      [
+        ['project', null],
+        ['items', null],
+        ['fields', null],
+        ['issueId', 'issueNumber=101'],
+        ['issueId', 'issueNumber=303'],
+      ],
+    );
+  });
+
+  test('fails closed when a hinted issue node-ID read fails at the transport boundary', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp',
+      owner: 'octo',
+      repo: 'example',
+      repositoryNumber: 1,
+      projectNumber: 1,
+      issueNodeIdHints: [101],
+      execGh(args) {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('project', fixtures.empty.project)), stderr: '' };
+        }
+        if (query.includes('github-sync:items')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('items', fixtures.empty.items[0])), stderr: '' };
+        }
+        if (query.includes('github-sync:fields')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('fields', fixtures.empty.fields[0])), stderr: '' };
+        }
+        if (query.includes('github-sync:issueId')) {
+          return { exitCode: 1, reason: 'gh_exit_nonzero', stdout: '', stderr: 'secret issue lookup failure' };
+        }
+        throw new Error(`unexpected query: ${query}`);
+      },
+    });
+
+    assert.deepEqual(result, {
       available: false,
       reason: REMOTE_REASON.UNAVAILABLE,
       items: [],

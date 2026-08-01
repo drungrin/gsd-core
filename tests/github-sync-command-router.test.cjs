@@ -45,14 +45,14 @@ test('enabled status composes only read seams and never receives a write adapter
       _target: { readSyncTarget(cwd) { calls.push(['target', cwd]); return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
       _desired: { readDesiredState(cwd) { calls.push(['desired', cwd]); return { available: true }; } },
       _remote: { readRemoteSnapshot(options) { calls.push(['remote', options]); return { available: true }; } },
-      _map: { readSyncMapStrict(cwd, repository) { calls.push(['map', cwd, repository]); return { kind: 'absent' }; }, writeSyncMapAtomically() { throw new Error('status must not write map'); } },
+      _map: { readSyncMapStrict(cwd, repository) { calls.push(['map', cwd, repository]); return { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 } } } }; }, writeSyncMapAtomically() { throw new Error('status must not write map'); } },
       _reconcile: { planReconciliation(...inputs) { calls.push(['reconcile', inputs.length]); return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
       _status: { buildStatusV1(remote, plan) { calls.push(['status', remote.available, plan.operations.length]); return { version: 1, available: true }; }, renderStatusV1(dto) { return JSON.stringify(dto); } },
     });
   } finally {
     mock.restoreAll();
   }
-  assert.deepEqual(calls, [['desired', '/fixture'], ['target', '/fixture'], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 }], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['reconcile', 3], ['status', true, 0]]);
+  assert.deepEqual(calls, [['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101] }], ['reconcile', 3], ['status', true, 0]]);
   assert.deepEqual(outputChunks, ['{"version":1,"available":true}']);
 });
 
@@ -69,7 +69,7 @@ test('enabled status propagates its resolved target yet cannot apply or persist 
         _desired: { readDesiredState() { return { available: true }; } },
         _remote: { readRemoteSnapshot(options) { calls.push(['remote', available, options]); return { available, reason: available ? 'ok' : 'remote_unavailable' }; } },
         _map: {
-          readSyncMapStrict(cwd, repository) { calls.push(['map', available, cwd, repository]); return { kind: 'absent' }; },
+          readSyncMapStrict(cwd, repository) { calls.push(['map', available, cwd, repository]); return { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 } } } }; },
           writeSyncMapAtomically() { throw new Error('status must never persist a map'); },
         },
         _reconcile: { planReconciliation() { calls.push(['reconcile', available]); return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
@@ -79,11 +79,11 @@ test('enabled status propagates its resolved target yet cannot apply or persist 
     }
   } finally { mock.restoreAll(); }
   assert.deepEqual(calls, [
-    ['remote', true, { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 }],
     ['map', true, '/fixture', { owner: 'octo', repo: 'example', number: 42 }],
+    ['remote', true, { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101] }],
     ['reconcile', true], ['status', true, true, { operations: [], noops: [], blocked: [], uncertain: [] }],
-    ['remote', false, { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 }],
     ['map', false, '/fixture', { owner: 'octo', repo: 'example', number: 42 }],
+    ['remote', false, { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101] }],
     ['reconcile', false], ['status', false, false, { operations: [], noops: [], blocked: [], uncertain: [] }],
   ]);
 });
@@ -101,12 +101,12 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
       _auth: { runPreflight(cwd) { calls.push(['preflight', cwd]); return { ok: true, reason: 'ok', message: 'ok' }; } },
       _desired: { readDesiredState(cwd) { calls.push(['desired', cwd]); return { available: true }; } },
       _remote: { readRemoteSnapshot(options) { calls.push(['remote', options]); return { available: true }; } },
-      _map: { readSyncMapStrict(cwd, repository) { calls.push(['map', cwd, repository]); return { kind: 'absent' }; } },
+      _map: { readSyncMapStrict(cwd, repository) { calls.push(['map', cwd, repository]); return { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } } }; } },
       _reconcile: { planReconciliation(...inputs) { calls.push(['reconcile', inputs.length]); return { operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [] }; } },
       _apply: { applyMutationPlan(plan, options) { calls.push(['apply', plan.operations[0].logicalKey, options.map]); return { kind: 'completed' }; } },
     });
   } finally { mock.restoreAll(); }
-  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 }], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['reconcile', 3], ['apply', 'phase:01', null]]);
+  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101, 303] }], ['reconcile', 3], ['apply', 'phase:01', { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } }]]);
   assert.deepEqual(chunks, ['{\n  "kind": "completed"\n}']);
 });
 
