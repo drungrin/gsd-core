@@ -18,7 +18,7 @@ import type {
   CompletionContext,
   ArgvEntry,
 } from './github-sync-operation.cts';
-import { OPERATION_TRANSPORT, OPERATION_ACTION } from './github-sync-operation.cjs';
+import { OPERATION_TRANSPORT, OPERATION_ACTION, ARGV_REF_PART } from './github-sync-operation.cjs';
 
 const STATUS_FIELD_NAME = 'Status';
 
@@ -106,10 +106,19 @@ function optionInputArgv(variableName: string, options: OptionInput[]): string[]
 interface RemoteSingleSelectOption { id: string; name: string; color: string; description: string; }
 interface RemoteStatusField { id: string; name: string; dataType: string; options: RemoteSingleSelectOption[] | null; }
 type ProjectOutcome = 'resolved' | 'absent' | 'unset' | 'unavailable';
+type LinkState = 'linked' | 'unlinked' | 'indeterminate';
+interface BootstrapRepositoryLike {
+  nodeId: string;
+  ownerNodeId: string;
+  ownerLogin: string;
+  linkState: LinkState | null;
+}
 interface BootstrapRemoteForMerge {
   available: boolean;
   projectOutcome: ProjectOutcome;
   statusField: RemoteStatusField | null;
+  repository?: BootstrapRepositoryLike | null;
+  projectNodeId?: string | null;
 }
 interface StrictMapCompletion { nodeId: string; }
 interface StrictMapLike {
@@ -239,6 +248,180 @@ function planStatusOptionMerge(remote: BootstrapRemoteForMerge, strictMap: Stric
   return { kind: 'operation', operation };
 }
 
+// ─── planProject ────────────────────────────────────────────────────────────
+
+const LINK_STATE = Object.freeze({
+  LINKED: 'linked',
+  UNLINKED: 'unlinked',
+  INDETERMINATE: 'indeterminate',
+} as const);
+
+/** BOOT-01's default project title when no `github_sync.project_title` is configured (plan 03-03 Task 3). */
+const DEFAULT_PROJECT_TITLE_SUFFIX = ' Roadmap';
+
+// Duplicated from src/github-sync-bootstrap-remote.cts's BOOTSTRAP_DOCUMENTS,
+// byte-for-byte — a differential test in tests/github-sync-bootstrap-plan.test.cjs
+// pins the two copies against each other. Duplicated rather than imported
+// because this module's header states zero I/O imports, and
+// github-sync-bootstrap-remote.cts transitively requires the gh transport
+// seam; STATUS_MERGE_DOCUMENT above sets the same precedent. No `rateLimit`
+// selection — see the note at STATUS_MERGE_DOCUMENT (live-verified in plan
+// 03-02: GitHub's `Mutation` type has no such field).
+const CREATE_PROJECT_DOCUMENT =
+  'mutation($ownerId:ID!,$title:String!) { # github-sync-bootstrap:createProject\n' +
+  ' createProjectV2(input:{ownerId:$ownerId,title:$title}) { projectV2 { id number } } }';
+const LINK_PROJECT_DOCUMENT =
+  'mutation($projectId:ID!,$repositoryId:ID!) { # github-sync-bootstrap:linkProjectToRepository\n' +
+  ' linkProjectV2ToRepository(input:{projectId:$projectId,repositoryId:$repositoryId}) { repository { id } } }';
+
+interface ProjectPlanResult {
+  operations: MutationOperation[];
+  checkpoints: AdoptionCheckpoint[];
+  blocked: Array<{ reason: string; detail?: string }>;
+}
+
+function emptyProjectPlan(): ProjectPlanResult {
+  return { operations: [], checkpoints: [], blocked: [] };
+}
+
+/**
+ * BOOT-01's project create/link/adopt/repair/not-found composer.
+ *
+ * - `target.projectNumber === null` → create-and-link: two operations under
+ *   two DISTINCT logical keys (project, project-link), zero checkpoints.
+ *   D-12: the create's owner id is the repository's OWNER node id, never a
+ *   viewer id. RESEARCH Pitfall 4: the create input carries only ownerId and
+ *   title — no repositoryId — so link stays independently retryable.
+ * - `target.projectNumber` positive and the project resolved → adopt: an
+ *   adoption checkpoint under the project key, recording what was observed
+ *   rather than doing nothing (D-03, cycle-2 HIGH-A), then branches on the
+ *   OBSERVED link state (D-14, cycle-2 HIGH-C) — linked emits a second
+ *   checkpoint under the link key and zero operations; unlinked emits the
+ *   link operation; indeterminate emits the link operation only when the
+ *   strict map holds no link completion yet (converges after one run).
+ *   D-15: no operation ever renames an adopted board's title.
+ * - `target.projectNumber` positive and the project is absent → not-found:
+ *   zero operations, zero checkpoints, one blocked entry (D-04).
+ */
+function planProject(
+  remote: BootstrapRemoteForMerge,
+  strictMap: StrictMapLike,
+  target: BootstrapTarget,
+  projectTitle: string | null,
+  context: CompletionContext,
+): ProjectPlanResult {
+  const repository = remote.repository;
+  if (!repository || typeof repository.ownerNodeId !== 'string' || repository.ownerNodeId.length === 0) {
+    return { ...emptyProjectPlan(), blocked: [{ reason: BOOTSTRAP_OPERATION_REASON.OWNER_UNRESOLVABLE }] };
+  }
+
+  const projectKey = BOOTSTRAP_LOGICAL_KEY.project();
+  const linkKey = BOOTSTRAP_LOGICAL_KEY.projectLink();
+
+  if (target.projectNumber === null) {
+    const title = projectTitle && projectTitle.length > 0 ? projectTitle : `${target.repo}${DEFAULT_PROJECT_TITLE_SUFFIX}`;
+    const createOperation: MutationOperation = {
+      kind: 'create-project',
+      logicalKey: projectKey,
+      args: [
+        'api', 'graphql',
+        '-f', `query=${CREATE_PROJECT_DOCUMENT}`,
+        // SECURITY: every string variable rides the raw -f flag.
+        '-f', `ownerId=${repository.ownerNodeId}`,
+        '-f', `title=${title}`,
+      ],
+      completionContext: context,
+      transport: OPERATION_TRANSPORT.GRAPHQL,
+      action: OPERATION_ACTION.CREATE,
+      hasPointsBudget: false,
+      // Every operation that brings a new GitHub-side object into existence
+      // declares content creation true (decided once for the whole phase —
+      // see the paragraph at this flag's twin use in planStatusOptionMerge's
+      // sibling create-path operations in plans 03-04/03-05).
+      contentCreation: true,
+      captures: [{ kind: 'node', logicalKey: projectKey, nodeIdPath: 'createProjectV2.projectV2.id', numberPath: 'createProjectV2.projectV2.number' }],
+    };
+    const linkArgs: ArgvEntry[] = [
+      'api', 'graphql',
+      '-f', `query=${LINK_PROJECT_DOCUMENT}`,
+      '-f', { from: projectKey, part: ARGV_REF_PART.NODE_ID, prefix: 'projectId=' },
+      '-f', `repositoryId=${repository.nodeId}`,
+    ];
+    const linkOperation: MutationOperation = {
+      kind: 'link-project',
+      logicalKey: linkKey,
+      args: linkArgs,
+      completionContext: context,
+      transport: OPERATION_TRANSPORT.GRAPHQL,
+      action: OPERATION_ACTION.LINK,
+      hasPointsBudget: false,
+      // Only re-points an existing object (the freshly created project) at
+      // the repository — mints nothing new.
+      contentCreation: false,
+      captures: [{ kind: 'node', logicalKey: linkKey, nodeIdPath: 'linkProjectV2ToRepository.repository.id' }],
+    };
+    return { operations: [createOperation, linkOperation], checkpoints: [], blocked: [] };
+  }
+
+  // Adopt / repair / not-found: a positive project number is configured.
+  if (remote.projectOutcome === 'absent') {
+    return {
+      ...emptyProjectPlan(),
+      blocked: [{
+        reason: BOOTSTRAP_OPERATION_REASON.PROJECT_NOT_FOUND,
+        detail: `project number ${target.projectNumber} not found for owner ${repository.ownerLogin}`,
+      }],
+    };
+  }
+
+  // remote.projectOutcome === 'resolved' here: 'unset' cannot occur because
+  // target.projectNumber !== null forces the caller to have issued the
+  // project-scoped documents, and 'unavailable' is gated upstream in
+  // planBootstrap's three-gate ordering.
+  const projectNodeId = remote.projectNodeId;
+  if (typeof projectNodeId !== 'string' || projectNodeId.length === 0) {
+    return { ...emptyProjectPlan(), blocked: [{ reason: BOOTSTRAP_OPERATION_REASON.PROJECT_NOT_FOUND, detail: `project number ${target.projectNumber} resolved with no node id` }] };
+  }
+
+  const checkpoints: AdoptionCheckpoint[] = [{
+    logicalKey: projectKey,
+    nodeId: projectNodeId,
+    remoteNumber: target.projectNumber,
+    completionContext: context,
+  }];
+
+  if (repository.linkState === LINK_STATE.LINKED) {
+    checkpoints.push({ logicalKey: linkKey, nodeId: repository.nodeId, completionContext: context });
+    return { operations: [], checkpoints, blocked: [] };
+  }
+
+  const hasLinkCompletion = strictMap.kind === 'valid' && !!strictMap.map?.completions?.[linkKey];
+  if (repository.linkState === LINK_STATE.INDETERMINATE && hasLinkCompletion) {
+    return { operations: [], checkpoints, blocked: [] };
+  }
+
+  // unlinked, or indeterminate with no prior link completion: plan the link
+  // (D-14/HIGH-C — never assumed linked merely because the project resolved).
+  const linkArgs: ArgvEntry[] = [
+    'api', 'graphql',
+    '-f', `query=${LINK_PROJECT_DOCUMENT}`,
+    '-f', `projectId=${projectNodeId}`,
+    '-f', `repositoryId=${repository.nodeId}`,
+  ];
+  const linkOperation: MutationOperation = {
+    kind: 'link-project',
+    logicalKey: linkKey,
+    args: linkArgs,
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.LINK,
+    hasPointsBudget: false,
+    contentCreation: false,
+    captures: [{ kind: 'node', logicalKey: linkKey, nodeIdPath: 'linkProjectV2ToRepository.repository.id' }],
+  };
+  return { operations: [linkOperation], checkpoints, blocked: [] };
+}
+
 // ─── planBootstrap ──────────────────────────────────────────────────────────
 
 interface DesiredStateLike { available: boolean; reason?: string; }
@@ -248,6 +431,7 @@ interface PlanBootstrapInput {
   remote: BootstrapRemoteForMerge;
   strictMap: StrictMapLike;
   target: BootstrapTarget;
+  projectTitle?: string | null;
 }
 
 interface BootstrapPlan {
@@ -269,8 +453,10 @@ function emptyPlan(): BootstrapPlan {
  * remote-unavailable gate fires on `remote.available` alone, never on
  * `projectOutcome`: an `unset` or `absent` project is itself an available
  * read, and folding either into this gate would make the fresh-create path
- * unreachable (cycle-4 HIGH-4). In this plan the structure pass contributes
- * nothing (later plans in this phase fill it in) and the options pass calls
+ * unreachable (cycle-4 HIGH-4). The structure pass runs `planProject` first
+ * and short-circuits every later structure builder (including their
+ * checkpoints) when it blocks — plans 03-04/03-05 fill in the rest of the
+ * structure pass on top of this. The options pass calls
  * `planStatusOptionMerge`.
  */
 function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPass }): BootstrapPlan {
@@ -284,6 +470,9 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
     return { ...emptyPlan(), blocked: [{ reason: BOOTSTRAP_OPERATION_REASON.MAP_BLOCKING, detail: input.strictMap.reason ?? 'invalid_schema' }] };
   }
 
+  // Checkpoint contract clause 1a: one CompletionContext, built once here
+  // from the resolved target, threaded verbatim to every stage builder.
+  // planProject does not derive its own from the `target` it also receives.
   const context: CompletionContext = {
     owner: input.target.owner,
     repo: input.target.repo,
@@ -291,8 +480,12 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
   };
 
   if (pass === BOOTSTRAP_PASS.STRUCTURE) {
-    // Filled in by plans 03-03 through 03-05 (project/link, fields, labels, milestones).
-    return emptyPlan();
+    const projectPlan = planProject(input.remote, input.strictMap, input.target, input.projectTitle ?? null, context);
+    if (projectPlan.blocked.length > 0) {
+      return { ...emptyPlan(), blocked: projectPlan.blocked };
+    }
+    // Filled in further by plans 03-04/03-05 (fields, labels, milestones).
+    return { ...emptyPlan(), operations: projectPlan.operations, checkpoints: projectPlan.checkpoints };
   }
 
   const merge = planStatusOptionMerge(input.remote, input.strictMap, context);
@@ -305,6 +498,7 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
 
 export = {
   planBootstrap,
+  planProject,
   planStatusOptionMerge,
   optionInputArgv,
   BOOTSTRAP_LOGICAL_KEY,
@@ -312,4 +506,7 @@ export = {
   BOOTSTRAP_PASS,
   GSD_STATUS_OPTIONS,
   STATUS_FIELD_NAME,
+  DEFAULT_PROJECT_TITLE_SUFFIX,
+  CREATE_PROJECT_DOCUMENT,
+  LINK_PROJECT_DOCUMENT,
 };

@@ -56,8 +56,23 @@ function assertPathSafeTarget(owner: unknown, repo: unknown): boolean {
     PATH_SAFE_TARGET.test(owner) && PATH_SAFE_TARGET.test(repo);
 }
 
+const LINK_STATE = Object.freeze({
+  LINKED: 'linked',
+  UNLINKED: 'unlinked',
+  INDETERMINATE: 'indeterminate',
+} as const);
+type LinkState = typeof LINK_STATE[keyof typeof LINK_STATE];
+
 const BOOTSTRAP_DOCUMENTS = Object.freeze({
-  repository: 'query($owner:String!,$repo:String!) { # github-sync-bootstrap:repository\n repository(owner:$owner,name:$repo) { id owner { id login } } }',
+  // Widened (plan 03-03 Task 2) to also read whether the resolved Project is
+  // actually linked to this repository — one round trip, no second document.
+  // `projectsV2` lists the repository's own linked Project v2 boards; only
+  // the first page is read (T-03-30): the target number's presence among the
+  // first 100 decides LINKED, its absence with no further page decides
+  // UNLINKED, and its absence WITH a further page decides INDETERMINATE —
+  // never assumed LINKED, so a truncated response can at worst cause one
+  // redundant link attempt, never a permanently unlinked board.
+  repository: 'query($owner:String!,$repo:String!) { # github-sync-bootstrap:repository\n repository(owner:$owner,name:$repo) { id owner { id login } projectsV2(first:100) { nodes { number } pageInfo { hasNextPage endCursor } } } }',
   // D-12/D-13: owner-rooted from the moment this document exists (cycle-4
   // HIGH-2) — repositoryOwner(login:) resolves through the repository's
   // actual owner (user or organization), and ProjectV2Owner is the interface
@@ -66,7 +81,19 @@ const BOOTSTRAP_DOCUMENTS = Object.freeze({
   // fragments below, so its `options` merge into the same JSON object as its
   // `id`/`name`/`dataType` — a field that is not a single-select simply omits
   // `options` from its decoded node.
-  fieldsWithTypes: 'query($owner:String!,$projectNumber:Int!,$endCursor:String) { # github-sync-bootstrap:fieldsWithTypes\n repositoryOwner(login:$owner) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { fields(first:100,after:$endCursor) { nodes { ... on ProjectV2FieldCommon { id name dataType } ... on ProjectV2SingleSelectField { id name dataType options { id name color description } } } pageInfo { hasNextPage endCursor } } } } } }',
+  // Selects the project's OWN id (sibling to `fields`) alongside its fields —
+  // BOOT-01's adopt path needs the resolved project's node id to checkpoint
+  // it, and this is the only document that reads a resolved project.
+  fieldsWithTypes: 'query($owner:String!,$projectNumber:Int!,$endCursor:String) { # github-sync-bootstrap:fieldsWithTypes\n repositoryOwner(login:$owner) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { id fields(first:100,after:$endCursor) { nodes { ... on ProjectV2FieldCommon { id name dataType } ... on ProjectV2SingleSelectField { id name dataType options { id name color description } } } pageInfo { hasNextPage endCursor } } } } } }',
+  // BOOT-01 create path (D-12/RESEARCH Pitfall 4): input carries only an
+  // owner id and a title — no repositoryId — so create and link stay two
+  // independently-retryable operations (github-sync-bootstrap-plan.cts's
+  // planProject). No `rateLimit` selection: live-verified in plan 03-02 that
+  // GitHub's `Mutation` type has no such field.
+  createProject: 'mutation($ownerId:ID!,$title:String!) { # github-sync-bootstrap:createProject\n createProjectV2(input:{ownerId:$ownerId,title:$title}) { projectV2 { id number } } }',
+  // D-14: its own operation, its own logical key, so a link failure retries
+  // independently of the project's own (already-confirmed) checkpoint.
+  linkProjectToRepository: 'mutation($projectId:ID!,$repositoryId:ID!) { # github-sync-bootstrap:linkProjectToRepository\n linkProjectV2ToRepository(input:{projectId:$projectId,repositoryId:$repositoryId}) { repository { id } } }',
 });
 
 const STATUS_FIELD_NAME = 'Status';
@@ -100,17 +127,27 @@ interface BootstrapRemoteOptions {
   execGh?: (args: string[], opts: { cwd?: string }) => GhResult;
 }
 
+interface RepositoryRead {
+  nodeId: string;
+  ownerNodeId: string;
+  ownerLogin: string;
+  /** null when the caller supplied no project number to check link state against. */
+  linkState: LinkState | null;
+}
+
 interface BootstrapRemoteState {
   available: boolean;
   reason: BootstrapRemoteReason;
   projectOutcome: ProjectOutcome;
-  repository: { nodeId: string; ownerNodeId: string; ownerLogin: string } | null;
+  repository: RepositoryRead | null;
+  /** The resolved project's own node id — null unless projectOutcome is 'resolved'. */
+  projectNodeId: string | null;
   fields: RemoteField[];
   statusField: RemoteField | null;
 }
 
 function unavailable(reason: BootstrapRemoteReason = BOOTSTRAP_REMOTE_REASON.UNAVAILABLE): BootstrapRemoteState {
-  return { available: false, reason, projectOutcome: PROJECT_OUTCOME.UNAVAILABLE, repository: null, fields: [], statusField: null };
+  return { available: false, reason, projectOutcome: PROJECT_OUTCOME.UNAVAILABLE, repository: null, projectNodeId: null, fields: [], statusField: null };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -136,7 +173,31 @@ function parseGraphqlEnvelope(result: GhResult): Record<string, unknown> | null 
   return isRecord(data) ? data : null;
 }
 
-function readRepository(options: BootstrapRemoteOptions): { nodeId: string; ownerNodeId: string; ownerLogin: string } | null | undefined {
+/**
+ * Decodes the widened repository document's `projectsV2` connection into a
+ * three-valued link state relative to `targetProjectNumber`, reading only
+ * the first page (T-03-30). Returns `undefined` on any malformed shape,
+ * distinct from the three legitimate decoded states.
+ */
+function decodeLinkState(rawConnection: unknown, targetProjectNumber: number): LinkState | undefined {
+  if (!isRecord(rawConnection)) return undefined;
+  const nodes = rawConnection.nodes;
+  const pageInfo = rawConnection.pageInfo;
+  if (!Array.isArray(nodes) || !isRecord(pageInfo)) return undefined;
+  const numbers: number[] = [];
+  for (const node of nodes) {
+    if (!isRecord(node)) return undefined;
+    const number = node.number;
+    if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) return undefined;
+    numbers.push(number);
+  }
+  const hasNextPage = pageInfo.hasNextPage;
+  if (typeof hasNextPage !== 'boolean') return undefined;
+  if (numbers.includes(targetProjectNumber)) return LINK_STATE.LINKED;
+  return hasNextPage ? LINK_STATE.INDETERMINATE : LINK_STATE.UNLINKED;
+}
+
+function readRepository(options: BootstrapRemoteOptions): RepositoryRead | null | undefined {
   const execGh = options.execGh ?? ghMod.execGh;
   const result = execGh(
     [
@@ -153,7 +214,14 @@ function readRepository(options: BootstrapRemoteOptions): { nodeId: string; owne
   if (!isRecord(repository)) return undefined;
   const owner = repository.owner;
   if (!isNonEmptyString(repository.id) || !isRecord(owner) || !isNonEmptyString(owner.id) || !isNonEmptyString(owner.login)) return undefined;
-  return { nodeId: repository.id, ownerNodeId: owner.id, ownerLogin: owner.login };
+
+  let linkState: LinkState | null = null;
+  if (options.projectNumber !== null) {
+    const decoded = decodeLinkState(repository.projectsV2, options.projectNumber);
+    if (decoded === undefined) return undefined;
+    linkState = decoded;
+  }
+  return { nodeId: repository.id, ownerNodeId: owner.id, ownerLogin: owner.login, linkState };
 }
 
 function decodeOption(raw: unknown): RemoteSingleSelectOption | null {
@@ -183,12 +251,13 @@ function decodeField(raw: unknown): RemoteField | null {
  * project itself does not resolve (repositoryOwner or projectV2 is null),
  * distinct from `undefined` (malformed payload, decode failure).
  */
-function readProjectFields(options: BootstrapRemoteOptions): { outcome: typeof PROJECT_OUTCOME.RESOLVED | typeof PROJECT_OUTCOME.ABSENT; fields: RemoteField[] } | undefined {
+function readProjectFields(options: BootstrapRemoteOptions): { outcome: typeof PROJECT_OUTCOME.RESOLVED | typeof PROJECT_OUTCOME.ABSENT; fields: RemoteField[]; projectNodeId: string | null } | undefined {
   const execGh = options.execGh ?? ghMod.execGh;
   const fields: RemoteField[] = [];
   const seenCursors = new Set<string>();
   let cursor: string | null = null;
   let sawProject = false;
+  let projectNodeId: string | null = null;
 
   while (true) {
     const result = execGh(
@@ -203,12 +272,14 @@ function readProjectFields(options: BootstrapRemoteOptions): { outcome: typeof P
     const data = parseGraphqlEnvelope(result);
     if (data === null) return undefined;
     const repositoryOwner = data.repositoryOwner;
-    if (repositoryOwner === null) return { outcome: PROJECT_OUTCOME.ABSENT, fields: [] };
+    if (repositoryOwner === null) return { outcome: PROJECT_OUTCOME.ABSENT, fields: [], projectNodeId: null };
     if (!isRecord(repositoryOwner)) return undefined;
     const projectV2 = repositoryOwner.projectV2;
-    if (projectV2 === null) return { outcome: PROJECT_OUTCOME.ABSENT, fields: [] };
+    if (projectV2 === null) return { outcome: PROJECT_OUTCOME.ABSENT, fields: [], projectNodeId: null };
     if (!isRecord(projectV2)) return undefined;
+    if (!isNonEmptyString(projectV2.id)) return undefined;
     sawProject = true;
+    projectNodeId = projectV2.id;
     const connection = projectV2.fields;
     if (!isRecord(connection)) return undefined;
     const nodes = connection.nodes;
@@ -227,7 +298,7 @@ function readProjectFields(options: BootstrapRemoteOptions): { outcome: typeof P
     seenCursors.add(endCursor);
     cursor = endCursor;
   }
-  return sawProject ? { outcome: PROJECT_OUTCOME.RESOLVED, fields } : { outcome: PROJECT_OUTCOME.ABSENT, fields: [] };
+  return sawProject ? { outcome: PROJECT_OUTCOME.RESOLVED, fields, projectNodeId } : { outcome: PROJECT_OUTCOME.ABSENT, fields: [], projectNodeId: null };
 }
 
 /**
@@ -250,6 +321,7 @@ function readBootstrapRemoteState(options: BootstrapRemoteOptions): BootstrapRem
       reason: BOOTSTRAP_REMOTE_REASON.OK,
       projectOutcome: PROJECT_OUTCOME.UNSET,
       repository,
+      projectNodeId: null,
       fields: [],
       statusField: null,
     };
@@ -264,6 +336,7 @@ function readBootstrapRemoteState(options: BootstrapRemoteOptions): BootstrapRem
     reason: BOOTSTRAP_REMOTE_REASON.OK,
     projectOutcome: projectFields.outcome,
     repository,
+    projectNodeId: projectFields.projectNodeId,
     fields: projectFields.fields,
     statusField,
   };
@@ -276,4 +349,5 @@ export = {
   BOOTSTRAP_DOCUMENTS,
   PROJECT_OUTCOME,
   STATUS_FIELD_NAME,
+  LINK_STATE,
 };
