@@ -42,3 +42,79 @@ test('status schema documentation pins every exported DTO field', () => {
     assert.match(documentation, new RegExp('`' + field + '`'));
   }
 });
+
+// ─── G-02-2 (Task 2): D-13/D-14 grouped, actionable human summary ───────────
+//
+// The renderer previously emitted counts only ('creates: N'); D-13 requires
+// the default output to list what would actually change, and D-14 requires
+// all five groups to always appear (even at zero) plus any limitations.
+
+test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), and uncertain by name, plus limitations (D-13/D-14)', () => {
+  const dto = {
+    version: 1, available: true,
+    creates: ['phase:02'], updates: ['phase:01'], noops: ['phase:00'],
+    blocked: [{ reason: 'map_blocking', detail: 'repository_mismatch' }],
+    uncertain: [{ reason: 'remote_unavailable' }],
+    limitations: ['Remote data is currently unavailable; no changes were made.'],
+  };
+  const out = renderStatusV1(dto, false);
+  assert.equal(out, [
+    'github-sync status',
+    'creates: 1',
+    '  - phase:02',
+    'updates: 1',
+    '  - phase:01',
+    'no-ops: 1',
+    '  - phase:00',
+    'blocked: 1',
+    '  - map_blocking (repository_mismatch)',
+    'uncertain: 1',
+    '  - remote_unavailable',
+    'limitations:',
+    '  - Remote data is currently unavailable; no changes were made.',
+    '',
+  ].join('\n'));
+});
+
+test('renderStatusV1 renders a blocked entry without a detail as the bare reason (no empty parentheses)', () => {
+  const dto = {
+    version: 1, available: true,
+    creates: [], updates: [], noops: [],
+    blocked: [{ reason: 'sync_map_blocking' }],
+    uncertain: [], limitations: [],
+  };
+  const out = renderStatusV1(dto, false);
+  assert.match(out, /blocked: 1\n {2}- sync_map_blocking\n/);
+  assert.doesNotMatch(out, /\(/);
+});
+
+test('renderStatusV1 still shows all five count lines at zero when every group is empty, with no limitations line (D-14)', () => {
+  const dto = {
+    version: 1, available: true,
+    creates: [], updates: [], noops: [], blocked: [], uncertain: [], limitations: [],
+  };
+  const out = renderStatusV1(dto, false);
+  assert.equal(out, [
+    'github-sync status',
+    'creates: 0',
+    'updates: 0',
+    'no-ops: 0',
+    'blocked: 0',
+    'uncertain: 0',
+    '',
+  ].join('\n'));
+  assert.doesNotMatch(out, /limitations:/);
+});
+
+test('renderStatusV1 for an unavailable DTO stays the fixed message followed by a newline, unaffected by the human-summary growth', () => {
+  const dto = buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
+  assert.equal(renderStatusV1(dto, false), `${dto.message}\n`);
+});
+
+test('renderStatusV1(dto, true) stays exactly JSON.stringify(dto) regardless of the human renderer growing (D-15)', () => {
+  const dto = buildStatusV1({ available: true, reason: 'ok' }, {
+    operations: [{ kind: 'create', logicalKey: 'phase:09' }],
+    noops: [], blocked: [{ reason: 'map_blocking' }], uncertain: [],
+  });
+  assert.equal(renderStatusV1(dto, true), JSON.stringify(dto));
+});
