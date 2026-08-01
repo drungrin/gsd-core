@@ -234,6 +234,100 @@ describe('github-sync status: G-02-2 default-path/--raw wiring (real status modu
   });
 });
 
+// ─── G-02-4: a local github_sync.target fault is diagnosed, not misreported ─
+//
+// Before this fix, the status handler collapsed `!resolvedTarget.available`
+// into `buildStatusV1({available:false, reason:'remote_unavailable'})`,
+// producing output byte-identical to a genuine GitHub outage. These tests
+// drive the real compiled status module (`realStatus`) so the router's
+// actual field-propagation wiring is exercised, and assert the target-fault
+// stdout is provably different from the remote-outage stdout emitted by the
+// existing tests above.
+
+describe('github-sync status: G-02-4 target-fault diagnosis (real status module)', () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, data, offset, length) => {
+      const chunk = chunkOfWriteSyncArgs(data, offset, length);
+      chunks.push(chunk);
+      return Buffer.byteLength(chunk, 'utf8');
+    });
+    return chunks;
+  }
+
+  function makeTargetFaultOptions(raw) {
+    return {
+      args: ['github-sync', 'status'], cwd: '/fixture', raw,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _status: realStatus,
+      _target: { readSyncTarget() { return { available: false, reason: 'target_unavailable', field: 'repository_number' }; } },
+      _desired: { readDesiredState() { return { available: true }; } },
+      _remote: { readRemoteSnapshot() { throw new Error('remote must not run on a local target fault'); } },
+      _map: {
+        readSyncMapStrict() { throw new Error('map must not be read on a local target fault'); },
+        writeSyncMapAtomically() { throw new Error('status must never persist a map'); },
+      },
+    };
+  }
+
+  test('a repository_number target fault names the field, exits 0, and reaches neither remote nor map (raw: false)', () => {
+    const chunks = captureStdout();
+    process.exitCode = 0;
+    try {
+      routeGithubSyncCommandRouter(makeTargetFaultOptions(false));
+    } finally { mock.restoreAll(); }
+    const stdout = chunks.join('');
+    assert.strictEqual(process.exitCode, 0, 'D-16: a local target fault must not gate the loop');
+    assert.throws(() => JSON.parse(stdout), 'default target-fault stdout must NOT parse as JSON');
+    assert.strictEqual(
+      stdout,
+      'github-sync status is unavailable because github_sync.target.repository_number in .planning/config.json is invalid. Set it to a positive whole number, then re-run.\n',
+    );
+  });
+
+  test('a local target fault differs from a genuine remote outage, which keeps its pre-existing message (raw: false)', () => {
+    const targetFaultChunks = captureStdout();
+    routeGithubSyncCommandRouter(makeTargetFaultOptions(false));
+    mock.restoreAll();
+    const targetFaultStdout = targetFaultChunks.join('');
+
+    const outageChunks = captureStdout();
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'status'], cwd: '/fixture', raw: false,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _status: realStatus,
+      _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
+      _desired: { readDesiredState() { return { available: true }; } },
+      _remote: { readRemoteSnapshot() { return { available: false, reason: 'remote_unavailable' }; } },
+      _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+      _reconcile: { planReconciliation() { return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
+    });
+    mock.restoreAll();
+    const outageStdout = outageChunks.join('');
+
+    assert.notStrictEqual(targetFaultStdout, outageStdout, 'a local config fault must not read the same as a remote outage (G-02-4)');
+    assert.match(outageStdout, /Retry shortly/);
+    assert.doesNotMatch(targetFaultStdout, /Retry shortly/, 'retrying can never fix a local config fault');
+  });
+
+  test('--raw carries a typed target_unavailable blocker with the field as detail, and an empty uncertain list', () => {
+    const chunks = captureStdout();
+    try {
+      routeGithubSyncCommandRouter(makeTargetFaultOptions(true));
+    } finally { mock.restoreAll(); }
+    const parsed = JSON.parse(chunks.join(''));
+    assert.strictEqual(parsed.available, false);
+    assert.deepEqual(parsed.blocked, [{ reason: 'target_unavailable', detail: 'repository_number' }]);
+    assert.deepEqual(parsed.uncertain, []);
+  });
+});
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 /**
