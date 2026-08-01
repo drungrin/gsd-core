@@ -11,6 +11,7 @@ const fixtures = JSON.parse(
 );
 
 function envelope(connection, page) {
+  if (connection === 'project') return { data: { viewer: { projectV2: page } } };
   if (connection === 'subIssues') return { data: { repository: { issue: { subIssues: page } } } };
   return { data: { viewer: { projectV2: { [connection]: page } } } };
 }
@@ -23,13 +24,13 @@ function fixtureExec(fixture) {
     calls,
     execGh(args) {
       const query = args.find((arg) => arg.startsWith('query='));
-      const connection = ['items', 'fields', 'subIssues'].find((name) => query.includes(`github-sync:${name}`));
+      const connection = ['project', 'items', 'fields', 'subIssues'].find((name) => query.includes(`github-sync:${name}`));
       calls.push({ connection, args });
       const issueArg = args.find((arg) => arg.startsWith('issueNumber='));
       const issueNumber = issueArg ? Number(issueArg.slice('issueNumber='.length)) : null;
       const cursor = connection === 'subIssues' ? (subIssueCursors.get(issueNumber) ?? 0) : cursors[connection]++;
       if (connection === 'subIssues') subIssueCursors.set(issueNumber, cursor + 1);
-      const page = fixture[connection][cursor];
+      const page = connection === 'project' ? fixture.project : fixture[connection][cursor];
       return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope(connection, page)), stderr: '' };
     },
   };
@@ -41,7 +42,7 @@ describe('readRemoteSnapshot', () => {
     const calls = [];
     const itemNodes = Array.from({ length: 101 }, (_, index) => ({
       id: `ITEM-${index + 1}`,
-      content: index === 0 ? { number: 101 } : index === 1 ? { number: 202 } : null,
+      content: index === 0 ? { id: 'ISSUE_NODE_101', number: 101 } : index === 1 ? { id: 'ISSUE_NODE_202', number: 202 } : null,
     }));
     const subNodes = Array.from({ length: 101 }, (_, index) => ({ id: `SUB-101-${index + 1}`, number: index + 1 }));
     const pages = {
@@ -66,23 +67,33 @@ describe('readRemoteSnapshot', () => {
       cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7,
       execGh(args) {
         const query = args.find((arg) => arg.startsWith('query='));
-        const connection = ['items', 'fields', 'subIssues'].find((name) => query.includes(`github-sync:${name}`));
+        const connection = ['project', 'items', 'fields', 'subIssues'].find((name) => query.includes(`github-sync:${name}`));
         const issueArg = args.find((arg) => arg.startsWith('issueNumber='));
         const parent = connection === 'subIssues' ? Number(issueArg.slice('issueNumber='.length)) : null;
         calls.push({ connection, parent, args });
-        const page = connection === 'subIssues' ? pages.subIssues[parent][cursors[parent]++] : pages[connection][cursors[connection]++];
+        const page = connection === 'project'
+          ? { id: 'PVT_proj_node_1' }
+          : connection === 'subIssues'
+            ? pages.subIssues[parent][cursors[parent]++]
+            : pages[connection][cursors[connection]++];
         return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope(connection, page)), stderr: '' };
       },
     });
 
     assert.equal(result.available, true);
-    assert.deepEqual(result.target, { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 });
+    assert.deepEqual(result.target, {
+      owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, projectNodeId: 'PVT_proj_node_1',
+    });
     assert.equal(result.items.length, 101);
     assert.equal(result.fields.length, 2);
     assert.equal(result.subIssues.length, 102);
+    assert.deepEqual(result.items.slice(0, 2).map((entry) => entry.content), [
+      { id: 'ISSUE_NODE_101', number: 101 },
+      { id: 'ISSUE_NODE_202', number: 202 },
+    ]);
     assert.deepEqual(result.subIssues.filter((entry) => entry.parentIssueNumber === 101).map((entry) => entry.id), subNodes.map((node) => node.id));
     assert.deepEqual(result.subIssues.filter((entry) => entry.parentIssueNumber === 202).map((entry) => entry.id), ['SUB-202-1']);
-    assert.deepEqual(calls.map(({ connection, parent }) => [connection, parent]), [['items', null], ['items', null], ['fields', null], ['fields', null], ['subIssues', 101], ['subIssues', 101], ['subIssues', 202]]);
+    assert.deepEqual(calls.map(({ connection, parent }) => [connection, parent]), [['project', null], ['items', null], ['items', null], ['fields', null], ['fields', null], ['subIssues', 101], ['subIssues', 101], ['subIssues', 202]]);
     for (const call of calls) {
       assert.ok(call.args.includes('owner=octo') || call.connection !== 'subIssues');
       assert.ok(call.args.includes('repo=example') || call.connection !== 'subIssues');
@@ -95,10 +106,11 @@ describe('readRemoteSnapshot', () => {
     const result = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1, subIssueNumber: 101, execGh: fake.execGh });
 
     assert.strictEqual(result.available, true);
+    assert.equal(result.target.projectNodeId, 'PVT_proj_node_1');
     assert.deepStrictEqual(result.items.map((node) => node.id), ['ITEM-1', 'ITEM-2']);
     assert.deepStrictEqual(result.fields.map((node) => node.id), ['FIELD-1', 'FIELD-2']);
     assert.deepStrictEqual(result.subIssues.map((node) => node.id), ['SUB-1', 'SUB-2', 'SUB-1', 'SUB-2']);
-    assert.deepStrictEqual(fake.calls.map((call) => call.connection), ['items', 'items', 'fields', 'fields', 'subIssues', 'subIssues', 'subIssues', 'subIssues']);
+    assert.deepStrictEqual(fake.calls.map((call) => call.connection), ['project', 'items', 'items', 'fields', 'fields', 'subIssues', 'subIssues', 'subIssues', 'subIssues']);
   });
 
   test('returns stable empty arrays when all fixture connections are empty', () => {
@@ -108,7 +120,33 @@ describe('readRemoteSnapshot', () => {
     assert.deepStrictEqual(result, {
       available: true,
       reason: REMOTE_REASON.OK,
-      target: { owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1 },
+      target: { owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1, projectNodeId: 'PVT_proj_node_empty' },
+      items: [],
+      fields: [],
+      subIssues: [],
+    });
+  });
+
+  test('selects the project node ID before paginated reads and fails closed on a missing or empty project ID', () => {
+    const fake = fixtureExec(fixtures['two-pages']);
+    const result = readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1, execGh: fake.execGh });
+    assert.equal(result.available, true);
+    assert.equal(result.target.projectNodeId, 'PVT_proj_node_1');
+    assert.equal(fake.calls[0].connection, 'project');
+
+    const unavailable = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh(args) {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('project', fixtures['project-missing-id'].project)), stderr: 'secret project failure' };
+        }
+        throw new Error('project failure must short-circuit pagination');
+      },
+    });
+    assert.deepStrictEqual(unavailable, {
+      available: false,
+      reason: REMOTE_REASON.UNAVAILABLE,
       items: [],
       fields: [],
       subIssues: [],

@@ -13,27 +13,30 @@ const desired = {
 const remote = {
   available: true,
   reason: 'ok',
-  target: { owner: 'octo', repo: 'repo', repositoryNumber: 42, projectNumber: 7 },
-  items: [{ id: 'item-01', content: { number: 1 } }],
+  target: { owner: 'octo', repo: 'repo', repositoryNumber: 42, projectNumber: 7, projectNodeId: 'PVT_proj_node_1' },
+  items: [{ id: 'item-01', content: { id: 'ISSUE_NODE_1', number: 1 } }],
   fields: [],
   subIssues: [],
+  issueNodeIds: {},
 };
 
-test('planReconciliation is deterministic and treats matching remote items and map completions as no-ops', () => {
-  const map = { kind: 'valid', map: { completions: { 'phase:02': { nodeId: 'item-02' } } } };
+test('planReconciliation is deterministic and treats a board item matched through strict-map identity as a no-op', () => {
+  const map = { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 } } } };
   const first = planReconciliation(desired, remote, map);
   const second = planReconciliation(desired, remote, map);
 
   assert.deepEqual(first, second);
-  assert.deepEqual(first.operations, []);
-  assert.deepEqual(first.noops.map((entry) => entry.logicalKey), ['phase:01', 'phase:02']);
+  assert.deepEqual(first.operations.map((entry) => entry.logicalKey), ['phase:02']);
+  assert.deepEqual(first.noops.map((entry) => entry.logicalKey), ['phase:01']);
 });
 
-test('planReconciliation emits a complete, array-only mutation operation from desired, remote, and map inputs', () => {
-  const plan = planReconciliation(desired, { ...remote, items: [] }, { kind: 'absent' });
-  assert.deepEqual(plan.operations.map((entry) => [entry.kind, entry.logicalKey]), [
-    [OPERATION_KIND.CREATE, 'phase:01'], [OPERATION_KIND.CREATE, 'phase:02'],
-  ]);
+test('planReconciliation emits a create operation with opaque project and issue node IDs only', () => {
+  const plan = planReconciliation(
+    desired,
+    { ...remote, items: [], issueNodeIds: { 101: 'ISSUE_NODE_101' } },
+    { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 } } } },
+  );
+  assert.deepEqual(plan.operations.map((entry) => [entry.kind, entry.logicalKey]), [[OPERATION_KIND.CREATE, 'phase:02']]);
 
   const operation = plan.operations[0];
   assert.ok(Array.isArray(operation.args) && operation.args.length > 0);
@@ -49,8 +52,28 @@ test('planReconciliation emits a complete, array-only mutation operation from de
   assert.match(query, /rateLimit \{ cost remaining resetAt \}/);
   assert.match(query, /addProjectV2Item\(input:/);
   assert.match(query, /projectV2Item \{ id content \{ \.\.\. on Issue \{ number \} \} \}/);
-  assert.ok(operation.args.some((arg) => arg === '-F'));
-  assert.ok(operation.args.includes('projectId=7'));
+  assert.deepEqual(operation.args.filter((arg) => arg === '-F').length, 2);
+  assert.ok(operation.args.includes('projectId=PVT_proj_node_1'));
+  assert.ok(operation.args.includes('contentId=ISSUE_NODE_101'));
+  assert.equal(operation.args.some((arg) => /^projectId=7$/.test(arg) || /^contentId=0?2$/.test(arg)), false);
+});
+
+test('planReconciliation ignores coincidental remote issue numbers and blocks identity when no stable binding exists', () => {
+  const coincidental = planReconciliation(
+    desired,
+    {
+      ...remote,
+      items: [{ id: 'item-02', content: { id: 'ISSUE_NODE_2', number: 2 } }],
+      issueNodeIds: {},
+    },
+    { kind: 'absent' },
+  );
+  assert.deepEqual(coincidental.noops, []);
+  assert.deepEqual(coincidental.operations, []);
+  assert.deepEqual(coincidental.blocked, [
+    { reason: OPERATION_REASON.IDENTITY_UNRESOLVABLE, detail: 'phase:01' },
+    { reason: OPERATION_REASON.IDENTITY_UNRESOLVABLE, detail: 'phase:02' },
+  ]);
 });
 
 test('planReconciliation preserves typed blocked and uncertain outcomes', () => {
