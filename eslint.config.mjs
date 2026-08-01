@@ -141,6 +141,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/github-sync-auth.cjs',
       'gsd-core/bin/lib/github-sync-command-router.cjs',
       'gsd-core/bin/lib/github-sync-apply.cjs',
+      'gsd-core/bin/lib/github-sync-operation.cjs',
       'gsd-core/bin/lib/github-sync-desired.cjs',
       'gsd-core/bin/lib/github-sync-map.cjs',
       'gsd-core/bin/lib/github-sync-reconcile.cjs',

@@ -372,6 +372,7 @@
       "github-sync-desired.cjs",
       "github-sync-gh.cjs",
       "github-sync-map.cjs",
+      "github-sync-operation.cjs",
       "github-sync-reconcile.cjs",
       "github-sync-remote.cjs",
       "github-sync-status.cjs",
