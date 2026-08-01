@@ -42,6 +42,8 @@ import bootstrapRemoteMod = require('./github-sync-bootstrap-remote.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import bootstrapPlanMod = require('./github-sync-bootstrap-plan.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import bootstrapConfigMod = require('./github-sync-bootstrap-config.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import operationMod = require('./github-sync-operation.cjs');
 import type { OperationOutcome } from './github-sync-operation.cts';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -118,6 +120,16 @@ interface BootstrapPlanModule {
   BOOTSTRAP_PASS: { STRUCTURE: string; OPTIONS: string };
 }
 
+interface ResolvedTargetLike { owner: string; repo: string; repositoryNumber: number; projectNumber: number | null; }
+interface ResolveTargetResultLike { target: ResolvedTargetLike | null; reason: string; strictMapRead: unknown; }
+interface ConfigWriteResultLike { ok: boolean; reason: string; }
+interface BootstrapConfigModule {
+  resolveTarget(cwd: string, options?: { execGh?: unknown }): ResolveTargetResultLike;
+  readProjectTitle(cwd: string): string | null;
+  writeProjectNumber(cwd: string, target: { owner: string; repo: string; repositoryNumber: number }, projectNumber: number): ConfigWriteResultLike;
+  RESOLVE_TARGET_REASON: { CONFIGURED: string; RESOLVED: string; UNRESOLVABLE: string };
+}
+
 // G-02-2: emitStatus() is a deliberate, local inversion of the family
 // convention. Every other router in src/ passes `undefined` as io.output()'s
 // third argument and lets its own `raw` flag pick JSON-vs-pretty-JSON.
@@ -166,6 +178,8 @@ interface RouteGithubSyncCommandRouterOptions {
   _bootstrapRemote?: BootstrapRemoteModule;
   /** Test seam: inject a mock bootstrap plan composer. Defaults to the real module. */
   _bootstrapPlan?: BootstrapPlanModule;
+  /** Test seam: inject a mock bootstrap config reader/writer. Defaults to the real module. */
+  _bootstrapConfig?: BootstrapConfigModule;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -186,6 +200,7 @@ function routeGithubSyncCommandRouter({
   _target,
   _bootstrapRemote,
   _bootstrapPlan,
+  _bootstrapConfig,
 }: RouteGithubSyncCommandRouterOptions): void {
   const activeCheck = _isCapabilityActive ?? isCapabilityActive;
 
@@ -224,6 +239,7 @@ function routeGithubSyncCommandRouter({
   const target: TargetModule = _target ?? targetMod;
   const bootstrapRemote: BootstrapRemoteModule = _bootstrapRemote ?? bootstrapRemoteMod;
   const bootstrapPlan: BootstrapPlanModule = _bootstrapPlan ?? bootstrapPlanMod;
+  const bootstrapConfig: BootstrapConfigModule = _bootstrapConfig ?? bootstrapConfigMod;
 
   routeHubCommandFamily({
     family: 'github-sync',
@@ -315,12 +331,9 @@ function routeGithubSyncCommandRouter({
         }
         output(result, raw);
       },
-      // D-05/D-15: `init` is registered and works end to end for D-03's
-      // adopt-and-repair path (both live UAT boards are in that state) — it
-      // is not a stub. Between this plan and plan 03-03, a target with no
-      // configured project number reports the ordinary unavailable-target
-      // result and does nothing: the fresh-create path arrives with
-      // `resolveTarget` and `planProject` in plan 03-03.
+      // D-05/D-15: `init` is registered and works end to end for BOOT-01's
+      // create/adopt/repair/not-found branches (plan 03-03) — it is not a
+      // stub.
       //
       // Unlike `sync`, `init` does NOT collapse the preflight result behind
       // a generic reason (line ~251 above) — a missing `project` scope must
@@ -336,35 +349,41 @@ function routeGithubSyncCommandRouter({
           }
 
           const desiredState = desired.readDesiredState(cwd);
-          const resolvedTarget = target.readSyncTarget(cwd);
-          if (!resolvedTarget.available || !resolvedTarget.target) {
+
+          // D-01/D-02/HIGH-1: resolveTarget is the identity-then-map single
+          // read this run consumes — an explicitly configured target always
+          // wins and spawns nothing; otherwise it fills the identity from a
+          // partial config and/or `gh repo view`, and only then (with a
+          // complete identity) reads the sync map once for project-number
+          // crash recovery. Every subsequent consumer here — the options
+          // pass's planner input, its adapters.map, and the effective-target
+          // computation — consumes the map returned by the most recent
+          // apply, never this head-of-run copy again.
+          const resolvedResult = bootstrapConfig.resolveTarget(cwd);
+          if (!resolvedResult.target) {
             result = { kind: 'blocked', reason: 'target_unavailable' };
             output(result, raw);
             return;
           }
-          const repository = { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber };
+          const resolvedTarget = resolvedResult.target;
 
-          // HIGH-1: the map is read exactly ONCE, here, at the head of the
-          // run. Every subsequent consumer — the options pass's planner
-          // input, its adapters.map, and the effective-target computation —
-          // consumes the map returned by the most recent apply, never this
-          // head-of-run copy again.
-          const strictMap = map.readSyncMapStrict(cwd, repository) as { kind: string; reason?: string; map?: unknown };
+          const strictMap = (resolvedResult.strictMapRead ?? { kind: 'absent' }) as { kind: string; reason?: string; map?: unknown };
           const remoteSnapshot = bootstrapRemote.readBootstrapRemoteState({
             cwd,
-            owner: resolvedTarget.target.owner,
-            repo: resolvedTarget.target.repo,
-            projectNumber: resolvedTarget.target.projectNumber,
+            owner: resolvedTarget.owner,
+            repo: resolvedTarget.repo,
+            projectNumber: resolvedTarget.projectNumber,
           });
 
           const baseTarget = {
-            owner: resolvedTarget.target.owner,
-            repo: resolvedTarget.target.repo,
-            repositoryNumber: resolvedTarget.target.repositoryNumber,
+            owner: resolvedTarget.owner,
+            repo: resolvedTarget.repo,
+            repositoryNumber: resolvedTarget.repositoryNumber,
           };
+          const projectTitle = bootstrapConfig.readProjectTitle(cwd);
 
           const structurePlan = bootstrapPlan.planBootstrap(
-            { desired: desiredState, remote: remoteSnapshot, strictMap, target: { ...baseTarget, projectNumber: resolvedTarget.target.projectNumber } },
+            { desired: desiredState, remote: remoteSnapshot, strictMap, target: { ...baseTarget, projectNumber: resolvedTarget.projectNumber }, projectTitle },
             { pass: bootstrapPlan.BOOTSTRAP_PASS.STRUCTURE },
           );
           if (structurePlan.blocked.length > 0) {
@@ -387,16 +406,17 @@ function routeGithubSyncCommandRouter({
             return;
           }
 
-          // Cycle-4 HIGH-4 second half: the effective target is recomputed
-          // from the structure pass's OWN result and feeds both the
-          // conditional re-read and (in plan 03-03) the config write, so the
-          // two can never disagree.
+          // Cycle-4 HIGH-4/HIGH-1: the effective target is recomputed from
+          // the structure pass's OWN returned map and feeds the conditional
+          // re-read AND the config write below — one value, two consumers,
+          // so they can never disagree. Reading it from resolveTarget's copy
+          // would miss a project created during this very run.
           const mutated = mutatedKeys(structureApply.outcomes ?? []);
           const projectMutated = mutated.includes('project');
           const fieldMutated = mutated.some((key: string) => key.startsWith('field:'));
           const effectiveProjectNumber = projectMutated
-            ? structureApply.map?.completions?.project?.issueNumber ?? resolvedTarget.target.projectNumber
-            : resolvedTarget.target.projectNumber;
+            ? structureApply.map?.completions?.project?.issueNumber ?? resolvedTarget.projectNumber
+            : resolvedTarget.projectNumber;
 
           // Re-read only when the structure pass MUTATED the field/option
           // surface (never on a mere checkpointed observation, which cannot
@@ -408,7 +428,7 @@ function routeGithubSyncCommandRouter({
 
           const optionsStrictMap = structureApply.map ? { kind: 'valid', map: structureApply.map } : { kind: 'absent' };
           const optionsPlan = bootstrapPlan.planBootstrap(
-            { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber } },
+            { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber }, projectTitle },
             { pass: bootstrapPlan.BOOTSTRAP_PASS.OPTIONS },
           );
           if (optionsPlan.blocked.length > 0) {
@@ -426,7 +446,33 @@ function routeGithubSyncCommandRouter({
           // the head-of-run strictMap read above — seeding from the stale
           // copy would make this single atomic write REPLACE every
           // completion the structure pass just persisted.
-          result = apply.applyMutationPlan(optionsPlan, { cwd, map: structureApply.map ?? null });
+          const optionsApply = apply.applyMutationPlan(optionsPlan, { cwd, map: structureApply.map ?? null }) as Record<string, unknown>;
+
+          // D-02: the config write fires whenever the run started
+          // unconfigured (a partial-config, gh-fallback, or crash-recovery
+          // resolution — never a fully-configured run, whose number is
+          // already correct) AND the effective target carries a positive
+          // project number — covering the create path AND the
+          // crash-recovery path, not only a confirmed create. A non-ok write
+          // result degrades to a notice on the typed result object; per
+          // D-11 it never changes the exit code, and it never re-throws into
+          // the outer catch (which would misreport an otherwise-successful
+          // sync as `init_unavailable`).
+          if (
+            resolvedResult.reason !== bootstrapConfig.RESOLVE_TARGET_REASON.CONFIGURED &&
+            typeof effectiveProjectNumber === 'number' && Number.isSafeInteger(effectiveProjectNumber) && effectiveProjectNumber > 0
+          ) {
+            try {
+              const writeResult = bootstrapConfig.writeProjectNumber(cwd, baseTarget, effectiveProjectNumber);
+              if (!writeResult.ok) {
+                optionsApply.configWriteNotice = writeResult.reason;
+              }
+            } catch {
+              optionsApply.configWriteNotice = 'config_write_threw';
+            }
+          }
+
+          result = optionsApply;
         } catch {
           result = { kind: 'uncertain', reason: 'init_unavailable' };
         }
