@@ -44,7 +44,16 @@ test('planReconciliation emits a create operation with opaque project and issue 
   assert.ok(Array.isArray(operation.args) && operation.args.length > 0);
   assert.ok(operation.args.every((arg) => typeof arg === 'string'));
   assert.deepEqual(operation.completionContext, { owner: 'octo', repo: 'repo', repositoryNumber: 42 });
-  assert.equal(operation.responsePayloadKey, 'addProjectV2Item');
+  assert.equal(operation.captures.length, 1);
+  assert.deepEqual(operation.captures[0], {
+    kind: 'node',
+    logicalKey: 'phase:01',
+    nodeIdPath: 'addProjectV2Item.projectV2Item.id',
+    numberPath: 'addProjectV2Item.projectV2Item.content.number',
+  });
+  assert.equal(operation.transport, 'graphql');
+  assert.equal(operation.action, 'create');
+  assert.equal(operation.hasPointsBudget, true);
   assert.equal(operation.contentCreation, true);
   assert.ok(operation.args.includes('api'));
   assert.ok(operation.args.includes('graphql'));

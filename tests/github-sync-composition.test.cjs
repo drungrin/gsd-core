@@ -141,11 +141,12 @@ test('real reconciler, applier, and strict map resume each response-validated ch
     recordCompletion,
     writeSyncMapAtomically,
   });
-  assert.deepEqual(firstRun, {
-    kind: 'failed',
-    logicalKey: 'phase:02',
-    remediation: 'Retry the sync after resolving the reported GitHub failure.',
-  });
+  // plan 03-02 (HIGH-F): ApplyResult now carries an outcomes journal on every
+  // variant, so this assertion is narrowed to the three pre-existing fields
+  // rather than a full-object deepEqual against them.
+  assert.equal(firstRun.kind, 'failed');
+  assert.equal(firstRun.logicalKey, 'phase:02');
+  assert.equal(firstRun.remediation, 'Retry the sync after resolving the reported GitHub failure.');
   assertOpaqueIdPairs(dispatchedArgv);
 
   const reopened = readSyncMapStrict(cwd, REPOSITORY);
