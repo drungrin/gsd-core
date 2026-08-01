@@ -56,8 +56,8 @@ describe('readRemoteSnapshot', () => {
         { nodes: itemNodes.slice(100), pageInfo: { hasNextPage: false, endCursor: null } },
       ],
       fields: [
-        { nodes: [{ id: 'FIELD-1' }], pageInfo: { hasNextPage: true, endCursor: 'fields-2' } },
-        { nodes: [{ id: 'FIELD-2' }], pageInfo: { hasNextPage: false, endCursor: null } },
+        { nodes: [{ id: 'PVTF_field_1', name: 'Status' }], pageInfo: { hasNextPage: true, endCursor: 'fields-2' } },
+        { nodes: [{ id: 'PVTSSF_field_2', name: 'Title' }], pageInfo: { hasNextPage: false, endCursor: null } },
       ],
       subIssues: {
         101: [
@@ -113,9 +113,24 @@ describe('readRemoteSnapshot', () => {
     assert.strictEqual(result.available, true);
     assert.equal(result.target.projectNodeId, 'PVT_proj_node_1');
     assert.deepStrictEqual(result.items.map((node) => node.id), ['ITEM-1', 'ITEM-2']);
-    assert.deepStrictEqual(result.fields.map((node) => node.id), ['FIELD-1', 'FIELD-2']);
+    assert.deepStrictEqual(result.fields.map((node) => ({ id: node.id, name: node.name })), [
+      { id: 'PVTF_field_1', name: 'Status' },
+      { id: 'PVTSSF_field_2', name: 'Title' },
+    ]);
     assert.deepStrictEqual(result.subIssues.map((node) => node.id), ['SUB-1', 'SUB-2', 'SUB-1', 'SUB-2']);
     assert.deepStrictEqual(fake.calls.map((call) => call.connection), ['project', 'items', 'items', 'fields', 'fields', 'subIssues', 'subIssues', 'subIssues', 'subIssues']);
+  });
+
+  test('dispatches a fields document that selects scalars inside an inline fragment on ProjectV2FieldCommon', () => {
+    const fake = fixtureExec(fixtures['two-pages']);
+    readRemoteSnapshot({ cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1, execGh: fake.execGh });
+    const fieldsCall = fake.calls.find((call) => call.connection === 'fields');
+    const query = fieldsCall.args.find((arg) => arg.startsWith('query=')).slice('query='.length);
+    assert.match(
+      query,
+      /fields\(first:100,after:\$endCursor\)\s*\{\s*nodes\s*\{\s*\.\.\.\s*on\s+ProjectV2FieldCommon\s*\{\s*id\s+name\s*\}\s*\}/,
+      'the fields document must select id/name inside an inline fragment on the ProjectV2FieldCommon interface, not directly on the ProjectV2FieldConfiguration union',
+    );
   });
 
   test('returns stable empty arrays when all fixture connections are empty', () => {
