@@ -1,7 +1,8 @@
 'use strict';
 
 /**
- * github-sync-gh.test.cjs — execGh seam coverage (Phase 1, plan 01-01, Task 2).
+ * github-sync-gh.test.cjs — execGh seam coverage (Phase 1, plan 01-01, Task 2;
+ * status-line widening, Phase 3, plan 03-01, Task 2).
  *
  * Mirrors tests/graphify.test.cjs's execGraphify describe block: mock.method on
  * childProcess.spawnSync with mock.restoreAll() cleanup, asserting on the typed
@@ -19,6 +20,29 @@ const { execGh, probeProjectsV2Scope, GH_REASON } = require('../gsd-core/bin/lib
 const headerFraming = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/header-framing.json'), 'utf8'),
 );
+
+/**
+ * Mirrors src/github-sync-apply.cts:100-102's isRateLimited exactly. Task 2's
+ * <files> scope excludes github-sync-apply.cts, and isRateLimited is not
+ * exported, so this local copy exercises the same predicate against a real
+ * execGh response object without editing or importing from that module.
+ */
+function isRateLimited(result) {
+  return result.response?.available === true &&
+    (result.response.status === 429 || result.response.status === 403) &&
+    typeof result.response.retry_after_seconds === 'number';
+}
+
+function runIncluded(stdout) {
+  mock.method(childProcess, 'spawnSync', () => ({
+    status: 0,
+    stdout,
+    stderr: '',
+    error: undefined,
+    signal: null,
+  }));
+  return execGh(['api', '--include', '/rate_limit'], { includeHeaders: true });
+}
 
 describe('execGh', () => {
   afterEach(() => {
@@ -134,15 +158,7 @@ describe('execGh include-header framing', () => {
 
   for (const [name, fixture] of Object.entries(headerFraming.cases)) {
     test(`${name} fixture exposes only unambiguous status and numeric Retry-After metadata`, () => {
-      mock.method(childProcess, 'spawnSync', () => ({
-        status: 0,
-        stdout: fixture.stdout,
-        stderr: '',
-        error: undefined,
-        signal: null,
-      }));
-
-      const result = execGh(['api', '--include', '/rate_limit'], { includeHeaders: true });
+      const result = runIncluded(fixture.stdout);
       assert.deepStrictEqual(result.response, {
         available: fixture.status !== null,
         status: fixture.status,
@@ -151,8 +167,69 @@ describe('execGh include-header framing', () => {
     });
   }
 
+  test('the live HTTP/2.0 200 form (gh 2.96.0) parses available:true with the real status, and the expected value is read from the re-recorded fixture, not typed into the test', () => {
+    const fixture = headerFraming.cases['live-200'];
+    const result = runIncluded(fixture.stdout);
+    assert.strictEqual(result.response.available, true);
+    assert.strictEqual(result.response.status, fixture.status);
+    // The parsed body must be everything after the blank-line separator: the
+    // JSON payload, with no header bytes leaked into it.
+    const separatorIndex = fixture.stdout.search(/\r?\n\r?\n/);
+    const separatorMatch = /\r?\n\r?\n/.exec(fixture.stdout);
+    const expectedBody = fixture.stdout.slice(separatorIndex + separatorMatch[0].length);
+    assert.strictEqual(result.stdout, expectedBody);
+  });
+
+  test('the live HTTP/2.0 422 form (gh 2.96.0, duplicate-label conflict) parses available:true with status 422 — the input plan 03-05 conflict recovery needs', () => {
+    const fixture = headerFraming.cases['live-422'];
+    const result = runIncluded(fixture.stdout);
+    assert.strictEqual(result.response.available, true);
+    assert.strictEqual(result.response.status, 422);
+  });
+
+  test('the HTTP/1.1 form still parses exactly as it does today', () => {
+    const fixture = headerFraming.cases['http11-200'];
+    const result = runIncluded(fixture.stdout);
+    assert.deepStrictEqual(result.response, { available: true, status: 200, retry_after_seconds: null });
+  });
+
+  test('a 429 in the real HTTP/2.0 form with a numeric Retry-After parses the retry value, and isRateLimited returns true for that result', () => {
+    const fixture = headerFraming.cases['retry-after-429'];
+    const result = runIncluded(fixture.stdout);
+    assert.strictEqual(result.response.available, true);
+    assert.strictEqual(result.response.status, 429);
+    assert.strictEqual(result.response.retry_after_seconds, 17);
+    assert.strictEqual(isRateLimited(result), true);
+  });
+
+  test('two stacked response blocks still yield available:false and return stdout completely untouched', () => {
+    const fixture = headerFraming.cases['stacked-blocks'];
+    const result = runIncluded(fixture.stdout);
+    assert.strictEqual(result.response.available, false);
+    assert.strictEqual(result.stdout, fixture.stdout);
+  });
+
+  test('the header allowlist is unchanged: extra headers on the live 200 response never leak into the returned metadata', () => {
+    const fixture = headerFraming.cases['live-200'];
+    const result = runIncluded(fixture.stdout);
+
+    assert.deepStrictEqual(Object.keys(result.response).sort(), ['available', 'retry_after_seconds', 'status'].sort());
+
+    const headerBlock = fixture.stdout.slice(0, fixture.stdout.search(/\r?\n\r?\n/));
+    const headerLines = headerBlock.split(/\r?\n/).slice(1); // drop the status line itself
+    const serialized = JSON.stringify(result.response);
+    for (const line of headerLines) {
+      const colonIndex = line.indexOf(':');
+      if (colonIndex === -1) continue;
+      const name = line.slice(0, colonIndex).trim();
+      const value = line.slice(colonIndex + 1).trim();
+      if (!value || /^retry-after$/i.test(name)) continue;
+      assert.ok(!serialized.includes(value), `header value for "${name}" (${value}) must not appear in the returned metadata`);
+    }
+  });
+
   test('include-header parsing remains opt-in and does not alter normal body stdout', () => {
-    const fixture = headerFraming.cases['header-present'];
+    const fixture = headerFraming.cases['live-200'];
     mock.method(childProcess, 'spawnSync', () => ({
       status: 0,
       stdout: fixture.stdout,
@@ -168,7 +245,7 @@ describe('execGh include-header framing', () => {
 
   test('includeHeaders requests one header block and returns body-only JSON to GraphQL consumers', () => {
     let capturedArgs;
-    const fixture = headerFraming.cases['retry-after'];
+    const fixture = headerFraming.cases['retry-after-429'];
     mock.method(childProcess, 'spawnSync', (_program, args) => {
       capturedArgs = args;
       return { status: 1, stdout: fixture.stdout, stderr: '', error: undefined, signal: null };
