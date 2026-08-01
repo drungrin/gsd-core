@@ -1,8 +1,33 @@
-# GitHub Sync Status JSON Schema v1
+# GitHub Sync Status Output v1
 
-`gsd-tools github-sync status --json` emits a compact JSON object with `version: 1`.
-The DTO is safe for automation: it contains only logical operation keys and fixed reason codes,
-never GitHub transport output, credentials, or remote payloads.
+`gsd-tools github-sync status` has two output surfaces. **This is the default** — running
+`status` with no flags prints the human summary below. `--raw` is a separate, versioned
+machine surface documented in the second section; `--json` is accepted as a synonym but does
+not change behavior. The two surfaces never mix: the human summary is for a developer reading
+a terminal, and `--raw` is for automation.
+
+## Default output: the human summary (D-13)
+
+Running `status` with no flags prints a heading, then five group lines in this fixed order —
+`creates:`, `updates:`, `no-ops:`, `blocked:`, `uncertain:` — each showing its count. Every
+group always appears, even at zero (D-14). When a group is non-empty, each member follows on
+its own indented line: `creates`, `updates`, and `no-ops` list logical keys verbatim; `blocked`
+lists its typed reason, with a safe `detail` appended in parentheses when present; `uncertain`
+lists its typed reason. If the report carries any `limitations`, a final `limitations:` line
+lists each one, indented; the line is omitted entirely when there are none. This is the surface
+SYNC-07 promises: every planned create, update, and no-op is named, and every blocked or
+uncertain entry is named by its typed reason — actionable without reading source or JSON.
+
+When the remote snapshot is unavailable, the default output is instead the DTO's fixed
+operator-facing `message` (see below), and the command still exits successfully (D-16).
+
+## `--raw`: the compact JSON v1 schema (D-15)
+
+`gsd-tools github-sync status --raw` (or `--json`, unchanged behavior) emits a compact JSON
+object with `version: 1`. The DTO is safe for automation: it contains only logical operation
+keys and fixed reason codes, never GitHub transport output, credentials, or remote payloads.
+This is a published, versioned, one-way contract — it is byte-unchanged by the default output
+described above.
 
 | Field | Meaning |
 | --- | --- |
