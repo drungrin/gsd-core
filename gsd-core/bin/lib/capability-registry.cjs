@@ -1437,6 +1437,11 @@ const capabilities = {
         "type": "number",
         "default": 0,
         "description": "Positive GitHub Project v2 number for the closed github-sync target."
+      },
+      "github_sync.project_title": {
+        "type": "string",
+        "default": "",
+        "description": "Title used when `init` creates a Project v2 board (empty means the repository name followed by the word Roadmap)."
       }
     },
     "commands": [
@@ -3876,6 +3881,7 @@ const configKeys = {
   "github_sync.target.repo": "github-sync",
   "github_sync.target.repository_number": "github-sync",
   "github_sync.target.project_number": "github-sync",
+  "github_sync.project_title": "github-sync",
   "graphify.enabled": "graphify",
   "intel.enabled": "intel",
   "mempalace.enabled": "mempalace",
@@ -4063,6 +4069,12 @@ const configSchema = {
     "type": "number",
     "default": 0,
     "description": "Positive GitHub Project v2 number for the closed github-sync target."
+  },
+  "github_sync.project_title": {
+    "owner": "github-sync",
+    "type": "string",
+    "default": "",
+    "description": "Title used when `init` creates a Project v2 board (empty means the repository name followed by the word Roadmap)."
   },
   "graphify.enabled": {
     "owner": "graphify",

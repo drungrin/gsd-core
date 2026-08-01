@@ -11,9 +11,8 @@ const {
   BOOTSTRAP_REMOTE_REASON,
   PROJECT_OUTCOME,
   STATUS_FIELD_NAME,
-  LINK_STATE,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
-const { planStatusOptionMerge, planProject, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
+const { planStatusOptionMerge, planProject } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 
 function envelope(data) {
   return { data };

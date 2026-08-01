@@ -764,8 +764,29 @@ describe('github-sync capability manifest: SAFE-02 structural rule', () => {
 
 // ─── 6. `init` — plan 03-02 registration, HIGH-1 map threading, HIGH-4 re-read ──
 
-describe('github-sync router: init (plan 03-02)', () => {
+describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
   const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+  const RESOLVE_TARGET_REASON = { CONFIGURED: 'configured', RESOLVED: 'resolved', UNRESOLVABLE: 'unresolvable' };
+
+  /**
+   * A `_bootstrapConfig` seam stub. `resolveTarget` reports `strictMapRead`
+   * as `{ kind: 'absent' }` by default (plan 03-03's resolveTarget performs
+   * the map read itself now, so the router no longer calls `map.readSyncMapStrict`
+   * for `init`); `overrides.strictMapRead` lets a test inject a real strict-map
+   * read for the HIGH-1 map-threading tests.
+   */
+  function bootstrapConfigStub(target, overrides = {}) {
+    return {
+      resolveTarget: () => ({
+        target,
+        reason: overrides.reason ?? RESOLVE_TARGET_REASON.CONFIGURED,
+        strictMapRead: overrides.strictMapRead ?? { kind: 'absent' },
+      }),
+      readProjectTitle: () => overrides.projectTitle ?? null,
+      writeProjectNumber: overrides.writeProjectNumber ?? (() => ({ ok: true, reason: 'written' })),
+      RESOLVE_TARGET_REASON,
+    };
+  }
 
   test('init appears in the registered subcommands and dispatches to a handler (reaches auth.runPreflight)', () => {
     let preflightCalled = false;
@@ -804,8 +825,7 @@ describe('github-sync router: init (plan 03-02)', () => {
         _isCapabilityActive: () => true,
         _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
         _desired: { readDesiredState: () => ({ available: true }) },
-        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
-        _map: { readSyncMapStrict: () => ({ kind: 'absent' }) },
+        _bootstrapConfig: bootstrapConfigStub(TARGET),
         _bootstrapRemote: { readBootstrapRemoteState: () => { throw new Error('boom'); } },
       });
     } finally { mock.restoreAll(); }
@@ -841,8 +861,7 @@ describe('github-sync router: init (plan 03-02)', () => {
         _isCapabilityActive: () => true,
         _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
         _desired: { readDesiredState: () => ({ available: false, reason: 'local_unavailable' }) },
-        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
-        _map: { readSyncMapStrict: () => ({ kind: 'absent' }) },
+        _bootstrapConfig: bootstrapConfigStub(TARGET),
         _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
       });
     } finally { mock.restoreAll(); }
@@ -862,8 +881,20 @@ describe('github-sync router: init (plan 03-02)', () => {
         _isCapabilityActive: () => true,
         _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
         _desired: { readDesiredState: () => ({ available: true }) },
-        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
-        _map: { readSyncMapStrict: (...callArgs) => { mapReads += 1; return realMapForInit.readSyncMapStrict(...callArgs); } },
+        _bootstrapConfig: {
+          // Plan 03-03: resolveTarget now performs the single strict-map
+          // read itself (identity-then-map). Counting calls here proves the
+          // router invokes resolveTarget — and therefore the map read it
+          // performs — exactly once.
+          resolveTarget: (callCwd) => {
+            mapReads += 1;
+            const strictMapRead = realMapForInit.readSyncMapStrict(callCwd, { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber });
+            return { target: TARGET, reason: RESOLVE_TARGET_REASON.CONFIGURED, strictMapRead };
+          },
+          readProjectTitle: () => null,
+          writeProjectNumber: () => ({ ok: true, reason: 'written' }),
+          RESOLVE_TARGET_REASON,
+        },
         _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
         _bootstrapPlan: {
           BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
@@ -911,8 +942,16 @@ describe('github-sync router: init (plan 03-02)', () => {
           _isCapabilityActive: () => true,
           _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
           _desired: { readDesiredState: () => ({ available: true }) },
-          _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
-          _map: { readSyncMapStrict: (...callArgs) => realMapForInit.readSyncMapStrict(...callArgs) },
+          _bootstrapConfig: {
+            resolveTarget: (callCwd) => ({
+              target: TARGET,
+              reason: RESOLVE_TARGET_REASON.CONFIGURED,
+              strictMapRead: realMapForInit.readSyncMapStrict(callCwd, { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber }),
+            }),
+            readProjectTitle: () => null,
+            writeProjectNumber: () => ({ ok: true, reason: 'written' }),
+            RESOLVE_TARGET_REASON,
+          },
           _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
           _bootstrapPlan: {
             BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
@@ -941,8 +980,7 @@ describe('github-sync router: init (plan 03-02)', () => {
       _isCapabilityActive: () => true,
       _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
       _desired: { readDesiredState: () => ({ available: true }) },
-      _target: { readSyncTarget: () => ({ available: true, target: nullTarget }) },
-      _map: { readSyncMapStrict: () => ({ kind: 'absent' }) },
+      _bootstrapConfig: bootstrapConfigStub(nullTarget),
       _bootstrapRemote: {
         readBootstrapRemoteState(options) {
           remoteCalls.push(options.projectNumber);
@@ -980,8 +1018,7 @@ describe('github-sync router: init (plan 03-02)', () => {
       _isCapabilityActive: () => true,
       _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
       _desired: { readDesiredState: () => ({ available: true }) },
-      _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
-      _map: { readSyncMapStrict: () => ({ kind: 'absent' }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET),
       _bootstrapRemote: { readBootstrapRemoteState: (options) => { remoteCalls.push(options.projectNumber); return { available: true, projectOutcome: 'resolved', statusField: null }; } },
       _bootstrapPlan: {
         BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
@@ -989,5 +1026,177 @@ describe('github-sync router: init (plan 03-02)', () => {
       },
     });
     assert.deepEqual(remoteCalls, [7]);
+  });
+
+  // ─── plan 03-03: target_unavailable when resolveTarget cannot resolve ─────
+
+  test('an unresolvable target (resolveTarget returns null) produces the target_unavailable blocked reason', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    process.exitCode = 0;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _bootstrapConfig: {
+          resolveTarget: () => ({ target: null, reason: RESOLVE_TARGET_REASON.UNRESOLVABLE, strictMapRead: null }),
+          readProjectTitle: () => null,
+          writeProjectNumber: () => ({ ok: true, reason: 'written' }),
+          RESOLVE_TARGET_REASON,
+        },
+      });
+    } finally { mock.restoreAll(); }
+    assert.equal(process.exitCode, 0);
+    const parsed = JSON.parse(chunks.join(''));
+    assert.equal(parsed.kind, 'blocked');
+    assert.equal(parsed.reason, 'target_unavailable');
+  });
+
+  // ─── plan 03-03: the projectTitle config value is threaded to planBootstrap ─
+
+  test('the configured project title is threaded into planBootstrap\'s input for both passes', () => {
+    const titles = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET, { projectTitle: 'Configured Board Title' }),
+      _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap(input) {
+          titles.push(input.projectTitle);
+          return { operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] };
+        },
+      },
+    });
+    assert.deepEqual(titles, ['Configured Board Title', 'Configured Board Title']);
+  });
+
+  // ─── plan 03-03: the config write gate (D-02) ──────────────────────────────
+
+  test('a create run (resolveTarget reason RESOLVED, structure pass confirms a project) writes the project number to config exactly once', () => {
+    const writeCalls = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub({ owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: null }, {
+        reason: RESOLVE_TARGET_REASON.RESOLVED,
+        writeProjectNumber: (_cwd, _target, projectNumber) => { writeCalls.push(projectNumber); return { ok: true, reason: 'written' }; },
+      }),
+      _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'unset', statusField: null }) },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap(_input, { pass }) {
+          if (pass === 'structure') return { operations: [{ logicalKey: 'project' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+          return { operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] };
+        },
+      },
+      _apply: {
+        applyMutationPlan(plan, options) {
+          if (plan.operations.length > 0) {
+            return {
+              kind: 'completed',
+              map: { version: '1', repository: { owner: 'octo', repo: 'repo', number: 1 }, completions: { project: { logicalKey: 'project', nodeId: 'PVT_NEW', issueNumber: 88, completedAt: 'now', owner: 'octo', repo: 'repo', repositoryNumber: 1 } } },
+              outcomes: [{ logicalKey: 'project', operationKey: 'project', action: 'create', result: 'confirmed' }],
+            };
+          }
+          return { kind: 'completed', map: options.map, outcomes: [] };
+        },
+      },
+    });
+    assert.deepEqual(writeCalls, [88]);
+  });
+
+  test('an already-configured (CONFIGURED) run records zero config writes', () => {
+    const writeCalls = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET, {
+        writeProjectNumber: (_cwd, _target, projectNumber) => { writeCalls.push(projectNumber); return { ok: true, reason: 'written' }; },
+      }),
+      _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap: () => ({ operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] }),
+      },
+    });
+    assert.deepEqual(writeCalls, []);
+  });
+
+  test('a blocked run records zero config writes', () => {
+    const writeCalls = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET, {
+        reason: RESOLVE_TARGET_REASON.RESOLVED,
+        writeProjectNumber: (_cwd, _target, projectNumber) => { writeCalls.push(projectNumber); return { ok: true, reason: 'written' }; },
+      }),
+      _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent', statusField: null }) },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap: () => ({ operations: [], noops: [], blocked: [{ reason: 'project_not_found', detail: 'not found' }], uncertain: [], checkpoints: [] }),
+      },
+    });
+    assert.deepEqual(writeCalls, []);
+  });
+
+  test('a failing config write leaves process.exitCode at 0 and surfaces a notice on the typed result rather than throwing', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    process.exitCode = 0;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _bootstrapConfig: bootstrapConfigStub({ owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: null }, {
+          reason: RESOLVE_TARGET_REASON.RESOLVED,
+          writeProjectNumber: () => ({ ok: false, reason: 'config_unreadable' }),
+        }),
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'unset', statusField: null }) },
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap(_input, { pass }) {
+            if (pass === 'structure') return { operations: [{ logicalKey: 'project' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+            return { operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] };
+          },
+        },
+        _apply: {
+          applyMutationPlan(plan, options) {
+            if (plan.operations.length > 0) {
+              return {
+                kind: 'completed',
+                map: { version: '1', repository: { owner: 'octo', repo: 'repo', number: 1 }, completions: { project: { logicalKey: 'project', nodeId: 'PVT_NEW', issueNumber: 99, completedAt: 'now', owner: 'octo', repo: 'repo', repositoryNumber: 1 } } },
+                outcomes: [{ logicalKey: 'project', operationKey: 'project', action: 'create', result: 'confirmed' }],
+              };
+            }
+            return { kind: 'completed', map: options.map, outcomes: [] };
+          },
+        },
+      });
+    } finally { mock.restoreAll(); }
+    assert.equal(process.exitCode, 0);
+    const parsed = JSON.parse(chunks.join(''));
+    assert.equal(parsed.kind, 'completed');
+    assert.equal(parsed.configWriteNotice, 'config_unreadable');
   });
 });

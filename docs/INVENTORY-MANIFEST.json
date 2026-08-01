@@ -368,6 +368,7 @@
       "git-base-branch.cjs",
       "github-sync-apply.cjs",
       "github-sync-auth.cjs",
+      "github-sync-bootstrap-config.cjs",
       "github-sync-bootstrap-plan.cjs",
       "github-sync-bootstrap-remote.cjs",
       "github-sync-command-router.cjs",
