@@ -11,25 +11,33 @@ const {
   BOOTSTRAP_REMOTE_REASON,
   PROJECT_OUTCOME,
   STATUS_FIELD_NAME,
+  LINK_STATE,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
-const { planStatusOptionMerge } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
+const { planStatusOptionMerge, planProject, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 
 function envelope(data) {
   return { data };
 }
 
-function ownerFieldsResponse(nodes, hasNextPage = false, endCursor = null) {
+function ownerFieldsResponse(nodes, hasNextPage = false, endCursor = null, projectId = 'PVT_project') {
   return envelope({
     repositoryOwner: {
       projectV2: {
+        id: projectId,
         fields: { nodes, pageInfo: { hasNextPage, endCursor } },
       },
     },
   });
 }
 
-function repositoryResponse(id = 'R_repo', ownerId = 'O_owner', login = 'octo') {
-  return envelope({ repository: { id, owner: { id: ownerId, login } } });
+function repositoryResponse(id = 'R_repo', ownerId = 'O_owner', login = 'octo', linkedNumbers = [], hasNextPage = false) {
+  return envelope({
+    repository: {
+      id,
+      owner: { id: ownerId, login },
+      projectsV2: { nodes: linkedNumbers.map((number) => ({ number })), pageInfo: { hasNextPage, endCursor: hasNextPage ? 'link-cursor' : null } },
+    },
+  });
 }
 
 function makeExecGh(sequence) {
@@ -207,7 +215,15 @@ const bootstrapContract = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/bootstrap-graphql-documents-contract.json'), 'utf8'),
 );
 
-/** Drives a full readBootstrapRemoteState run and returns a Map of document name -> dispatched query text. */
+/**
+ * Drives a full readBootstrapRemoteState run and returns a Map of document
+ * name -> dispatched query text. `createProject`/`linkProjectToRepository`
+ * are never dispatched by readBootstrapRemoteState itself (planProject emits
+ * them as MutationOperations, applied later by applyMutationPlan) — they are
+ * captured here from planProject's own emitted operation args, in the
+ * create-path scenario, so Guard 1's completeness check still sees all four
+ * contract-registered document names.
+ */
 function captureDispatchedBootstrapDocuments() {
   const documents = new Map();
   readBootstrapRemoteState({
@@ -216,13 +232,32 @@ function captureDispatchedBootstrapDocuments() {
       const query = args.find((arg) => arg.startsWith('query='));
       const name = ['repository', 'fieldsWithTypes'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
       if (!documents.has(name)) documents.set(name, query.slice('query='.length));
-      if (name === 'repository') return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify({ data: { repository: { id: 'R_1', owner: { id: 'O_1', login: 'octo' } } } }) };
+      if (name === 'repository') {
+        return {
+          exitCode: 0, reason: 'ok', stderr: '',
+          stdout: JSON.stringify({ data: { repository: { id: 'R_1', owner: { id: 'O_1', login: 'octo' }, projectsV2: { nodes: [{ number: 7 }], pageInfo: { hasNextPage: false, endCursor: null } } } } }),
+        };
+      }
       return {
         exitCode: 0, reason: 'ok', stderr: '',
-        stdout: JSON.stringify({ data: { repositoryOwner: { projectV2: { fields: { nodes: [{ id: 'PVTF_1', name: 'Status', dataType: 'SINGLE_SELECT', options: [] }], pageInfo: { hasNextPage: false, endCursor: null } } } } } }),
+        stdout: JSON.stringify({ data: { repositoryOwner: { projectV2: { id: 'PVT_contract', fields: { nodes: [{ id: 'PVTF_1', name: 'Status', dataType: 'SINGLE_SELECT', options: [] }], pageInfo: { hasNextPage: false, endCursor: null } } } } } }),
       };
     },
   });
+
+  const createPathPlan = planProject(
+    { available: true, projectOutcome: 'unset', repository: { nodeId: 'R_1', ownerNodeId: 'O_1', ownerLogin: 'octo', linkState: null }, projectNodeId: null, statusField: null },
+    { kind: 'absent' },
+    { owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: null },
+    null,
+    { owner: 'octo', repo: 'example', repositoryNumber: 1 },
+  );
+  for (const operation of createPathPlan.operations) {
+    const query = operation.args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
+    const name = ['createProject', 'linkProjectToRepository'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
+    if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
+  }
+
   return documents;
 }
 

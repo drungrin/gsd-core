@@ -4,6 +4,7 @@ const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   planBootstrap,
+  planProject,
   planStatusOptionMerge,
   optionInputArgv,
   BOOTSTRAP_LOGICAL_KEY,
@@ -11,9 +12,14 @@ const {
   BOOTSTRAP_PASS,
   GSD_STATUS_OPTIONS,
   STATUS_FIELD_NAME,
+  DEFAULT_PROJECT_TITLE_SUFFIX,
+  CREATE_PROJECT_DOCUMENT,
+  LINK_PROJECT_DOCUMENT,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const { applyMutationPlan } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
+const { resolveArgv } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
 const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+const bootstrapRemote = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
 
 const CONTEXT = { owner: 'octo', repo: 'repo', repositoryNumber: 1 };
 
@@ -353,4 +359,263 @@ test('a converged plan folds through the real applyMutationPlan and writes zero 
   });
   assert.equal(second.kind, 'completed');
   assert.equal(writes.length, 1);
+});
+
+// ─── planProject ────────────────────────────────────────────────────────────
+
+const { ARGV_REF_PART } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
+
+function projectRepo(overrides = {}) {
+  return { nodeId: 'R_1', ownerNodeId: 'O_1', ownerLogin: 'octo', linkState: null, ...overrides };
+}
+function projectRemote(overrides = {}) {
+  return { available: true, projectOutcome: 'unset', repository: projectRepo(), projectNodeId: null, statusField: null, ...overrides };
+}
+function projectTarget(projectNumber) {
+  return { owner: 'octo', repo: 'gsd-core', repositoryNumber: 1, projectNumber };
+}
+function findArg(operation, prefix) {
+  return operation.args.find((arg) => typeof arg === 'string' && arg.startsWith(prefix));
+}
+
+describe('planProject', () => {
+  // ── create path ──
+  test('a null project number emits exactly two operations in order — create then link — and zero checkpoints, under distinct logical keys', () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    assert.equal(result.operations.length, 2);
+    assert.equal(result.checkpoints.length, 0);
+    assert.equal(result.blocked.length, 0);
+    assert.equal(result.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.project());
+    assert.equal(result.operations[1].logicalKey, BOOTSTRAP_LOGICAL_KEY.projectLink());
+    assert.notEqual(result.operations[0].logicalKey, result.operations[1].logicalKey);
+  });
+
+  test("the link operation's argv carries a reference entry whose from-key is the project key, resolving against a map holding a project completion", () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    const linkOp = result.operations[1];
+    const ref = linkOp.args.find((arg) => typeof arg === 'object' && arg !== null);
+    assert.ok(ref, 'the link operation must carry a reference entry, not a literal project id');
+    assert.equal(ref.from, BOOTSTRAP_LOGICAL_KEY.project());
+    assert.equal(ref.part, ARGV_REF_PART.NODE_ID);
+    const resolved = resolveArgv(linkOp.args, { [BOOTSTRAP_LOGICAL_KEY.project()]: { nodeId: 'PVT_created' } });
+    assert.equal(resolved.ok, true);
+    assert.ok(resolved.argv.includes(`${ref.prefix}PVT_created`));
+  });
+
+  test("resolving the link operation's argv against a map with no project completion returns an unresolved result naming the project key", () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    const linkOp = result.operations[1];
+    const resolved = resolveArgv(linkOp.args, {});
+    assert.equal(resolved.ok, false);
+    assert.equal(resolved.missingLogicalKey, BOOTSTRAP_LOGICAL_KEY.project());
+  });
+
+  test("the create operation's input carries only an owner id and a title — no repository id", () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    const createOp = result.operations[0];
+    assert.ok(findArg(createOp, 'ownerId='));
+    assert.ok(findArg(createOp, 'title='));
+    assert.equal(createOp.args.some((arg) => typeof arg === 'string' && arg.startsWith('repositoryId=')), false);
+    assert.equal(findArg(createOp, 'ownerId='), 'ownerId=O_1', 'the owner id must be the repository OWNER node id, not a viewer id');
+  });
+
+  test('title comes from the configured project title when present and non-empty, otherwise defaults to "<repo> Roadmap"', () => {
+    const configured = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), 'My Custom Title', CONTEXT);
+    assert.equal(findArg(configured.operations[0], 'title='), 'title=My Custom Title');
+
+    const defaulted = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    assert.equal(findArg(defaulted.operations[0], 'title='), `title=gsd-core${DEFAULT_PROJECT_TITLE_SUFFIX}`);
+
+    const emptyString = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), '', CONTEXT);
+    assert.equal(findArg(emptyString.operations[0], 'title='), `title=gsd-core${DEFAULT_PROJECT_TITLE_SUFFIX}`);
+  });
+
+  test('every string variable in both create-path operations rides the raw -f flag; no typed -F flag appears anywhere', () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    for (const operation of result.operations) {
+      assert.equal(operation.args.includes('-F'), false, `${operation.logicalKey} must never use the typed -F flag`);
+      for (let i = 0; i < operation.args.length; i++) {
+        const entry = operation.args[i];
+        const isValueEntry = (typeof entry === 'string' && entry.includes('=')) || (typeof entry === 'object' && entry !== null);
+        if (!isValueEntry) continue;
+        assert.equal(operation.args[i - 1], '-f', `${operation.logicalKey}'s value entry at index ${i} must be preceded by the raw -f flag`);
+      }
+    }
+  });
+
+  test('the create operation declares content creation true (a comment at the flag records why), and the link operation declares it false', () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    assert.equal(result.operations[0].contentCreation, true);
+    assert.equal(result.operations[1].contentCreation, false);
+  });
+
+  test("the create operation's node capture declares a number path ending at the project's number (BOOT-06's remote-number slot)", () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    const capture = result.operations[0].captures[0];
+    assert.equal(capture.kind, 'node');
+    assert.equal(capture.numberPath, 'createProjectV2.projectV2.number');
+    assert.equal(capture.nodeIdPath, 'createProjectV2.projectV2.id');
+  });
+
+  test('the link operation declares the link action and a single node capture whose node-id path walks the link payload, the repository, and the id', () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    const linkOp = result.operations[1];
+    assert.equal(linkOp.action, 'link');
+    assert.equal(linkOp.captures.length, 1);
+    assert.equal(linkOp.captures[0].nodeIdPath, 'linkProjectV2ToRepository.repository.id');
+  });
+
+  test('the create operation declares the GraphQL transport, the create action, and a points-budget flag', () => {
+    const result = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+    assert.equal(result.operations[0].transport, 'graphql');
+    assert.equal(result.operations[0].action, 'create');
+    assert.equal(typeof result.operations[0].hasPointsBudget, 'boolean');
+  });
+
+  // ── adopt path (HIGH-A / HIGH-C) ──
+  test('HIGH-A: an adopted, LINKED board emits zero operations and two checkpoints, under the project key and the link key', () => {
+    const remote = projectRemote({
+      projectOutcome: 'resolved',
+      projectNodeId: 'PVT_adopted',
+      repository: projectRepo({ linkState: 'linked' }),
+    });
+    const result = planProject(remote, { kind: 'absent' }, projectTarget(9), null, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 2);
+    assert.deepEqual(result.checkpoints.map((c) => c.logicalKey).sort(), [BOOTSTRAP_LOGICAL_KEY.project(), BOOTSTRAP_LOGICAL_KEY.projectLink()].sort());
+  });
+
+  test('adoption emits zero operations even when the remote title differs from the configured title (D-15, no rename)', () => {
+    const remote = projectRemote({ projectOutcome: 'resolved', projectNodeId: 'PVT_adopted', repository: projectRepo({ linkState: 'linked' }) });
+    const result = planProject(remote, { kind: 'absent' }, projectTarget(9), 'A Totally Different Title', CONTEXT);
+    assert.equal(result.operations.length, 0);
+  });
+
+  test('HIGH-C: an adopted board the remote reports UNLINKED emits exactly one operation (the link key) and one project checkpoint', () => {
+    const remote = projectRemote({ projectOutcome: 'resolved', projectNodeId: 'PVT_adopted', repository: projectRepo({ linkState: 'unlinked' }) });
+    const result = planProject(remote, { kind: 'absent' }, projectTarget(9), null, CONTEXT);
+    assert.equal(result.operations.length, 1);
+    assert.equal(result.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.projectLink());
+    assert.equal(result.checkpoints.length, 1);
+    assert.equal(result.checkpoints[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.project());
+  });
+
+  test('indeterminate link state with no link completion in the map emits the link operation; the same input with a link completion emits zero operations', () => {
+    const remote = projectRemote({ projectOutcome: 'resolved', projectNodeId: 'PVT_adopted', repository: projectRepo({ linkState: 'indeterminate' }) });
+    const noCompletion = planProject(remote, { kind: 'absent' }, projectTarget(9), null, CONTEXT);
+    assert.equal(noCompletion.operations.length, 1);
+    assert.equal(noCompletion.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.projectLink());
+
+    const withCompletion = planProject(remote, {
+      kind: 'valid',
+      map: { completions: { [BOOTSTRAP_LOGICAL_KEY.projectLink()]: { nodeId: 'R_already_linked' } } },
+    }, projectTarget(9), null, CONTEXT);
+    assert.equal(withCompletion.operations.length, 0);
+    assert.equal(withCompletion.checkpoints.length, 1);
+  });
+
+  test("the project checkpoint's node id is the exact remote string and its remote number equals the target's project number, neither coerced", () => {
+    const remote = projectRemote({ projectOutcome: 'resolved', projectNodeId: 'PVT_exact_string', repository: projectRepo({ linkState: 'linked' }) });
+    const result = planProject(remote, { kind: 'absent' }, projectTarget(42), null, CONTEXT);
+    const projectCheckpoint = result.checkpoints.find((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.project());
+    assert.strictEqual(projectCheckpoint.nodeId, 'PVT_exact_string');
+    assert.strictEqual(projectCheckpoint.remoteNumber, 42);
+    assert.equal(typeof projectCheckpoint.nodeId, 'string');
+    assert.equal(typeof projectCheckpoint.remoteNumber, 'number');
+  });
+
+  // ── refuse path (D-04) ──
+  test('a non-resolving project number yields zero operations, zero checkpoints, one blocked entry reasoned for a project not found, detail carrying the attempted number', () => {
+    const remote = projectRemote({ projectOutcome: 'absent', repository: projectRepo() });
+    const result = planProject(remote, { kind: 'absent' }, projectTarget(404), null, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 0);
+    assert.equal(result.blocked.length, 1);
+    assert.equal(result.blocked[0].reason, BOOTSTRAP_OPERATION_REASON.PROJECT_NOT_FOUND);
+    assert.match(result.blocked[0].detail, /404/);
+  });
+
+  test('the repository document resolving with an absent or non-string owner id yields zero operations, zero checkpoints, one blocked entry reasoned for an unresolvable owner', () => {
+    for (const repository of [null, projectRepo({ ownerNodeId: '' }), projectRepo({ ownerNodeId: undefined })]) {
+      const result = planProject(projectRemote({ repository }), { kind: 'absent' }, projectTarget(null), null, CONTEXT);
+      assert.equal(result.operations.length, 0);
+      assert.equal(result.checkpoints.length, 0);
+      assert.equal(result.blocked[0].reason, BOOTSTRAP_OPERATION_REASON.OWNER_UNRESOLVABLE);
+    }
+  });
+
+  // ── every operation/checkpoint carries the completion context planBootstrap built ──
+  test('every operation and checkpoint planProject emits carries the supplied completion context byte-identically, never derived from target independently', () => {
+    const context = { owner: 'zzz-owner', repo: 'zzz-repo', repositoryNumber: 999 };
+    const createResult = planProject(projectRemote(), { kind: 'absent' }, projectTarget(null), null, context);
+    for (const op of createResult.operations) assert.deepEqual(op.completionContext, context);
+
+    const adoptResult = planProject(
+      projectRemote({ projectOutcome: 'resolved', projectNodeId: 'PVT_x', repository: projectRepo({ linkState: 'linked' }) }),
+      { kind: 'absent' }, projectTarget(9), null, context,
+    );
+    for (const checkpoint of adoptResult.checkpoints) assert.deepEqual(checkpoint.completionContext, context);
+  });
+});
+
+// ─── planBootstrap wiring: planProject drives the structure pass ──────────
+
+describe('planBootstrap structure pass wiring (plan 03-03)', () => {
+  const target = { owner: 'octo', repo: 'gsd-core', repositoryNumber: 1, projectNumber: null };
+
+  test('an unset project number produces the create-and-link structure plan', () => {
+    const plan = planBootstrap({
+      desired: { available: true },
+      remote: projectRemote(),
+      strictMap: { kind: 'absent' },
+      target,
+    }, { pass: BOOTSTRAP_PASS.STRUCTURE });
+    assert.equal(plan.operations.length, 2);
+    assert.equal(plan.blocked.length, 0);
+  });
+
+  test('when planProject blocks, the structure pass reports zero operations and zero checkpoints', () => {
+    const plan = planBootstrap({
+      desired: { available: true },
+      remote: projectRemote({ repository: null }),
+      strictMap: { kind: 'absent' },
+      target,
+    }, { pass: BOOTSTRAP_PASS.STRUCTURE });
+    assert.equal(plan.operations.length, 0);
+    assert.equal(plan.checkpoints.length, 0);
+    assert.equal(plan.blocked[0].reason, BOOTSTRAP_OPERATION_REASON.OWNER_UNRESOLVABLE);
+  });
+
+  test('planBootstrap threads a configured projectTitle through to planProject', () => {
+    const plan = planBootstrap({
+      desired: { available: true },
+      remote: projectRemote(),
+      strictMap: { kind: 'absent' },
+      target,
+      projectTitle: 'Configured Title',
+    }, { pass: BOOTSTRAP_PASS.STRUCTURE });
+    assert.equal(findArg(plan.operations[0], 'title='), 'title=Configured Title');
+  });
+});
+
+// ─── differential parity: the local mutation documents match the ones ──────
+// registered in github-sync-bootstrap-remote.cts's BOOTSTRAP_DOCUMENTS (cycle
+// 2 actionable non-HIGH #2's parity principle, applied to the two mutation
+// documents this task adds — duplicated rather than imported to preserve
+// this module's zero-I/O-import architecture, per the note at their
+// declaration).
+
+describe('mutation document parity with github-sync-bootstrap-remote.cts', () => {
+  test('CREATE_PROJECT_DOCUMENT is byte-identical to BOOTSTRAP_DOCUMENTS.createProject', () => {
+    assert.equal(CREATE_PROJECT_DOCUMENT, bootstrapRemote.BOOTSTRAP_DOCUMENTS.createProject);
+  });
+
+  test('LINK_PROJECT_DOCUMENT is byte-identical to BOOTSTRAP_DOCUMENTS.linkProjectToRepository', () => {
+    assert.equal(LINK_PROJECT_DOCUMENT, bootstrapRemote.BOOTSTRAP_DOCUMENTS.linkProjectToRepository);
+  });
+
+  test('neither mutation document selects a rateLimit field (live-verified in plan 03-02: Mutation has no such field)', () => {
+    assert.doesNotMatch(CREATE_PROJECT_DOCUMENT, /rateLimit/);
+    assert.doesNotMatch(LINK_PROJECT_DOCUMENT, /rateLimit/);
+  });
 });

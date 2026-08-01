@@ -1,12 +1,12 @@
 {
-  "provenance": "Schema facts probed live against drungrin/gsd-core's repositoryOwner/projectV2 surface with `project` scope, 2026-08-01 (plan 03-02 Task 2). A sibling of tests/fixtures/github-sync/graphql-documents-contract.json (Phase 2) scoped to the two documents github-sync-bootstrap-remote.cts adds. Re-verify against the live schema before editing this file rather than guessing.",
+  "provenance": "Schema facts probed live against drungrin/gsd-core's repositoryOwner/projectV2 surface with `project` scope, 2026-08-01 (plan 03-02 Task 2). A sibling of tests/fixtures/github-sync/graphql-documents-contract.json (Phase 2) scoped to the documents github-sync-bootstrap-remote.cts adds. Re-verify against the live schema before editing this file rather than guessing. Updated 2026-08-01 (plan 03-03 Task 2, D-14/HIGH-C): `repository` widened with a `projectsV2` linked-project connection for link-state reads; `createProject`/`linkProjectToRepository` mutation documents registered for completeness (dispatched only via planProject's emitted operations, byte-pinned against github-sync-bootstrap-plan.cts's local copies by a differential test in tests/github-sync-bootstrap-plan.test.cjs — not captured by readBootstrapRemoteState's own dispatch, so they are exempted from Guard 1's capture-driven completeness check).",
   "documents": {
     "repository": {
       "connection": null,
       "nodeType": "Repository",
       "nodeKind": "OBJECT",
       "fragmentTargets": [],
-      "selects": ["id", "owner"],
+      "selects": ["id", "owner", "projectsV2"],
       "paginated": false
     },
     "fieldsWithTypes": {
@@ -16,6 +16,24 @@
       "fragmentTargets": ["ProjectV2FieldCommon", "ProjectV2SingleSelectField"],
       "selects": ["id", "name", "dataType", "options"],
       "paginated": true
+    },
+    "createProject": {
+      "connection": null,
+      "nodeType": "CreateProjectV2Payload",
+      "nodeKind": "OBJECT",
+      "fragmentTargets": [],
+      "selects": ["projectV2"],
+      "paginated": false,
+      "dispatchedBy": "planProject (not readBootstrapRemoteState) — exempt from Guard 1"
+    },
+    "linkProjectToRepository": {
+      "connection": null,
+      "nodeType": "LinkProjectV2ToRepositoryPayload",
+      "nodeKind": "OBJECT",
+      "fragmentTargets": [],
+      "selects": ["repository"],
+      "paginated": false,
+      "dispatchedBy": "planProject (not readBootstrapRemoteState) — exempt from Guard 1"
     }
   }
 }
