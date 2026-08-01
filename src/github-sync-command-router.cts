@@ -95,6 +95,24 @@ interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string;
 interface TargetReadResult { available: boolean; target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number }; }
 interface TargetModule { readSyncTarget(cwd: string): TargetReadResult; }
 
+// G-02-2: emitStatus() is a deliberate, local inversion of the family
+// convention. Every other router in src/ passes `undefined` as io.output()'s
+// third argument and lets its own `raw` flag pick JSON-vs-pretty-JSON.
+// github-sync's status handler instead pre-renders its own string on BOTH
+// routes — human by default per D-13, the unchanged compact v1 JSON under
+// `--raw` per D-15 — via status.renderStatusV1(dto, raw), which is the single
+// place left to decide human versus JSON. Because io.output() only consumes
+// its third argument when its OWN second argument is true, this helper passes
+// a literal `true` there: that argument now means "emit the string I already
+// rendered," not "the user asked for raw." Do not change io.output() itself —
+// every other caller depends on its current raw-gated semantics. The
+// large-payload tmpfile spill in io.output() does not apply to this path: a
+// status report is a pre-rendered string carrying logical keys and typed
+// reasons only, never a multi-KB machine payload.
+function emitStatus(dto: unknown, raw: boolean, statusModule: StatusModule): void {
+  output(dto, true, statusModule.renderStatusV1(dto, raw));
+}
+
 function collectIssueNodeIdHints(strictMap: unknown): number[] {
   if (strictMap === null || typeof strictMap !== 'object' || (strictMap as { kind?: unknown }).kind !== 'valid') return [];
   const completions = (strictMap as { map?: { completions?: Record<string, { issueNumber?: unknown }> } }).map?.completions;
@@ -211,7 +229,7 @@ function routeGithubSyncCommandRouter({
           const resolvedTarget = target.readSyncTarget(cwd);
           if (!resolvedTarget.available || !resolvedTarget.target) {
             dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
-            output(dto, raw, status.renderStatusV1(dto, raw));
+            emitStatus(dto, raw, status);
             return;
           }
           const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber });
@@ -220,7 +238,7 @@ function routeGithubSyncCommandRouter({
         } catch {
           dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
         }
-        output(dto, raw, status.renderStatusV1(dto, raw));
+        emitStatus(dto, raw, status);
       },
       sync: () => {
         let result: unknown;
