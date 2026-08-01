@@ -35,7 +35,7 @@ interface ReadRemoteSnapshotOptions {
 interface RemoteSnapshot {
   available: boolean;
   reason: RemoteReason;
-  target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number };
+  target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number; projectNodeId: string };
   items: RemoteNode[];
   fields: RemoteNode[];
   subIssues: RemoteNode[];
@@ -48,7 +48,8 @@ interface Page {
 }
 
 const DOCUMENTS = Object.freeze({
-  items: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:items\n viewer { projectV2(number:$projectNumber) { items(first:100,after:$endCursor) { nodes { id content { ... on Issue { number } } } pageInfo { hasNextPage endCursor } } } } }',
+  project: 'query($projectNumber:Int!) { # github-sync:project\n viewer { projectV2(number:$projectNumber) { id } } }',
+  items: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:items\n viewer { projectV2(number:$projectNumber) { items(first:100,after:$endCursor) { nodes { id content { ... on Issue { id number } } } pageInfo { hasNextPage endCursor } } } } }',
   fields: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:fields\n viewer { projectV2(number:$projectNumber) { fields(first:100,after:$endCursor) { nodes { id name } pageInfo { hasNextPage endCursor } } } } }',
   subIssues: 'query($owner:String!,$repo:String!,$issueNumber:Int!,$endCursor:String) { # github-sync:subIssues\n repository(owner:$owner,name:$repo) { issue(number:$issueNumber) { subIssues(first:100,after:$endCursor) { nodes { id number } pageInfo { hasNextPage endCursor } } } } }',
 });
@@ -89,6 +90,29 @@ function decodePage(result: GhResult, path: string[]): Page | null {
   if (typeof hasNextPage !== 'boolean' || (endCursor !== null && typeof endCursor !== 'string')) return null;
   if (hasNextPage && (!endCursor || endCursor.length === 0)) return null;
   return { nodes: nodes as RemoteNode[], hasNextPage, endCursor: endCursor as string | null };
+}
+
+function readProjectNodeId(options: ReadRemoteSnapshotOptions): string | null {
+  const execGh = options.execGh ?? ghMod.execGh;
+  const result = execGh(
+    ['api', 'graphql', '-f', `query=${DOCUMENTS.project}`, '-F', `projectNumber=${options.projectNumber}`],
+    { cwd: options.cwd },
+  );
+  if (result.exitCode !== 0) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object') return null;
+  const envelope = parsed as { data?: unknown; errors?: unknown };
+  if (Array.isArray(envelope.errors) && envelope.errors.length > 0) return null;
+  const project = readPath(envelope.data, ['viewer', 'projectV2']);
+  if (project === null || typeof project !== 'object') return null;
+  const projectNodeId = (project as { id?: unknown }).id;
+  return typeof projectNodeId === 'string' && projectNodeId.length > 0 ? projectNodeId : null;
 }
 
 function readConnection(
@@ -133,6 +157,9 @@ function collectIssueNumbers(items: RemoteNode[]): number[] | null {
 }
 
 function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot {
+  const projectNodeId = readProjectNodeId(options);
+  if (!projectNodeId) return unavailable();
+
   const items = readConnection(
     'items',
     ['viewer', 'projectV2', 'items'],
@@ -171,6 +198,7 @@ function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot 
       repo: options.repo,
       repositoryNumber: options.repositoryNumber,
       projectNumber: options.projectNumber,
+      projectNodeId,
     },
     items,
     fields,

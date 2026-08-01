@@ -26,8 +26,9 @@ test('planReconciliation is deterministic and treats a board item matched throug
   const second = planReconciliation(desired, remote, map);
 
   assert.deepEqual(first, second);
-  assert.deepEqual(first.operations.map((entry) => entry.logicalKey), ['phase:02']);
+  assert.deepEqual(first.operations, []);
   assert.deepEqual(first.noops.map((entry) => entry.logicalKey), ['phase:01']);
+  assert.deepEqual(first.blocked, [{ reason: OPERATION_REASON.IDENTITY_UNRESOLVABLE, detail: 'phase:02' }]);
 });
 
 test('planReconciliation emits a create operation with opaque project and issue node IDs only', () => {
@@ -36,7 +37,8 @@ test('planReconciliation emits a create operation with opaque project and issue 
     { ...remote, items: [], issueNodeIds: { 101: 'ISSUE_NODE_101' } },
     { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 } } } },
   );
-  assert.deepEqual(plan.operations.map((entry) => [entry.kind, entry.logicalKey]), [[OPERATION_KIND.CREATE, 'phase:02']]);
+  assert.deepEqual(plan.operations.map((entry) => [entry.kind, entry.logicalKey]), [[OPERATION_KIND.CREATE, 'phase:01']]);
+  assert.deepEqual(plan.blocked, [{ reason: OPERATION_REASON.IDENTITY_UNRESOLVABLE, detail: 'phase:02' }]);
 
   const operation = plan.operations[0];
   assert.ok(Array.isArray(operation.args) && operation.args.length > 0);
