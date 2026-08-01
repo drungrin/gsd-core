@@ -1,20 +1,41 @@
 'use strict';
-/** Serial, checkpointed mutation interpreter for github-sync reconciliation plans. */
+/**
+ * Serial, checkpointed mutation interpreter for github-sync reconciliation
+ * and bootstrap plans (plan 03-02, HIGH-A). Migrated onto the shared
+ * operation contract in `github-sync-operation.cts`: this module no longer
+ * declares its own `MutationOperation` shape and no longer decodes
+ * completions by hand. It folds `AdoptionCheckpoint`s into the map before
+ * dispatching anything, resolves late-bound argv against the live map,
+ * decodes a per-transport response root, and fans one operation's response
+ * out to N completions in a single atomic write.
+ */
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import ghMod = require('./github-sync-gh.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import mapMod = require('./github-sync-map.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import clockMod = require('./clock.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import operationMod = require('./github-sync-operation.cjs');
 import type { SyncCompletion, SyncMap } from './github-sync-map.cts';
+import type {
+  MutationPlan,
+  AdoptionCheckpoint,
+  OperationOutcome,
+  CompletionLookupMap,
+} from './github-sync-operation.cts';
 
-interface MutationOperation {
-  kind: string;
-  logicalKey: string;
-  args: string[];
-  completionContext: { owner: string; repo: string; repositoryNumber: number };
-  responsePayloadKey: string;
-  contentCreation: boolean;
-}
-interface MutationPlan { operations: MutationOperation[]; }
+const {
+  OPERATION_TRANSPORT,
+  OPERATION_ACTION,
+  OPERATION_OUTCOME,
+  isOperation,
+  resolveArgv,
+  decodeResponseRoot,
+  decodeCompletions,
+} = operationMod;
+
 interface GhResult {
   exitCode: number;
   reason: string;
@@ -34,9 +55,9 @@ interface ApplyAdapters {
   notice?: (message: string) => void;
 }
 type ApplyResult =
-  | { kind: 'completed'; map: SyncMap | null }
-  | { kind: 'failed'; logicalKey: string; remediation: string }
-  | { kind: 'uncertain'; logicalKey: string; remediation: string };
+  | { kind: 'completed'; map: SyncMap | null; outcomes: OperationOutcome[] }
+  | { kind: 'failed'; logicalKey: string; remediation: string; outcomes: OperationOutcome[] }
+  | { kind: 'uncertain'; logicalKey: string; remediation: string; outcomes: OperationOutcome[] };
 
 const RETRY_LIMIT = 3;
 const CONTENT_CREATE_INTERVAL_MS = 750;
@@ -44,20 +65,10 @@ const POINTS_RESERVE = 100;
 const RETRY_REMEDIATION = 'Retry the sync after resolving the reported GitHub failure.';
 const CREATE_UNCERTAIN_REMEDIATION = 'Re-read GitHub and reconcile before retrying this content create.';
 const CHECKPOINT_UNCERTAIN_REMEDIATION = 'Repair the local sync map before running sync again.';
+const ARGV_UNRESOLVED_REMEDIATION_PREFIX = 'A prerequisite object was not checkpointed this run: ';
 
-function parseData(result: GhResult): Record<string, unknown> | null {
-  try {
-    const parsed: unknown = JSON.parse(result.stdout);
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-    const envelope = parsed as { data?: unknown; errors?: unknown };
-    if (Array.isArray(envelope.errors) && envelope.errors.length > 0) return null;
-    return envelope.data !== null && typeof envelope.data === 'object' && !Array.isArray(envelope.data)
-      ? envelope.data as Record<string, unknown> : null;
-  } catch { return null; }
-}
-
-function parseRateLimit(result: GhResult): RateLimit | null {
-  const rateLimit = parseData(result)?.rateLimit;
+function parseRateLimitFromRoot(root: Record<string, unknown> | null): RateLimit | null {
+  const rateLimit = root?.rateLimit;
   if (rateLimit === null || typeof rateLimit !== 'object' || Array.isArray(rateLimit)) return null;
   const { cost, remaining, resetAt } = rateLimit as Record<string, unknown>;
   if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0 ||
@@ -66,35 +77,14 @@ function parseRateLimit(result: GhResult): RateLimit | null {
   return { cost, remaining, resetAt };
 }
 
-function isOperation(operation: MutationOperation): boolean {
-  const context = operation.completionContext;
-  return Array.isArray(operation.args) && operation.args.length > 0 && operation.args.every((arg) => typeof arg === 'string') &&
-    typeof operation.logicalKey === 'string' && operation.logicalKey.length > 0 &&
-    typeof operation.responsePayloadKey === 'string' && operation.responsePayloadKey.length > 0 &&
-    typeof operation.contentCreation === 'boolean' && context !== null && typeof context === 'object' &&
-    typeof context.owner === 'string' && context.owner.length > 0 && typeof context.repo === 'string' && context.repo.length > 0 &&
-    Number.isSafeInteger(context.repositoryNumber) && context.repositoryNumber > 0;
-}
-
-function decodeConfirmedCompletion(operation: MutationOperation, result: GhResult, completedAt: string): SyncCompletion | null {
-  if (!isOperation(operation)) return null;
-  const payload = parseData(result)?.[operation.responsePayloadKey];
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return null;
-  const item = (payload as Record<string, unknown>).projectV2Item;
-  if (item === null || typeof item !== 'object' || Array.isArray(item)) return null;
-  const { id, content } = item as Record<string, unknown>;
-  if (typeof id !== 'string' || id.length === 0) return null;
-  let issueNumber: number | undefined;
-  if (content !== null && content !== undefined) {
-    if (typeof content !== 'object' || Array.isArray(content)) return null;
-    const number = (content as Record<string, unknown>).number;
-    if (number !== undefined) {
-      if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) return null;
-      issueNumber = number;
-    }
-  }
-  return { logicalKey: operation.logicalKey, nodeId: id, ...(issueNumber === undefined ? {} : { issueNumber }), completedAt,
-    owner: operation.completionContext.owner, repo: operation.completionContext.repo, repositoryNumber: operation.completionContext.repositoryNumber };
+/**
+ * Thin wrapper on the pre-existing exported signature: decodes the GraphQL
+ * envelope through the shared `decodeResponseRoot`, then reads `rateLimit`
+ * off the resulting root. Kept so the existing export and its direct test
+ * assertion keep working unchanged.
+ */
+function parseRateLimit(result: GhResult): RateLimit | null {
+  return parseRateLimitFromRoot(decodeResponseRoot(OPERATION_TRANSPORT.GRAPHQL, result.stdout));
 }
 
 function isRateLimited(result: GhResult): boolean {
@@ -115,6 +105,66 @@ function pointsDelayMs(rateLimit: RateLimit, now: number): number | null {
   return Number.isNaN(resetAt) ? null : Math.max(0, resetAt - now);
 }
 
+/** Builds the late-bound argv resolution lookup from the current map's completions. */
+function lookupFromMap(map: SyncMap | null): CompletionLookupMap | null {
+  if (!map) return null;
+  const lookup: CompletionLookupMap = {};
+  for (const [key, completion] of Object.entries(map.completions)) {
+    lookup[key] = {
+      nodeId: completion.nodeId,
+      ...(completion.issueNumber === undefined ? {} : { remoteNumber: completion.issueNumber }),
+    };
+  }
+  return lookup;
+}
+
+function completionFromCheckpoint(checkpoint: AdoptionCheckpoint, completedAt: string): SyncCompletion {
+  return {
+    logicalKey: checkpoint.logicalKey,
+    nodeId: checkpoint.nodeId,
+    ...(checkpoint.remoteNumber === undefined ? {} : { issueNumber: checkpoint.remoteNumber }),
+    completedAt,
+    owner: checkpoint.completionContext.owner,
+    repo: checkpoint.completionContext.repo,
+    repositoryNumber: checkpoint.completionContext.repositoryNumber,
+  };
+}
+
+/**
+ * Folds a plan's checkpoints into `map`, before any operation dispatches
+ * (checkpoint contract clause 2, HIGH-A). Returns the pending map, the
+ * outcomes it produced, and whether anything actually changed — the caller
+ * persists with exactly one `writeSyncMapAtomically` call, and only when
+ * `wrote` is true. Throws exactly what `recordCompletion` throws (a
+ * repository mismatch); the caller's try/catch converts that into an
+ * uncertain result whose outcome journal carries none of this fold's
+ * entries (clause 3b) — a mid-fold throw must never let the journal claim a
+ * confirmation the file never received.
+ */
+function foldCheckpoints(
+  checkpoints: AdoptionCheckpoint[],
+  map: SyncMap | null,
+  recordCompletion: (map: SyncMap | null, completion: SyncCompletion) => SyncMap,
+  nowIso: () => string,
+): { map: SyncMap | null; outcomes: OperationOutcome[]; wrote: boolean } {
+  let pendingMap = map;
+  const outcomes: OperationOutcome[] = [];
+  let wrote = false;
+  for (const checkpoint of checkpoints) {
+    const existing = pendingMap?.completions[checkpoint.logicalKey];
+    const sameNodeId = existing !== undefined && existing.nodeId === checkpoint.nodeId;
+    const sameNumber = existing !== undefined && existing.issueNumber === checkpoint.remoteNumber;
+    if (existing !== undefined && sameNodeId && sameNumber) {
+      outcomes.push({ logicalKey: checkpoint.logicalKey, operationKey: null, action: OPERATION_ACTION.OBSERVE, result: OPERATION_OUTCOME.UNCHANGED });
+      continue;
+    }
+    pendingMap = recordCompletion(pendingMap, completionFromCheckpoint(checkpoint, nowIso()));
+    wrote = true;
+    outcomes.push({ logicalKey: checkpoint.logicalKey, operationKey: null, action: OPERATION_ACTION.OBSERVE, result: OPERATION_OUTCOME.CONFIRMED });
+  }
+  return { map: pendingMap, outcomes, wrote };
+}
+
 function applyMutationPlan(plan: MutationPlan, adapters: ApplyAdapters): ApplyResult {
   const execGh = adapters.execGh ?? ghMod.execGh;
   const recordCompletion = adapters.recordCompletion ?? mapMod.recordCompletion;
@@ -125,9 +175,35 @@ function applyMutationPlan(plan: MutationPlan, adapters: ApplyAdapters): ApplyRe
   let currentMap = adapters.map;
   let lastContentCreateAt: number | null = null;
   let pendingPointsDelay = 0;
+  const outcomes: OperationOutcome[] = [];
+
+  // Checkpoint contract clause 2 / HIGH-A: fold observations before any dispatch,
+  // so an adopted object's node id is durably in the map before the first execGh call.
+  const checkpoints = plan.checkpoints ?? [];
+  if (checkpoints.length > 0) {
+    let folded: { map: SyncMap | null; outcomes: OperationOutcome[]; wrote: boolean };
+    try {
+      folded = foldCheckpoints(checkpoints, currentMap, recordCompletion, () => clock.nowIso());
+    } catch {
+      // Clause 3b: a mid-fold throw publishes no outcome for this batch.
+      return { kind: 'uncertain', logicalKey: 'checkpoints', remediation: CHECKPOINT_UNCERTAIN_REMEDIATION, outcomes: [] };
+    }
+    if (folded.wrote) writeSyncMapAtomically(adapters.cwd, folded.map as SyncMap);
+    // The fold's resulting map becomes currentMap on every path — including
+    // nothing-to-write — so a checkpoints-only plan (the ordinary shape of a
+    // fully-adopted run) never returns the head-of-run map (HIGH-1).
+    currentMap = folded.map;
+    outcomes.push(...folded.outcomes);
+  }
 
   for (const operation of plan.operations) {
-    if (!isOperation(operation)) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION };
+    if (!isOperation(operation)) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION, outcomes };
+
+    const resolved = resolveArgv(operation.args, lookupFromMap(currentMap));
+    if (!resolved.ok) {
+      return { kind: 'failed', logicalKey: operation.logicalKey, remediation: `${ARGV_UNRESOLVED_REMEDIATION_PREFIX}${resolved.missingLogicalKey}`, outcomes };
+    }
+
     if (pendingPointsDelay > 0) {
       notice(`github-sync: pacing rate-limit points for ${pendingPointsDelay}ms.`);
       clock.sleep(pendingPointsDelay);
@@ -137,33 +213,60 @@ function applyMutationPlan(plan: MutationPlan, adapters: ApplyAdapters): ApplyRe
       const remaining = CONTENT_CREATE_INTERVAL_MS - (clock.now() - lastContentCreateAt);
       if (remaining > 0) { notice(`github-sync: pacing content creation for ${remaining}ms.`); clock.sleep(remaining); }
     }
+
     let retries = 0;
     while (true) {
-      const result = execGh(operation.args, { cwd: adapters.cwd, includeHeaders: true });
+      const result = execGh(resolved.argv, { cwd: adapters.cwd, includeHeaders: true });
       if (result.exitCode === 0) {
-        const rateLimit = parseRateLimit(result);
-        const completion = decodeConfirmedCompletion(operation, result, clock.nowIso());
-        if (!rateLimit || !completion) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION };
-        const delay = pointsDelayMs(rateLimit, clock.now());
-        if (delay === null) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION };
+        const root = decodeResponseRoot(operation.transport, result.stdout);
+        let rateLimit: RateLimit | null = null;
+        if (operation.hasPointsBudget) {
+          rateLimit = parseRateLimitFromRoot(root);
+          if (!rateLimit) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION, outcomes };
+        }
+        const decoded = decodeCompletions(operation, root, clock.nowIso());
+        if (!decoded) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION, outcomes };
+
+        let pendingMap = currentMap;
+        const pendingOutcomes: OperationOutcome[] = [];
         try {
-          const nextMap = recordCompletion(currentMap, completion);
-          writeSyncMapAtomically(adapters.cwd, nextMap);
-          currentMap = nextMap;
-        } catch { return { kind: 'uncertain', logicalKey: operation.logicalKey, remediation: CHECKPOINT_UNCERTAIN_REMEDIATION }; }
-        pendingPointsDelay = delay;
+          for (const item of decoded) {
+            pendingMap = recordCompletion(pendingMap, {
+              logicalKey: item.logicalKey,
+              nodeId: item.nodeId,
+              ...(item.remoteNumber === undefined ? {} : { issueNumber: item.remoteNumber }),
+              completedAt: item.completedAt,
+              owner: operation.completionContext.owner,
+              repo: operation.completionContext.repo,
+              repositoryNumber: operation.completionContext.repositoryNumber,
+            });
+            pendingOutcomes.push({ logicalKey: item.logicalKey, operationKey: operation.logicalKey, action: operation.action, result: OPERATION_OUTCOME.CONFIRMED });
+          }
+          writeSyncMapAtomically(adapters.cwd, pendingMap as SyncMap);
+        } catch {
+          // Clause 3b: this operation's fan-out publishes nothing on a mid-fold throw.
+          return { kind: 'uncertain', logicalKey: operation.logicalKey, remediation: CHECKPOINT_UNCERTAIN_REMEDIATION, outcomes };
+        }
+        currentMap = pendingMap;
+        outcomes.push(...pendingOutcomes);
+
+        if (operation.hasPointsBudget && rateLimit) {
+          const delay = pointsDelayMs(rateLimit, clock.now());
+          if (delay === null) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION, outcomes };
+          pendingPointsDelay = delay;
+        }
         if (operation.contentCreation) lastContentCreateAt = clock.now();
         break;
       }
-      if (operation.contentCreation && result.reason === 'gh_timed_out') return { kind: 'uncertain', logicalKey: operation.logicalKey, remediation: CREATE_UNCERTAIN_REMEDIATION };
-      if (!(isRateLimited(result) || isTransient(result)) || retries >= RETRY_LIMIT) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION };
+      if (operation.contentCreation && result.reason === 'gh_timed_out') return { kind: 'uncertain', logicalKey: operation.logicalKey, remediation: CREATE_UNCERTAIN_REMEDIATION, outcomes };
+      if (!(isRateLimited(result) || isTransient(result)) || retries >= RETRY_LIMIT) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION, outcomes };
       retries += 1;
       const delay = retryDelayMs(result, retries, random);
       notice(`github-sync: retrying ${operation.logicalKey} in ${delay}ms.`);
       clock.sleep(delay);
     }
   }
-  return { kind: 'completed', map: currentMap };
+  return { kind: 'completed', map: currentMap, outcomes };
 }
 
-export = { applyMutationPlan, CONTENT_CREATE_INTERVAL_MS, POINTS_RESERVE, RETRY_LIMIT, parseRateLimit, decodeConfirmedCompletion };
+export = { applyMutationPlan, CONTENT_CREATE_INTERVAL_MS, POINTS_RESERVE, RETRY_LIMIT, parseRateLimit, decodeCompletions };

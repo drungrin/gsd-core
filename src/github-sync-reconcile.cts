@@ -1,6 +1,12 @@
 'use strict';
 /** Pure, deterministic reconciliation plan for desired state and typed inputs. */
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import operationMod = require('./github-sync-operation.cjs');
+import type { MutationOperation } from './github-sync-operation.cts';
+
+const { OPERATION_TRANSPORT, OPERATION_ACTION } = operationMod;
+
 const OPERATION_KIND = Object.freeze({ CREATE: 'create', UPDATE: 'update' } as const);
 const OPERATION_REASON = Object.freeze({
   MAP_BLOCKING: 'map_blocking',
@@ -21,15 +27,6 @@ interface RemoteSnapshot {
 }
 interface StrictMap { kind: 'absent' | 'valid' | 'blocking'; reason?: string; map?: { completions?: Record<string, { nodeId: string; issueNumber?: number }> }; }
 
-interface MutationOperation {
-  kind: typeof OPERATION_KIND[keyof typeof OPERATION_KIND];
-  logicalKey: string;
-  args: string[];
-  completionContext: { owner: string; repo: string; repositoryNumber: number };
-  responsePayloadKey: 'addProjectV2Item';
-  contentCreation: boolean;
-}
-
 interface ReconciliationPlan {
   operations: MutationOperation[];
   noops: Array<{ logicalKey: string }>;
@@ -41,16 +38,34 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
+/**
+ * Emits the shared `MutationOperation` shape (plan 03-02 migration). The
+ * response capture walks precisely the path the deleted hardcoded decoder
+ * used to walk — the mutation payload key, then the project item, then its
+ * `id`; and the same payload key, the project item, its `content`, then
+ * `number` — so Phase 2's behavior is preserved exactly. The argv field
+ * keeps its existing name (`args`) and `operationFor`'s flag choices are
+ * unchanged: two opaque node-id string variables on the typed `-F` flag,
+ * the pre-existing documented exception to the raw-flag rule
+ * (`src/github-sync-operation.cts`'s module header).
+ */
 function operationFor(logicalKey: string, projectNodeId: string, contentNodeId: string, target: NonNullable<RemoteSnapshot['target']>): MutationOperation {
-  const responsePayloadKey = 'addProjectV2Item' as const;
-  const query = `mutation($projectId:ID!,$contentId:ID!){ rateLimit { cost remaining resetAt } ${responsePayloadKey}(input:{projectId:$projectId,contentId:$contentId}) { projectV2Item { id content { ... on Issue { number } } } } }`;
+  const query = 'mutation($projectId:ID!,$contentId:ID!){ rateLimit { cost remaining resetAt } addProjectV2Item(input:{projectId:$projectId,contentId:$contentId}) { projectV2Item { id content { ... on Issue { number } } } } }';
   return {
     kind: OPERATION_KIND.CREATE,
     logicalKey,
     args: ['api', 'graphql', '-f', `query=${query}`, '-F', `projectId=${projectNodeId}`, '-F', `contentId=${contentNodeId}`],
     completionContext: { owner: target.owner, repo: target.repo, repositoryNumber: target.repositoryNumber },
-    responsePayloadKey,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.CREATE,
+    hasPointsBudget: true,
     contentCreation: true,
+    captures: [{
+      kind: 'node',
+      logicalKey,
+      nodeIdPath: 'addProjectV2Item.projectV2Item.id',
+      numberPath: 'addProjectV2Item.projectV2Item.content.number',
+    }],
   };
 }
 
