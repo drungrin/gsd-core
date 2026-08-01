@@ -49,15 +49,25 @@ interface Page {
   endCursor: string | null;
 }
 
+// D-12/D-13: the project, items, and fields documents are resolved through
+// the repository OWNER, not the authenticated viewer. `repositoryOwner(login:)`
+// returns the `RepositoryOwner` interface both `User` and `Organization`
+// implement; `ProjectV2Owner` is the interface (also implemented by both)
+// that carries `projectV2(number:)`, reached here via an inline fragment on
+// that interface so one document and one decode path serve both owner kinds.
+// A viewer-rooted response no longer decodes to anything (see the matching
+// re-rooted decode paths in readProjectNodeId/readRemoteSnapshot below) —
+// closing D-13 for every board read this module owns, documents and
+// decoders alike (cycle-2 HIGH-H).
 const DOCUMENTS = Object.freeze({
-  project: 'query($projectNumber:Int!) { # github-sync:project\n viewer { projectV2(number:$projectNumber) { id } } }',
-  items: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:items\n viewer { projectV2(number:$projectNumber) { items(first:100,after:$endCursor) { nodes { id content { ... on Issue { id number } } } pageInfo { hasNextPage endCursor } } } } }',
+  project: 'query($login:String!,$projectNumber:Int!) { # github-sync:project\n repositoryOwner(login:$login) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { id } } } }',
+  items: 'query($login:String!,$projectNumber:Int!,$endCursor:String) { # github-sync:items\n repositoryOwner(login:$login) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { items(first:100,after:$endCursor) { nodes { id content { ... on Issue { id number } } } pageInfo { hasNextPage endCursor } } } } } }',
   // ProjectV2.fields.nodes resolves to the ProjectV2FieldConfiguration union
   // (ProjectV2Field | ProjectV2IterationField | ProjectV2SingleSelectField).
   // Scalars can't be selected directly on a union (GitHub rejects it live with
   // selectionMismatch); select through an inline fragment on ProjectV2FieldCommon,
   // the interface every member of the union implements (G-02-7).
-  fields: 'query($projectNumber:Int!,$endCursor:String) { # github-sync:fields\n viewer { projectV2(number:$projectNumber) { fields(first:100,after:$endCursor) { nodes { ... on ProjectV2FieldCommon { id name } } pageInfo { hasNextPage endCursor } } } } }',
+  fields: 'query($login:String!,$projectNumber:Int!,$endCursor:String) { # github-sync:fields\n repositoryOwner(login:$login) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { fields(first:100,after:$endCursor) { nodes { ... on ProjectV2FieldCommon { id name } } pageInfo { hasNextPage endCursor } } } } } }',
   subIssues: 'query($owner:String!,$repo:String!,$issueNumber:Int!,$endCursor:String) { # github-sync:subIssues\n repository(owner:$owner,name:$repo) { issue(number:$issueNumber) { subIssues(first:100,after:$endCursor) { nodes { id number } pageInfo { hasNextPage endCursor } } } } }',
   issueId: 'query($owner:String!,$repo:String!,$issueNumber:Int!) { # github-sync:issueId\n repository(owner:$owner,name:$repo) { issue(number:$issueNumber) { id } } }',
 });
@@ -103,7 +113,12 @@ function decodePage(result: GhResult, path: string[]): Page | null {
 function readProjectNodeId(options: ReadRemoteSnapshotOptions): string | null {
   const execGh = options.execGh ?? ghMod.execGh;
   const result = execGh(
-    ['api', 'graphql', '-f', `query=${DOCUMENTS.project}`, '-F', `projectNumber=${options.projectNumber}`],
+    [
+      'api', 'graphql', '-f', `query=${DOCUMENTS.project}`,
+      // SECURITY: login rides -f (raw) — see the note in readIssueNodeIds.
+      '-f', `login=${options.owner}`,
+      '-F', `projectNumber=${options.projectNumber}`,
+    ],
     { cwd: options.cwd },
   );
   if (result.exitCode !== 0) return null;
@@ -117,7 +132,10 @@ function readProjectNodeId(options: ReadRemoteSnapshotOptions): string | null {
   if (parsed === null || typeof parsed !== 'object') return null;
   const envelope = parsed as { data?: unknown; errors?: unknown };
   if (Array.isArray(envelope.errors) && envelope.errors.length > 0) return null;
-  const project = readPath(envelope.data, ['viewer', 'projectV2']);
+  // D-12/D-13: re-rooted to match the owner-scoped document above — a
+  // viewer-rooted response (the pre-generalization shape) resolves to
+  // undefined here and correctly decodes to null (cycle-2 HIGH-H).
+  const project = readPath(envelope.data, ['repositoryOwner', 'projectV2']);
   if (project === null || typeof project !== 'object') return null;
   const projectNodeId = (project as { id?: unknown }).id;
   return typeof projectNodeId === 'string' && projectNodeId.length > 0 ? projectNodeId : null;
@@ -226,16 +244,19 @@ function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot 
 
   const items = readConnection(
     'items',
-    ['viewer', 'projectV2', 'items'],
-    ['-F', `projectNumber=${options.projectNumber}`],
+    ['repositoryOwner', 'projectV2', 'items'],
+    // SECURITY: login rides -f (raw) — see the note in readIssueNodeIds.
+    // Threaded through baseArgs so every page request carries it, not only
+    // the first.
+    ['-f', `login=${options.owner}`, '-F', `projectNumber=${options.projectNumber}`],
     options,
   );
   if (!items) return unavailable();
 
   const fields = readConnection(
     'fields',
-    ['viewer', 'projectV2', 'fields'],
-    ['-F', `projectNumber=${options.projectNumber}`],
+    ['repositoryOwner', 'projectV2', 'fields'],
+    ['-f', `login=${options.owner}`, '-F', `projectNumber=${options.projectNumber}`],
     options,
   );
   if (!fields) return unavailable();
