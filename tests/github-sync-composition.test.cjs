@@ -87,12 +87,32 @@ function fixedClock() {
   return clock;
 }
 
-function writeSeededMap(_cwd) {
-  assert.fail('TODO: seed the map only through recordCompletion() and writeSyncMapAtomically()');
+function writeSeededMap(cwd) {
+  let map = null;
+  map = recordCompletion(map, makeSeedCompletion('phase:01', 'PVTI_item_original', 101));
+  map = recordCompletion(map, makeSeedCompletion('phase:02', 'PVTI_item_original_2', 102));
+  writeSyncMapAtomically(cwd, map);
+  const reopened = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(reopened.kind, 'valid');
+  return reopened;
 }
 
-function assertOpaqueIdPairs(_argvCalls) {
-  assert.fail('TODO: assert every ID-typed -F value belongs to the opaque node-ID allowlist');
+function assertOpaqueIdPairs(argvCalls) {
+  const idPairs = [];
+  for (const args of argvCalls) {
+    for (let index = 0; index < args.length - 1; index += 1) {
+      if (args[index] !== '-F') continue;
+      const raw = args[index + 1];
+      const [key, value] = String(raw).split('=', 2);
+      if (key.endsWith('Id')) idPairs.push({ key, value, raw: String(raw) });
+    }
+  }
+
+  assert.ok(idPairs.length > 0, 'expected at least one ID-typed -F argument');
+  assert.deepEqual([...new Set(idPairs.map(({ key }) => key))].sort(), ['contentId', 'projectId']);
+  for (const { raw, value } of idPairs) {
+    assert.ok(ID_ALLOWLIST.has(value), `${raw} must use an opaque node ID from the allowlist`);
+  }
 }
 
 test('real reconciler, applier, and strict map resume each response-validated checkpoint without duplicate argv', (t) => {
@@ -165,15 +185,25 @@ test('real reconciler, applier, and strict map resume each response-validated ch
   assertOpaqueIdPairs(dispatchedArgv);
   assert.notDeepEqual(firstConfirmedArgv, dispatchedArgv[2], 'resume must not repeat the confirmed first-run argv for phase:01');
 
-  const unchanged = readSyncMapStrict(cwd, REPOSITORY);
-  assert.equal(unchanged.kind, 'valid');
+  const resumedMap = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(resumedMap.kind, 'valid');
+  assert.deepEqual(resumedMap.map.completions['phase:02'], {
+    logicalKey: 'phase:02',
+    nodeId: 'PVTI_item_2',
+    issueNumber: 102,
+    completedAt: FIXED_NOW,
+    owner: TARGET.owner,
+    repo: TARGET.repo,
+    repositoryNumber: TARGET.repositoryNumber,
+  });
+
   const unchangedPlan = planReconciliation(
     desired(),
     remote([
       { id: 'PVTI_item_1', content: { id: 'I_node_101', number: 101 } },
       { id: 'PVTI_item_2', content: { id: 'I_node_102', number: 102 } },
     ]),
-    unchanged,
+    resumedMap,
   );
   assert.equal(unchangedPlan.operations.length, 0);
   assert.deepEqual(unchangedPlan.noops, [{ logicalKey: 'phase:01' }, { logicalKey: 'phase:02' }]);
@@ -181,7 +211,7 @@ test('real reconciler, applier, and strict map resume each response-validated ch
   let unexpectedCalls = 0;
   const unchangedResult = applyMutationPlan(unchangedPlan, {
     cwd,
-    map: unchanged.map,
+    map: resumedMap.map,
     clock,
     execGh() {
       unexpectedCalls += 1;
