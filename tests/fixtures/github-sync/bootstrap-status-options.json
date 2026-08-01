@@ -1,0 +1,93 @@
+{
+  "provenance": "Recorded live against drungrin/gsd-core Project v2 board #9 'GSD Sync UAT 01' (PVT_kwHOAMcbHs4BfFaI), 2026-08-01, gh 2.96.0 (2026-07-02). Captured during plan 03-02 Task 2's live A1 proof: a custom 'In Review' option was added by hand, one draft item was set to it, gsd-tools github-sync init was run twice, and the board's fields, the merged-write confirmation, and gh's own GraphQL-variables transcript for the bracket-suffixed option encoding were all read back from the real API. Not hand-authored.",
+  "fieldsWithTypesResponseBeforeInit": {
+    "data": {
+      "repositoryOwner": {
+        "projectV2": {
+          "fields": {
+            "nodes": [
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4VY", "name": "Title", "dataType": "TITLE" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4Vc", "name": "Assignees", "dataType": "ASSIGNEES" },
+              {
+                "id": "PVTSSF_lAHOAMcbHs4BfFaIzhZa4Vg",
+                "name": "Status",
+                "dataType": "SINGLE_SELECT",
+                "options": [
+                  { "id": "f75ad846", "name": "Todo", "color": "GREEN", "description": "This item hasn't been started" },
+                  { "id": "47fc9ee4", "name": "In Progress", "color": "YELLOW", "description": "This is actively being worked on" },
+                  { "id": "98236657", "name": "Done", "color": "PURPLE", "description": "This has been completed" },
+                  { "id": "3f45dd5b", "name": "In Review", "color": "PINK", "description": "UAT: manually added custom option (03-02 A1 proof)" }
+                ]
+              },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4Vk", "name": "Labels", "dataType": "LABELS" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4Vo", "name": "Linked pull requests", "dataType": "LINKED_PULL_REQUESTS" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4Vs", "name": "Milestone", "dataType": "MILESTONE" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4Vw", "name": "Repository", "dataType": "REPOSITORY" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4V0", "name": "Reviewers", "dataType": "REVIEWERS" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4V4", "name": "Parent issue", "dataType": "PARENT_ISSUE" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4V8", "name": "Sub-issues progress", "dataType": "SUB_ISSUES_PROGRESS" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4WA", "name": "Created", "dataType": "CREATED" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4WE", "name": "Updated", "dataType": "UPDATED" },
+              { "id": "PVTF_lAHOAMcbHs4BfFaIzhZa4WI", "name": "Closed", "dataType": "CLOSED" }
+            ],
+            "pageInfo": { "hasNextPage": false, "endCursor": "MTM" }
+          }
+        }
+      }
+    }
+  },
+  "mergedWriteConfirmationResponse": {
+    "data": {
+      "updateProjectV2Field": {
+        "projectV2Field": {
+          "options": [
+            { "id": "f75ad846", "name": "Todo" },
+            { "id": "47fc9ee4", "name": "In Progress" },
+            { "id": "bac73137", "name": "Blocked" },
+            { "id": "98236657", "name": "Done" },
+            { "id": "db539d19", "name": "Deferred" },
+            { "id": "3f45dd5b", "name": "In Review" }
+          ]
+        }
+      }
+    },
+    "note": "The gsd-tools github-sync init command dispatches this document with the selection { id name } only (the checkpointing each-capture reads id/name; color/description are never re-selected on the write per D-18). The full { id name color description } shape was re-read separately below via fieldsWithTypesResponseAfterInit for the human-check evidence table."
+  },
+  "fieldsWithTypesResponseAfterInit": {
+    "data": {
+      "repositoryOwner": {
+        "projectV2": {
+          "fields": {
+            "nodes": [
+              {
+                "id": "PVTSSF_lAHOAMcbHs4BfFaIzhZa4Vg",
+                "name": "Status",
+                "dataType": "SINGLE_SELECT",
+                "options": [
+                  { "id": "f75ad846", "name": "Todo", "color": "GREEN", "description": "This item hasn't been started" },
+                  { "id": "47fc9ee4", "name": "In Progress", "color": "YELLOW", "description": "This is actively being worked on" },
+                  { "id": "bac73137", "name": "Blocked", "color": "RED", "description": "" },
+                  { "id": "98236657", "name": "Done", "color": "PURPLE", "description": "This has been completed" },
+                  { "id": "db539d19", "name": "Deferred", "color": "YELLOW", "description": "" },
+                  { "id": "3f45dd5b", "name": "In Review", "color": "PINK", "description": "UAT: manually added custom option (03-02 A1 proof)" }
+                ]
+              }
+            ],
+            "pageInfo": { "hasNextPage": false, "endCursor": "MTM" }
+          }
+        }
+      }
+    },
+    "note": "Truncated to the Status field only for brevity; the other 12 fields are byte-identical to fieldsWithTypesResponseBeforeInit. Confirms A1: Todo/In Progress/Done kept their pre-existing ids; Blocked/Deferred are freshly minted; In Review (the pre-existing custom option) kept its id 3f45dd5b unchanged and was appended after the five GSD options, in D-19 order."
+  },
+  "ghVariablesTranscript": {
+    "provenance": "gh api graphql --verbose output captured for a representative two-element optionInputArgv() call (an id-bearing element 'Todo' immediately followed by an id-less element 'Blocked') against a harmless query op, to pin the bracket-suffix element-boundary behavior (Task 2 step D fact 3) with a live observation rather than prose. Command: gh api graphql -f query='query{ viewer{ login } }' -f 'options[][name]=Todo' -f 'options[][id]=f75ad846' -f 'options[][color]=GREEN' -f \"options[][description]=This item hasn't been started\" -f 'options[][name]=Blocked' -f 'options[][color]=RED' -f 'options[][description]=' --verbose",
+    "capturedLine": "GraphQL variables: {\"options\":[{\"color\":\"GREEN\",\"description\":\"This item hasn't been started\",\"id\":\"f75ad846\",\"name\":\"Todo\"},{\"color\":\"RED\",\"description\":\"\",\"name\":\"Blocked\"}]}",
+    "observation": "gh correctly built a two-element array: the first element carries id=f75ad846 (Todo), the second carries no id (Blocked) — confirming the name-first sub-key emission order in optionInputArgv prevents an id from migrating onto the wrong element, exactly as fact 3 in the plan's <action> requires."
+  },
+  "itemStatusValue": {
+    "before": { "itemId": "PVTI_lAHOAMcbHs4BfFaIzg073lw", "optionId": "3f45dd5b", "name": "In Review" },
+    "after": { "itemId": "PVTI_lAHOAMcbHs4BfFaIzg073lw", "optionId": "3f45dd5b", "name": "In Review" },
+    "note": "Byte-identical optionId before and after gsd-tools github-sync init — the item's Status value survived the merged full-replace write, confirming A1."
+  }
+}

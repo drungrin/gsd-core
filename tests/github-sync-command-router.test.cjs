@@ -29,6 +29,7 @@ const childProcess = require('node:child_process');
 const { spawnSync, spawn } = require('node:child_process');
 
 const { createTempProject, cleanup, TOOLS_PATH } = require('./helpers.cjs');
+const realMapForInit = require('../gsd-core/bin/lib/github-sync-map.cjs');
 
 const { routeGithubSyncCommandRouter } = require('../gsd-core/bin/lib/github-sync-command-router.cjs');
 const { PREFLIGHT_REASON } = require('../gsd-core/bin/lib/github-sync-auth.cjs');
@@ -758,5 +759,235 @@ describe('github-sync capability manifest: SAFE-02 structural rule', () => {
       assert.strictEqual(contribution.onError, 'skip',
         `every declared contribution must carry onError: skip; got: ${JSON.stringify(contribution)}`);
     }
+  });
+});
+
+// ─── 6. `init` — plan 03-02 registration, HIGH-1 map threading, HIGH-4 re-read ──
+
+describe('github-sync router: init (plan 03-02)', () => {
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+
+  test('init appears in the registered subcommands and dispatches to a handler (reaches auth.runPreflight)', () => {
+    let preflightCalled = false;
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight() { preflightCalled = true; return { ok: false, reason: 'outage', message: 'x' }; } },
+    });
+    assert.equal(preflightCalled, true);
+  });
+
+  test('init with the capability disabled produces no output and leaves process.exitCode at 0', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    process.exitCode = 0;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => false,
+      });
+    } finally { mock.restoreAll(); }
+    assert.equal(process.exitCode, 0);
+    assert.deepEqual(chunks, []);
+  });
+
+  test('a thrown error inside the injected bootstrap seams leaves process.exitCode at 0 and emits a typed uncertain result', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    process.exitCode = 0;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: { readSyncMapStrict: () => ({ kind: 'absent' }) },
+        _bootstrapRemote: { readBootstrapRemoteState: () => { throw new Error('boom'); } },
+      });
+    } finally { mock.restoreAll(); }
+    assert.equal(process.exitCode, 0);
+    const parsed = JSON.parse(chunks.join(''));
+    assert.equal(parsed.kind, 'uncertain');
+    assert.equal(parsed.reason, 'init_unavailable');
+  });
+
+  test('a preflight failure carrying the wrong-scope reason names that scope failure specifically (unlike sync\'s collapse)', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: false, reason: PREFLIGHT_REASON.WRONG_SCOPE, message: 'missing project scope' }) },
+      });
+    } finally { mock.restoreAll(); }
+    const parsed = JSON.parse(chunks.join(''));
+    assert.equal(parsed.reason, PREFLIGHT_REASON.WRONG_SCOPE);
+  });
+
+  test('an init run whose desired-state seam reports unavailable produces the desired-unavailable blocked reason at exit code 0', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    process.exitCode = 0;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: false, reason: 'local_unavailable' }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: { readSyncMapStrict: () => ({ kind: 'absent' }) },
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+      });
+    } finally { mock.restoreAll(); }
+    assert.equal(process.exitCode, 0);
+    const parsed = JSON.parse(chunks.join(''));
+    assert.equal(parsed.kind, 'blocked');
+    assert.equal(parsed.reason, 'desired_unavailable');
+  });
+
+  test('HIGH-1: the options pass writes into the map the structure pass returned, and the strict map is read exactly once', () => {
+    const tmpDir = createTempProject();
+    let mapReads = 0;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: { readSyncMapStrict: (...callArgs) => { mapReads += 1; return realMapForInit.readSyncMapStrict(...callArgs); } },
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap(_input, { pass }) {
+            const context = { owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber };
+            if (pass === 'structure') {
+              return {
+                operations: [], noops: [], blocked: [], uncertain: [],
+                checkpoints: [
+                  { logicalKey: 'project', nodeId: 'PVT_1', completionContext: context },
+                  { logicalKey: 'field:gsd-id', nodeId: 'FIELD_1', completionContext: context },
+                ],
+              };
+            }
+            return {
+              operations: [], noops: [], blocked: [], uncertain: [],
+              checkpoints: [
+                { logicalKey: 'option:status:todo', nodeId: 'OPT_1', completionContext: context },
+                { logicalKey: 'option:status:in-progress', nodeId: 'OPT_2', completionContext: context },
+                { logicalKey: 'option:status:blocked', nodeId: 'OPT_3', completionContext: context },
+              ],
+            };
+          },
+        },
+      });
+      const mapPath = path.join(tmpDir, '.planning', '.github-sync.json');
+      const written = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
+      assert.deepEqual(
+        Object.keys(written.completions).sort(),
+        ['field:gsd-id', 'option:status:blocked', 'option:status:in-progress', 'option:status:todo', 'project'].sort(),
+      );
+      assert.equal(mapReads, 1);
+    } finally { cleanup(tmpDir); }
+  });
+
+  test('HIGH-1 (converged variant): the options pass confirms nothing, yet the reported final map still carries the structure pass\'s completions', () => {
+    const tmpDir = createTempProject();
+    try {
+      const chunks = [];
+      mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+      try {
+        routeGithubSyncCommandRouter({
+          args: ['github-sync', 'init'], cwd: tmpDir, raw: true,
+          error: (message) => { throw new Error(message); },
+          _isCapabilityActive: () => true,
+          _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+          _desired: { readDesiredState: () => ({ available: true }) },
+          _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+          _map: { readSyncMapStrict: (...callArgs) => realMapForInit.readSyncMapStrict(...callArgs) },
+          _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+          _bootstrapPlan: {
+            BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+            planBootstrap(_input, { pass }) {
+              const context = { owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber };
+              if (pass === 'structure') {
+                return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [{ logicalKey: 'project', nodeId: 'PVT_1', completionContext: context }] };
+              }
+              return { operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] };
+            },
+          },
+        });
+      } finally { mock.restoreAll(); }
+      const parsed = JSON.parse(chunks.join(''));
+      assert.equal(parsed.kind, 'completed');
+      assert.ok(Object.keys(parsed.map.completions).includes('project'));
+    } finally { cleanup(tmpDir); }
+  });
+
+  test('HIGH-4: the effective target feeds the conditional re-read — the second readBootstrapRemoteState call receives the structure pass\'s confirmed project number, not null', () => {
+    const nullTarget = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: null };
+    const remoteCalls = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _target: { readSyncTarget: () => ({ available: true, target: nullTarget }) },
+      _map: { readSyncMapStrict: () => ({ kind: 'absent' }) },
+      _bootstrapRemote: {
+        readBootstrapRemoteState(options) {
+          remoteCalls.push(options.projectNumber);
+          return { available: true, projectOutcome: options.projectNumber ? 'resolved' : 'unset', statusField: null };
+        },
+      },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap(_input, { pass }) {
+          if (pass === 'structure') return { operations: [{ logicalKey: 'project' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+          return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+        },
+      },
+      _apply: {
+        applyMutationPlan(plan, options) {
+          if (plan.operations.length > 0) {
+            return {
+              kind: 'completed',
+              map: { version: '1', repository: { owner: 'octo', repo: 'repo', number: 1 }, completions: { project: { logicalKey: 'project', nodeId: 'PVT_NEW', issueNumber: 42, completedAt: 'now', owner: 'octo', repo: 'repo', repositoryNumber: 1 } } },
+              outcomes: [{ logicalKey: 'project', operationKey: 'project', action: 'create', result: 'confirmed' }],
+            };
+          }
+          return { kind: 'completed', map: options.map, outcomes: [] };
+        },
+      },
+    });
+    assert.deepEqual(remoteCalls, [null, 42]);
+  });
+
+  test('a run that mutated nothing issues exactly one remote read', () => {
+    const remoteCalls = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+      _map: { readSyncMapStrict: () => ({ kind: 'absent' }) },
+      _bootstrapRemote: { readBootstrapRemoteState: (options) => { remoteCalls.push(options.projectNumber); return { available: true, projectOutcome: 'resolved', statusField: null }; } },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap: () => ({ operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] }),
+      },
+    });
+    assert.deepEqual(remoteCalls, [7]);
   });
 });

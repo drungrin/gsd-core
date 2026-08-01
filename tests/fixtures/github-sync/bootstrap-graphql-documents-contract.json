@@ -1,0 +1,21 @@
+{
+  "provenance": "Schema facts probed live against drungrin/gsd-core's repositoryOwner/projectV2 surface with `project` scope, 2026-08-01 (plan 03-02 Task 2). A sibling of tests/fixtures/github-sync/graphql-documents-contract.json (Phase 2) scoped to the two documents github-sync-bootstrap-remote.cts adds. Re-verify against the live schema before editing this file rather than guessing.",
+  "documents": {
+    "repository": {
+      "connection": null,
+      "nodeType": "Repository",
+      "nodeKind": "OBJECT",
+      "fragmentTargets": [],
+      "selects": ["id", "owner"],
+      "paginated": false
+    },
+    "fieldsWithTypes": {
+      "connection": ["repositoryOwner", "projectV2", "fields"],
+      "nodeType": "ProjectV2FieldConfiguration",
+      "nodeKind": "UNION",
+      "fragmentTargets": ["ProjectV2FieldCommon", "ProjectV2SingleSelectField"],
+      "selects": ["id", "name", "dataType", "options"],
+      "paginated": true
+    }
+  }
+}
