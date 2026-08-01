@@ -170,6 +170,8 @@ build/
 /gsd-core/bin/lib/github-sync-status.cjs
 /gsd-core/bin/lib/github-sync-apply.cjs
 /gsd-core/bin/lib/github-sync-operation.cjs
+/gsd-core/bin/lib/github-sync-bootstrap-remote.cjs
+/gsd-core/bin/lib/github-sync-bootstrap-plan.cjs
 /gsd-core/bin/lib/github-sync-auth.cjs
 /gsd-core/bin/lib/github-sync-command-router.cjs
 /gsd-core/bin/lib/audit-command-router.cjs

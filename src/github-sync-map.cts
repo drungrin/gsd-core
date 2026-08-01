@@ -3,6 +3,15 @@
  *
  * The file is deliberately a closed schema: it contains only stable operation
  * identifiers and checkpoint metadata, never credentials or GraphQL payloads.
+ *
+ * D-05/D-07 (plan 03-01/03-02): `SyncCompletion.logicalKey` also carries the
+ * reserved bootstrap namespace approved in plan 03-01 Task 1 (`project`,
+ * `project-link`, `field:<slug>`, `option:status:<slug>`, `label:<slug>`,
+ * `milestone:<version>`), alongside Phase 2's `phase:<id>` convention.
+ * `SyncCompletion.issueNumber` is the generic remote-number slot — it is not
+ * issue-specific, and bootstrap reuses it for a project number, a field's
+ * declared type ordinal, or a milestone number, whichever the completion
+ * represents. No schema field, validator, or `SYNC_MAP_VERSION` changes.
  */
 
 import fs from 'node:fs';

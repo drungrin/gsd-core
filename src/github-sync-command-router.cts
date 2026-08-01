@@ -38,6 +38,13 @@ import applyMod = require('./github-sync-apply.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import targetMod = require('./github-sync-target.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import bootstrapRemoteMod = require('./github-sync-bootstrap-remote.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import bootstrapPlanMod = require('./github-sync-bootstrap-plan.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import operationMod = require('./github-sync-operation.cjs');
+import type { OperationOutcome } from './github-sync-operation.cts';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import io = require('./io.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import cjsCommandRouterAdapter = require('./cjs-command-router-adapter.cjs');
@@ -46,6 +53,7 @@ const { isCapabilityActive } = capabilityStateMod;
 const { output } = io;
 const { routeHubCommandFamily } = cjsCommandRouterAdapter;
 const { PREFLIGHT_REASON } = authMod;
+const { mutatedKeys } = operationMod;
 
 // ─── WR-03: D-11 local containment literals ────────────────────────────────
 //
@@ -95,6 +103,21 @@ interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string;
 interface TargetReadResult { available: boolean; reason?: string; field?: string; target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number }; }
 interface TargetModule { readSyncTarget(cwd: string): TargetReadResult; }
 
+interface BootstrapRemoteModule {
+  readBootstrapRemoteState(options: { cwd: string; owner: string; repo: string; projectNumber: number | null; execGh?: unknown }): unknown;
+}
+interface BootstrapPlanStageResult {
+  operations: unknown[];
+  checkpoints: unknown[];
+  noops: Array<{ reason: string }>;
+  blocked: Array<{ reason: string; detail?: string }>;
+  uncertain: Array<{ reason: string }>;
+}
+interface BootstrapPlanModule {
+  planBootstrap(input: unknown, options: { pass: string }): BootstrapPlanStageResult;
+  BOOTSTRAP_PASS: { STRUCTURE: string; OPTIONS: string };
+}
+
 // G-02-2: emitStatus() is a deliberate, local inversion of the family
 // convention. Every other router in src/ passes `undefined` as io.output()'s
 // third argument and lets its own `raw` flag pick JSON-vs-pretty-JSON.
@@ -139,6 +162,10 @@ interface RouteGithubSyncCommandRouterOptions {
   _status?: StatusModule;
   _apply?: ApplyModule;
   _target?: TargetModule;
+  /** Test seam: inject a mock bootstrap remote reader. Defaults to the real module. */
+  _bootstrapRemote?: BootstrapRemoteModule;
+  /** Test seam: inject a mock bootstrap plan composer. Defaults to the real module. */
+  _bootstrapPlan?: BootstrapPlanModule;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -157,6 +184,8 @@ function routeGithubSyncCommandRouter({
   _status,
   _apply,
   _target,
+  _bootstrapRemote,
+  _bootstrapPlan,
 }: RouteGithubSyncCommandRouterOptions): void {
   const activeCheck = _isCapabilityActive ?? isCapabilityActive;
 
@@ -193,11 +222,13 @@ function routeGithubSyncCommandRouter({
   const status: StatusModule = _status ?? statusMod;
   const apply: ApplyModule = _apply ?? applyMod;
   const target: TargetModule = _target ?? targetMod;
+  const bootstrapRemote: BootstrapRemoteModule = _bootstrapRemote ?? bootstrapRemoteMod;
+  const bootstrapPlan: BootstrapPlanModule = _bootstrapPlan ?? bootstrapPlanMod;
 
   routeHubCommandFamily({
     family: 'github-sync',
     args,
-    subcommands: ['preflight', 'status', 'sync'],
+    subcommands: ['preflight', 'status', 'sync', 'init'],
     handlers: {
       preflight: () => {
         // WR-03: auth.runPreflight(cwd) is documented not to throw
@@ -281,6 +312,123 @@ function routeGithubSyncCommandRouter({
           }
         } catch {
           result = { kind: 'uncertain', reason: 'sync_unavailable' };
+        }
+        output(result, raw);
+      },
+      // D-05/D-15: `init` is registered and works end to end for D-03's
+      // adopt-and-repair path (both live UAT boards are in that state) — it
+      // is not a stub. Between this plan and plan 03-03, a target with no
+      // configured project number reports the ordinary unavailable-target
+      // result and does nothing: the fresh-create path arrives with
+      // `resolveTarget` and `planProject` in plan 03-03.
+      //
+      // Unlike `sync`, `init` does NOT collapse the preflight result behind
+      // a generic reason (line ~251 above) — a missing `project` scope must
+      // be nameable in the report, not hidden behind "preflight_unavailable".
+      init: () => {
+        let result: unknown;
+        try {
+          const preflight = auth.runPreflight(cwd);
+          if (!preflight.ok) {
+            result = { kind: 'blocked', reason: preflight.reason, message: preflight.message };
+            output(result, raw);
+            return;
+          }
+
+          const desiredState = desired.readDesiredState(cwd);
+          const resolvedTarget = target.readSyncTarget(cwd);
+          if (!resolvedTarget.available || !resolvedTarget.target) {
+            result = { kind: 'blocked', reason: 'target_unavailable' };
+            output(result, raw);
+            return;
+          }
+          const repository = { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber };
+
+          // HIGH-1: the map is read exactly ONCE, here, at the head of the
+          // run. Every subsequent consumer — the options pass's planner
+          // input, its adapters.map, and the effective-target computation —
+          // consumes the map returned by the most recent apply, never this
+          // head-of-run copy again.
+          const strictMap = map.readSyncMapStrict(cwd, repository) as { kind: string; reason?: string; map?: unknown };
+          const remoteSnapshot = bootstrapRemote.readBootstrapRemoteState({
+            cwd,
+            owner: resolvedTarget.target.owner,
+            repo: resolvedTarget.target.repo,
+            projectNumber: resolvedTarget.target.projectNumber,
+          });
+
+          const baseTarget = {
+            owner: resolvedTarget.target.owner,
+            repo: resolvedTarget.target.repo,
+            repositoryNumber: resolvedTarget.target.repositoryNumber,
+          };
+
+          const structurePlan = bootstrapPlan.planBootstrap(
+            { desired: desiredState, remote: remoteSnapshot, strictMap, target: { ...baseTarget, projectNumber: resolvedTarget.target.projectNumber } },
+            { pass: bootstrapPlan.BOOTSTRAP_PASS.STRUCTURE },
+          );
+          if (structurePlan.blocked.length > 0) {
+            result = { kind: 'blocked', reason: structurePlan.blocked[0].reason, detail: structurePlan.blocked[0].detail };
+            output(result, raw);
+            return;
+          }
+          if (structurePlan.uncertain.length > 0) {
+            result = { kind: 'uncertain', reason: structurePlan.uncertain[0].reason };
+            output(result, raw);
+            return;
+          }
+
+          const structureApply = apply.applyMutationPlan(structurePlan, {
+            cwd,
+            map: strictMap.kind === 'valid' ? strictMap.map : null,
+          }) as { kind: string; map?: { completions?: Record<string, { issueNumber?: number }> } | null; outcomes?: OperationOutcome[] };
+          if (structureApply.kind !== 'completed') {
+            output(structureApply, raw);
+            return;
+          }
+
+          // Cycle-4 HIGH-4 second half: the effective target is recomputed
+          // from the structure pass's OWN result and feeds both the
+          // conditional re-read and (in plan 03-03) the config write, so the
+          // two can never disagree.
+          const mutated = mutatedKeys(structureApply.outcomes ?? []);
+          const projectMutated = mutated.includes('project');
+          const fieldMutated = mutated.some((key: string) => key.startsWith('field:'));
+          const effectiveProjectNumber = projectMutated
+            ? structureApply.map?.completions?.project?.issueNumber ?? resolvedTarget.target.projectNumber
+            : resolvedTarget.target.projectNumber;
+
+          // Re-read only when the structure pass MUTATED the field/option
+          // surface (never on a mere checkpointed observation, which cannot
+          // have changed anything remotely) — this is the condition
+          // `mutatedKeys` exists to answer.
+          const optionsRemote = (projectMutated || fieldMutated)
+            ? bootstrapRemote.readBootstrapRemoteState({ cwd, owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: effectiveProjectNumber })
+            : remoteSnapshot;
+
+          const optionsStrictMap = structureApply.map ? { kind: 'valid', map: structureApply.map } : { kind: 'absent' };
+          const optionsPlan = bootstrapPlan.planBootstrap(
+            { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber } },
+            { pass: bootstrapPlan.BOOTSTRAP_PASS.OPTIONS },
+          );
+          if (optionsPlan.blocked.length > 0) {
+            result = { kind: 'blocked', reason: optionsPlan.blocked[0].reason, detail: optionsPlan.blocked[0].detail };
+            output(result, raw);
+            return;
+          }
+          if (optionsPlan.uncertain.length > 0) {
+            result = { kind: 'uncertain', reason: optionsPlan.uncertain[0].reason };
+            output(result, raw);
+            return;
+          }
+
+          // HIGH-1: adapters.map is the structure pass's RETURNED map, never
+          // the head-of-run strictMap read above — seeding from the stale
+          // copy would make this single atomic write REPLACE every
+          // completion the structure pass just persisted.
+          result = apply.applyMutationPlan(optionsPlan, { cwd, map: structureApply.map ?? null });
+        } catch {
+          result = { kind: 'uncertain', reason: 'init_unavailable' };
         }
         output(result, raw);
       },
