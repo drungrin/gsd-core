@@ -436,3 +436,107 @@ describe('DOCUMENTS schema contract', () => {
     }
   });
 });
+
+// Captures the FULL argv of every dispatched gh call (not just the query=
+// argument), so flag-level regressions are visible to assertions.
+function captureDispatchedArgv() {
+  const calls = [];
+  readRemoteSnapshot({
+    cwd: '/tmp',
+    owner: 'octo',
+    repo: 'example',
+    repositoryNumber: 1,
+    projectNumber: 1,
+    issueNodeIdHints: [101],
+    execGh(args) {
+      calls.push([...args]);
+      const query = args.find((arg) => arg.startsWith('query='));
+      const connection = ['project', 'items', 'fields', 'subIssues', 'issueId'].find((name) => query.includes(`github-sync:${name}`));
+      const page = connection === 'project'
+        ? { id: 'PVT_proj_node_contract' }
+        : connection === 'items'
+          ? { nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE_NODE_101', number: 101 } }], pageInfo: { hasNextPage: false, endCursor: null } }
+          : connection === 'fields'
+            ? { nodes: [{ id: 'PVTF_contract_1', name: 'Status' }], pageInfo: { hasNextPage: false, endCursor: null } }
+            : connection === 'subIssues'
+              ? { nodes: [{ id: 'SUB-CONTRACT-1', number: 1 }], pageInfo: { hasNextPage: false, endCursor: null } }
+              : { id: 'ISSUE_NODE_101' };
+      return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope(connection, page)), stderr: '' };
+    },
+  });
+  return calls;
+}
+
+// `gh`'s typed `-F/--field` flag performs magic value substitution BEFORE the
+// request is built: a value starting with `@` is read from a local file (`@-`
+// from stdin), and `{owner}`/`{repo}`/`{branch}` are expanded from the local
+// git repo. This is not shell injection — array argv already prevents that —
+// it is gh's own documented field semantics, so it survives spawnSync entirely.
+//
+// Confirmed live against gh 2.96.0: `-F owner=@canary.txt` transmits the
+// FILE CONTENTS to api.github.com, while `-f owner=@canary.txt` sends the
+// literal string. readSyncTarget validates owner/repo only as non-empty
+// strings, so any value reaching `-F` is an exfiltration vector.
+describe('gh field-flag safety (no local-file read via -F)', () => {
+  test('every -F value is a bare integer; unvalidated strings ride -f', () => {
+    for (const args of captureDispatchedArgv()) {
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] !== '-F') continue;
+        const pair = args[i + 1];
+        const value = pair.slice(pair.indexOf('=') + 1);
+        assert.match(
+          value,
+          /^\d+$/,
+          `-F ${pair} carries a non-integer value. gh's typed -F flag expands a leading "@" into a local file read and substitutes {owner}/{repo}/{branch}. Only validated positive integers may use -F; every string variable must use -f.`,
+        );
+      }
+    }
+  });
+
+  test('owner and repo are never dispatched on -F', () => {
+    for (const args of captureDispatchedArgv()) {
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] !== '-F') continue;
+        const key = args[i + 1].slice(0, args[i + 1].indexOf('='));
+        assert.ok(
+          key !== 'owner' && key !== 'repo',
+          `${key} is a config-sourced string with no charset restriction and must use -f, not -F`,
+        );
+      }
+    }
+  });
+
+  test('a config-sourced owner beginning with @ reaches gh verbatim, not as a file read', () => {
+    const dispatched = [];
+    readRemoteSnapshot({
+      cwd: '/tmp',
+      owner: '@/etc/passwd',
+      repo: 'example',
+      repositoryNumber: 1,
+      projectNumber: 1,
+      issueNodeIdHints: [101],
+      execGh(args) {
+        dispatched.push([...args]);
+        const query = args.find((arg) => arg.startsWith('query='));
+        const connection = ['project', 'items', 'fields', 'subIssues', 'issueId'].find((name) => query.includes(`github-sync:${name}`));
+        const page = connection === 'project'
+          ? { id: 'PVT_proj_node_contract' }
+          : connection === 'items'
+            ? { nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE_NODE_101', number: 101 } }], pageInfo: { hasNextPage: false, endCursor: null } }
+            : connection === 'fields'
+              ? { nodes: [{ id: 'PVTF_contract_1', name: 'Status' }], pageInfo: { hasNextPage: false, endCursor: null } }
+              : connection === 'subIssues'
+                ? { nodes: [{ id: 'SUB-CONTRACT-1', number: 1 }], pageInfo: { hasNextPage: false, endCursor: null } }
+                : { id: 'ISSUE_NODE_101' };
+        return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope(connection, page)), stderr: '' };
+      },
+    });
+    const ownerArgs = dispatched.flatMap((args) => args.filter((arg) => arg.startsWith('owner=')));
+    assert.ok(ownerArgs.length > 0, 'expected at least one owner argument to be dispatched');
+    for (const args of dispatched) {
+      const index = args.findIndex((arg) => arg.startsWith('owner='));
+      if (index === -1) continue;
+      assert.equal(args[index - 1], '-f', 'an @-prefixed owner must be dispatched with -f so gh sends it verbatim instead of reading the named file');
+    }
+  });
+});

@@ -156,8 +156,18 @@ function readIssueNodeIds(options: ReadRemoteSnapshotOptions): Record<string, st
     const result = execGh(
       [
         'api', 'graphql', '-f', `query=${DOCUMENTS.issueId}`,
-        '-F', `owner=${options.owner}`,
-        '-F', `repo=${options.repo}`,
+        // SECURITY: owner/repo are String! variables and MUST use `-f` (raw), never `-F`.
+        // `gh`'s typed `-F` flag performs magic value substitution before the request is
+        // built: a value starting with `@` is read from a local file (`@-` from stdin) and
+        // `{owner}`/`{repo}`/`{branch}` are expanded from the local git repo. Since
+        // readSyncTarget validates owner/repo only as non-empty strings (no charset
+        // restriction), a `.planning/config.json` carrying `owner: "@/path/to/secret"`
+        // would make gh read that file and transmit its contents to api.github.com.
+        // `-f` sends the value verbatim. Numeric variables stay on `-F` because they need
+        // Int typing and are validated positive safe integers, so neither `@` nor `{` can
+        // appear.
+        '-f', `owner=${options.owner}`,
+        '-f', `repo=${options.repo}`,
         '-F', `issueNumber=${issueNumber}`,
       ],
       { cwd: options.cwd },
@@ -237,7 +247,8 @@ function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot 
     const children = readConnection(
       'subIssues',
       ['repository', 'issue', 'subIssues'],
-      ['-F', `owner=${options.owner}`, '-F', `repo=${options.repo}`, '-F', `issueNumber=${issueNumber}`],
+      // SECURITY: owner/repo on `-f` (raw), never `-F` — see the note in readIssueNodeIds.
+      ['-f', `owner=${options.owner}`, '-f', `repo=${options.repo}`, '-F', `issueNumber=${issueNumber}`],
       options,
     );
     if (!children) return unavailable();
