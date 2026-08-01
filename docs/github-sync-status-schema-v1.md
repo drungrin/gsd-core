@@ -42,7 +42,28 @@ described above.
 | `message` | Present only for unavailable status; a fixed operator-facing remediation. |
 
 Grouping is by operation outcome: `creates`, `updates`, and `noops` contain only logical keys;
-`blocked` and `uncertain` preserve only typed reasons. An unavailable remote response sets
-`available` to `false`, returns empty normal groups, reports `remote_unavailable` under
-`uncertain`, and exits successfully. Status is read-only and never applies a mutation or writes
-the sync map.
+`blocked` and `uncertain` preserve only typed reasons. Status is read-only and never applies a
+mutation or writes the sync map.
+
+## Unavailable status: two distinct reason codes (G-02-4)
+
+An unavailable status report (`available: false`) always has an outcome-specific `message`, but
+that `message` is selected from a fixed catalog keyed by fault class — never assembled from a
+config value or a caught error (D-07/SAFE-04) — and the two fault classes are reported through
+different DTO shapes so a local configuration fault can never read as a GitHub outage:
+
+- **`remote_unavailable`** (genuinely unreadable remote): `uncertain` carries
+  `[{ reason: 'remote_unavailable' }]`, `blocked` is empty, and `message` is the fixed retry
+  remediation ("Retry shortly.") — appropriate because a transient remote failure can resolve on
+  its own.
+- **`target_unavailable`** (a local `github_sync.target` configuration fault): `blocked` carries
+  `[{ reason: 'target_unavailable', detail }]`, where `detail` is one of the six values in the
+  closed `SYNC_TARGET_FIELD` catalog (`config`, `target`, `owner`, `repo`, `repository_number`,
+  `project_number`) naming the field readSyncTarget's own validation rejected — `uncertain` is
+  empty, because retrying a fixed local config value can never help. `message` names the
+  offending field with its full dotted path (e.g. `github_sync.target.repository_number`) and a
+  concrete remedy, drawn from the same frozen catalog. **A local target fault therefore reports
+  no `uncertain` entry** — automation keying on `uncertain` alone to detect "something's wrong"
+  will see an empty list for this fault class and must also check `blocked`.
+
+Both classes exit successfully (D-16) and make no remote read or write.

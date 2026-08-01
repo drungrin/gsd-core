@@ -21,9 +21,7 @@ const SYNC_TARGET_REASON = Object.freeze({
 // identify a single leaf field (missing/wrong-shaped root, github_sync, or
 // target, or a target whose key set isn't exactly the four required keys).
 // `config` covers an unreadable/unparseable .planning/config.json. The four
-// leaf members name the specific field that failed its own validation. This
-// task wires `repository_number` precisely; the remaining leaf fields fan out
-// in the next task, routed through `target` until then.
+// leaf members name the specific field that failed its own validation.
 const SYNC_TARGET_FIELD = Object.freeze({
   CONFIG: 'config',
   TARGET: 'target',
@@ -60,25 +58,32 @@ function unavailable(field: SyncTargetField): SyncTargetReadResult {
  * configuration is deliberately not guessed: callers must take their safe
  * unavailable/blocked terminal path before any remote or map operation.
  *
- * The `field` discriminator this task wires precisely: an unreadable or
- * unparseable config file reports `repository_number` when that is the sole
- * invalid value; every other rejection reports the generic `target` fallback
- * until the next task fans the remaining leaf fields out. Accept/reject
- * decisions themselves are unchanged.
+ * The `field` discriminator is assigned in a fixed evaluation order: an
+ * unreadable or unparseable config file reports `config`; a non-object root,
+ * a missing/non-object `github_sync`, a missing/non-object `target`, or a
+ * target whose key set isn't exactly the four required keys all report the
+ * generic `target` fallback; otherwise the first field failing its own
+ * validity check reports that field's name, checked in the order owner,
+ * repo, repository_number, project_number. The `isRecord`/`isNonEmptyString`/
+ * `isPositiveSafeInteger` predicates below remain the single source of
+ * validity, so the discriminator can never disagree with the accept/reject
+ * decision itself — which is unchanged by this catalog.
  */
 function readSyncTarget(cwd: string): SyncTargetReadResult {
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(path.join(cwd, '.planning', 'config.json'), 'utf8'));
   } catch {
-    return unavailable(SYNC_TARGET_FIELD.TARGET);
+    return unavailable(SYNC_TARGET_FIELD.CONFIG);
   }
   if (!isRecord(parsed) || !isRecord(parsed.github_sync) || !isRecord(parsed.github_sync.target)) return unavailable(SYNC_TARGET_FIELD.TARGET);
   const target = parsed.github_sync.target;
   if (!['owner', 'repo', 'repository_number', 'project_number'].every((key) => Object.hasOwn(target, key)) ||
-    Object.keys(target).length !== 4 || !isNonEmptyString(target.owner) || !isNonEmptyString(target.repo)) return unavailable(SYNC_TARGET_FIELD.TARGET);
+    Object.keys(target).length !== 4) return unavailable(SYNC_TARGET_FIELD.TARGET);
+  if (!isNonEmptyString(target.owner)) return unavailable(SYNC_TARGET_FIELD.OWNER);
+  if (!isNonEmptyString(target.repo)) return unavailable(SYNC_TARGET_FIELD.REPO);
   if (!isPositiveSafeInteger(target.repository_number)) return unavailable(SYNC_TARGET_FIELD.REPOSITORY_NUMBER);
-  if (!isPositiveSafeInteger(target.project_number)) return unavailable(SYNC_TARGET_FIELD.TARGET);
+  if (!isPositiveSafeInteger(target.project_number)) return unavailable(SYNC_TARGET_FIELD.PROJECT_NUMBER);
   return {
     available: true,
     reason: SYNC_TARGET_REASON.OK,

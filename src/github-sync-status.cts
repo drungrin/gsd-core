@@ -6,15 +6,17 @@ const UNAVAILABLE_MESSAGE = 'github-sync status is unavailable because GitHub co
 
 // G-02-4: a local github_sync.target fault is a local configuration fault,
 // not a GitHub outage — "Retry shortly" is actively wrong advice for it, and
-// no field was ever named. Every entry is a whole fixed literal (D-07/SAFE-04):
-// never assembled from a config value, a caught error, or anything thrown.
-// This task adds only the entries it needs (`target`, `repository_number`);
-// the next task completes the remaining leaf fields (`config`, `owner`,
-// `repo`, `project_number`). An unrecognized or absent field falls back to
+// no field was ever named. Every entry below is a reviewed, whole fixed
+// literal (D-07/SAFE-04): nothing from config or a caught error may ever be
+// interpolated into one. An unrecognized or absent field falls back to
 // `target` so the lookup stays total.
 const TARGET_UNAVAILABLE_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  config: 'github-sync status is unavailable because .planning/config.json could not be read or parsed. Fix that file, then re-run.',
   target: 'github-sync status is unavailable because github_sync.target in .planning/config.json is missing or does not declare exactly owner, repo, repository_number, and project_number. Declare all four, then re-run.',
+  owner: 'github-sync status is unavailable because github_sync.target.owner in .planning/config.json is invalid. Set it to a non-empty string (the GitHub owner login), then re-run.',
+  repo: 'github-sync status is unavailable because github_sync.target.repo in .planning/config.json is invalid. Set it to a non-empty string (the GitHub repository name), then re-run.',
   repository_number: 'github-sync status is unavailable because github_sync.target.repository_number in .planning/config.json is invalid. Set it to a positive whole number, then re-run.',
+  project_number: 'github-sync status is unavailable because github_sync.target.project_number in .planning/config.json is invalid. Set it to a positive whole number, then re-run.',
 });
 
 interface StatusInput { available: boolean; reason: string; field?: string; }
