@@ -67,6 +67,38 @@ const CREATE_UNCERTAIN_REMEDIATION = 'Re-read GitHub and reconcile before retryi
 const CHECKPOINT_UNCERTAIN_REMEDIATION = 'Repair the local sync map before running sync again.';
 const ARGV_UNRESOLVED_REMEDIATION_PREFIX = 'A prerequisite object was not checkpointed this run: ';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Decodes GitHub's REST already-exists validation-error shape directly from
+ * the raw response body — never through `decodeResponseRoot`, which rejects
+ * any REST body carrying a `message` and no success key as `null` by design
+ * (that rejection is what makes a genuine error body distinguishable from a
+ * success body elsewhere in this module; the already-exists recovery below
+ * needs the body itself, not the post-rejection null). Recorded live
+ * (`tests/fixtures/github-sync/header-framing.json`'s `live-422` case,
+ * `tests/fixtures/github-sync/bootstrap-repo-objects.json`'s
+ * `milestoneAlreadyExists422Body`): `{"message":"Validation Failed","errors":
+ * [{"resource":"Label","code":"already_exists","field":"name"}], ...}`. Only
+ * the `errors[].code === 'already_exists'` shape is checked — the resource
+ * and field vary between a label and a milestone conflict, and are not part
+ * of the identity this recovery keys on.
+ */
+function isAlreadyExistsBody(stdout: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return false;
+  }
+  if (!isRecord(parsed)) return false;
+  const errors = parsed.errors;
+  if (!Array.isArray(errors)) return false;
+  return errors.some((entry) => isRecord(entry) && entry.code === 'already_exists');
+}
+
 function parseRateLimitFromRoot(root: Record<string, unknown> | null): RateLimit | null {
   const rateLimit = root?.rateLimit;
   if (rateLimit === null || typeof rateLimit !== 'object' || Array.isArray(rateLimit)) return null;
@@ -255,6 +287,26 @@ function applyMutationPlan(plan: MutationPlan, adapters: ApplyAdapters): ApplyRe
           if (delay === null) return { kind: 'failed', logicalKey: operation.logicalKey, remediation: RETRY_REMEDIATION, outcomes };
           pendingPointsDelay = delay;
         }
+        if (operation.contentCreation) lastContentCreateAt = clock.now();
+        break;
+      }
+      // Task 3's typed already-exists recovery (D-11's sole documented
+      // exception): scoped to the REST transport, a 422 status parsed from a
+      // real response (plan 03-01 Task 2's status-line fix is what makes
+      // `result.response` reachable here at all), and a body that actually
+      // decodes to GitHub's already-exists shape — never to the status code
+      // alone, so an unrelated 422 still fails the run below, and never to a
+      // GraphQL operation, so a GraphQL failure can never be swallowed by it.
+      // Records no completion (the object stays absent from the sync map;
+      // the next run's live list read is what reconciles it — BOOT-04/05's
+      // ordinary list-then-create discipline, not an exception to it), and
+      // still advances the content-creation clock before continuing: the
+      // request was dispatched and GitHub processed it, so the next
+      // content-creating operation must still honour the pacing interval
+      // (D-10, cycle-2 non-HIGH #6) rather than dispatching immediately
+      // after a rejected create.
+      if (operation.transport === OPERATION_TRANSPORT.REST && result.response?.status === 422 && isAlreadyExistsBody(result.stdout)) {
+        outcomes.push({ logicalKey: operation.logicalKey, operationKey: operation.logicalKey, action: operation.action, result: OPERATION_OUTCOME.ALREADY_EXISTS });
         if (operation.contentCreation) lastContentCreateAt = clock.now();
         break;
       }

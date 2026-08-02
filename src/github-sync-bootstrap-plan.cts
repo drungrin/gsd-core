@@ -35,6 +35,10 @@ const BOOTSTRAP_OPERATION_REASON = Object.freeze({
   OWNER_UNRESOLVABLE: 'owner_unresolvable',
   FIELD_TYPE_MISMATCH: 'field_type_mismatch',
   REST_UNAVAILABLE: 'rest_unavailable',
+  // Task 3: a GSD label or milestone already exists (exact or, for a label,
+  // case-variant) — the noop reason recorded alongside its adoption checkpoint.
+  LABEL_EXISTS: 'label_exists',
+  MILESTONE_EXISTS: 'milestone_exists',
 } as const);
 
 const BOOTSTRAP_PASS = Object.freeze({
@@ -113,14 +117,23 @@ interface BootstrapRepositoryLike {
   ownerLogin: string;
   linkState: LinkState | null;
 }
+/** Mirrors github-sync-bootstrap-remote.cts's `RestListEntry` — not imported (zero I/O). One decoded REST label or milestone. */
+interface RestEntryLike { nodeId: string; name: string; number?: number; state?: string; }
+
 interface BootstrapRemoteForMerge {
   available: boolean;
+  /** Present on an unavailable read; the remote-layer reason, translated at the plan boundary — see translateRemoteReason. */
+  reason?: string;
   projectOutcome: ProjectOutcome;
   statusField: RemoteStatusField | null;
   repository?: BootstrapRepositoryLike | null;
   projectNodeId?: string | null;
   /** Every field on the project, `Status` included — the shape plan 03-04's planFields/planAutonomousOptions consume. */
   fields?: RemoteStatusField[];
+  /** BOOT-04: every repository label, from the REST list read (Task 2). */
+  labels?: RestEntryLike[];
+  /** BOOT-05: every repository Milestone (open and closed), from the REST list read (Task 2). */
+  milestones?: RestEntryLike[];
 }
 interface StrictMapCompletion { nodeId: string; }
 interface StrictMapLike {
@@ -644,6 +657,226 @@ function planAutonomousOptions(remote: BootstrapRemoteForMerge, strictMap: Stric
   return { operations: [operation] };
 }
 
+// ─── REST endpoint path (duplicated from github-sync-bootstrap-remote.cts) ──
+//
+// This module declares zero I/O imports (its own header, and every mutation
+// document above is duplicated rather than imported for the same reason).
+// `bootstrapRestPath` therefore duplicates only the pure path-BUILDING half
+// of that module's `restPath` — not the `assertPathSafeTarget` safety check,
+// which stays exactly where it is: `context.owner`/`context.repo` reaching
+// this module have already passed that guard, because `planBootstrap` only
+// ever runs once `input.remote.available` is true, and the remote reader
+// (Task 2) never sets that flag for a target that failed the guard.
+
+function bootstrapRestPath(owner: string, repo: string, suffix: string): string {
+  return `repos/${owner}/${repo}${suffix}`;
+}
+
+// ─── planLabels ─────────────────────────────────────────────────────────────
+
+interface GsdLabelDeclaration { name: string; color: string; description: string; }
+
+/** BOOT-04's two fixed label declarations. Colour/description chosen at implementation time — never reconciled after creation (D-18's sibling rule). */
+const GSD_LABELS: readonly GsdLabelDeclaration[] = Object.freeze([
+  Object.freeze({ name: 'gsd:phase', color: '5319E7', description: 'GSD phase-scoped issue' }),
+  Object.freeze({ name: 'gsd:plan', color: '1D76DB', description: 'GSD plan-scoped issue' }),
+]);
+
+/** ASCII-only case fold — every GSD label literal is ASCII, so this is sufficient and avoids any locale-dependent Unicode casing behavior. */
+function asciiLowerCase(value: string): string {
+  return value.replace(/[A-Z]/g, (char) => String.fromCharCode(char.charCodeAt(0) + 32));
+}
+
+function buildCreateLabelOperation(gsdLabel: GsdLabelDeclaration, labelKey: string, context: CompletionContext): StageTaggedOperation {
+  const restApiPath = bootstrapRestPath(context.owner, context.repo, '/labels');
+  return {
+    kind: 'create-label',
+    logicalKey: labelKey,
+    args: [
+      'api', restApiPath, '-X', 'POST',
+      '-f', `name=${gsdLabel.name}`,
+      '-f', `color=${gsdLabel.color}`,
+      '-f', `description=${gsdLabel.description}`,
+    ],
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.REST,
+    action: OPERATION_ACTION.CREATE,
+    hasPointsBudget: false,
+    // Every operation that brings a new GitHub-side object into existence
+    // declares content creation true — the phase-wide decision (planProject's
+    // create path) now covers REST creates too (D-10).
+    contentCreation: true,
+    captures: [{ kind: 'node', logicalKey: labelKey, nodeIdPath: 'node_id' }],
+    stage: BOOTSTRAP_STAGE.LABELS,
+  };
+}
+
+interface LabelPlanResult {
+  operations: StageTaggedOperation[];
+  checkpoints: StageTaggedCheckpoint[];
+  noops: Array<{ reason: string; detail?: string }>;
+}
+
+/**
+ * BOOT-04's list-then-create composer. Existence is decided from the live
+ * label list every run — never from `.planning/.github-sync.json` — because
+ * a label is a named, human-discoverable object a developer can create by
+ * hand outside `init`; `strictMap` is accepted for signature symmetry with
+ * `planFields`/`planMilestones` but is never consulted here for that reason.
+ *
+ * Two-tier comparison per GSD label (T-03-32):
+ *   1. **Exact** — a live label whose raw name equals the GSD literal under
+ *      `===` — zero operations, one noop, one adoption checkpoint carrying
+ *      its node id.
+ *   2. **Case variant** — failing tier one, a live label whose name equals
+ *      the GSD literal after ASCII case folding on both sides — zero
+ *      operations, one noop whose detail names the observed spelling, one
+ *      adoption checkpoint under GSD's own reserved key carrying that
+ *      label's node id. Never renamed, never duplicated.
+ * Anything else is missing: one create operation. A label differing by more
+ * than case is not GSD's and produces no operation, no noop, no checkpoint.
+ * Never an edit or a delete — only creates.
+ */
+function planLabels(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, context: CompletionContext): LabelPlanResult {
+  const remoteLabels = remote.labels ?? [];
+  const operations: StageTaggedOperation[] = [];
+  const checkpoints: StageTaggedCheckpoint[] = [];
+  const noops: Array<{ reason: string; detail?: string }> = [];
+
+  for (const gsdLabel of GSD_LABELS) {
+    const labelKey = BOOTSTRAP_LOGICAL_KEY.label(gsdLabel.name);
+    const exact = remoteLabels.find((label) => label.name === gsdLabel.name);
+    if (exact) {
+      noops.push({ reason: BOOTSTRAP_OPERATION_REASON.LABEL_EXISTS });
+      checkpoints.push({ logicalKey: labelKey, nodeId: exact.nodeId, completionContext: context, stage: BOOTSTRAP_STAGE.LABELS });
+      continue;
+    }
+    const variant = remoteLabels.find((label) => asciiLowerCase(label.name) === asciiLowerCase(gsdLabel.name));
+    if (variant) {
+      noops.push({ reason: BOOTSTRAP_OPERATION_REASON.LABEL_EXISTS, detail: `existing label spelled "${variant.name}"` });
+      checkpoints.push({ logicalKey: labelKey, nodeId: variant.nodeId, completionContext: context, stage: BOOTSTRAP_STAGE.LABELS });
+      continue;
+    }
+    operations.push(buildCreateLabelOperation(gsdLabel, labelKey, context));
+  }
+  return { operations, checkpoints, noops };
+}
+
+// ─── planMilestones ─────────────────────────────────────────────────────────
+
+/**
+ * Matches a leading version token: optional leading ASCII whitespace, a
+ * lowercase `v`, one or more digits, zero or more dot-separated digit
+ * groups, terminated at a word boundary. Returns null when the token is not
+ * in the leading position — identity is the token in the leading position,
+ * never anywhere in the string (D-26).
+ */
+const MILESTONE_VERSION_TOKEN = /^[ \t]*(v\d+(?:\.\d+)*)\b/;
+
+function parseMilestoneVersionToken(title: string): string | null {
+  const match = MILESTONE_VERSION_TOKEN.exec(title);
+  return match ? match[1] : null;
+}
+
+function buildCreateMilestoneOperation(desiredMilestone: DesiredMilestoneLike, milestoneKey: string, context: CompletionContext): StageTaggedOperation {
+  const restApiPath = bootstrapRestPath(context.owner, context.repo, '/milestones');
+  return {
+    kind: 'create-milestone',
+    logicalKey: milestoneKey,
+    args: [
+      'api', restApiPath, '-X', 'POST',
+      '-f', `title=${desiredMilestone.title}`,
+      '-f', `description=${desiredMilestone.description}`,
+      '-f', `state=${desiredMilestone.archived ? 'closed' : 'open'}`,
+    ],
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.REST,
+    action: OPERATION_ACTION.CREATE,
+    hasPointsBudget: false,
+    contentCreation: true,
+    captures: [{ kind: 'node', logicalKey: milestoneKey, nodeIdPath: 'node_id', numberPath: 'number' }],
+    stage: BOOTSTRAP_STAGE.MILESTONES,
+  };
+}
+
+/**
+ * Resolves a desired milestone against the live list by stored completion
+ * id first (D-17/D-23's shared rule), then by the parsed leading version
+ * token of each remote title matching the desired version (D-26).
+ */
+function resolveMilestoneIdentity(desiredMilestone: DesiredMilestoneLike, remoteMilestones: RestEntryLike[], strictMap: StrictMapLike): RestEntryLike | undefined {
+  const completions = strictMap.kind === 'valid' ? strictMap.map?.completions ?? {} : {};
+  const storedId = completions[BOOTSTRAP_LOGICAL_KEY.milestone(desiredMilestone.version)]?.nodeId;
+  if (storedId) {
+    const byId = remoteMilestones.find((milestone) => milestone.nodeId === storedId);
+    if (byId) return byId;
+  }
+  return remoteMilestones.find((milestone) => parseMilestoneVersionToken(milestone.name) === desiredMilestone.version);
+}
+
+interface MilestonePlanResult {
+  operations: StageTaggedOperation[];
+  checkpoints: StageTaggedCheckpoint[];
+  noops: Array<{ reason: string; detail?: string }>;
+}
+
+/**
+ * BOOT-05's list-then-create composer, D-28: consumes the desired-state
+ * milestone array `readDesiredState` already deduplicated — never a local
+ * ROADMAP.md or STATE.md read. A match emits zero operations, one noop, and
+ * one adoption checkpoint carrying the live entry's node id and its number
+ * in the remote-number slot; no match emits a create with the closed state
+ * when the desired entry's `archived` flag is true, open otherwise (D-25).
+ * Never emits a field that sets a due date, and never emits an operation
+ * that updates an existing milestone's title, description, or state — D-27
+ * sets the description once at creation and never reconciles it.
+ */
+function planMilestones(desired: DesiredStateLike, remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, context: CompletionContext): MilestonePlanResult {
+  const desiredMilestones = desired.milestones ?? [];
+  const remoteMilestones = remote.milestones ?? [];
+  const operations: StageTaggedOperation[] = [];
+  const checkpoints: StageTaggedCheckpoint[] = [];
+  const noops: Array<{ reason: string; detail?: string }> = [];
+
+  for (const desiredMilestone of desiredMilestones) {
+    const milestoneKey = BOOTSTRAP_LOGICAL_KEY.milestone(desiredMilestone.version);
+    const match = resolveMilestoneIdentity(desiredMilestone, remoteMilestones, strictMap);
+    if (match) {
+      noops.push({ reason: BOOTSTRAP_OPERATION_REASON.MILESTONE_EXISTS });
+      checkpoints.push({
+        logicalKey: milestoneKey, nodeId: match.nodeId, completionContext: context, stage: BOOTSTRAP_STAGE.MILESTONES,
+        ...(match.number === undefined ? {} : { remoteNumber: match.number }),
+      });
+      continue;
+    }
+    operations.push(buildCreateMilestoneOperation(desiredMilestone, milestoneKey, context));
+  }
+  return { operations, checkpoints, noops };
+}
+
+// ─── remote-layer to operation-layer reason translation (cycle-2 non-HIGH #14) ──
+
+/**
+ * Maps every `BootstrapRemoteReason` value (github-sync-bootstrap-remote.cts,
+ * not imported here — zero I/O) onto this module's own reason catalog, so
+ * `planBootstrap`'s blocked/uncertain lists only ever carry
+ * `BOOTSTRAP_OPERATION_REASON` members. Both catalogs carry a
+ * similarly-spelled member with different ownership; this is the single
+ * translation point, tested by iterating every member of the remote-layer
+ * reason enum rather than trusting that today's string values happen to
+ * match.
+ */
+const REMOTE_REASON_TO_OPERATION_REASON: Record<string, string> = Object.freeze({
+  ok: BOOTSTRAP_OPERATION_REASON.REMOTE_UNAVAILABLE,
+  unsafe_target: BOOTSTRAP_OPERATION_REASON.UNSAFE_TARGET,
+  remote_unavailable: BOOTSTRAP_OPERATION_REASON.REMOTE_UNAVAILABLE,
+  rest_unavailable: BOOTSTRAP_OPERATION_REASON.REST_UNAVAILABLE,
+});
+
+function translateRemoteReason(remoteReason: string | undefined): string {
+  return REMOTE_REASON_TO_OPERATION_REASON[remoteReason ?? ''] ?? BOOTSTRAP_OPERATION_REASON.REMOTE_UNAVAILABLE;
+}
+
 // ─── planProject ────────────────────────────────────────────────────────────
 
 const LINK_STATE = Object.freeze({
@@ -820,7 +1053,9 @@ function planProject(
 
 // ─── planBootstrap ──────────────────────────────────────────────────────────
 
-interface DesiredStateLike { available: boolean; reason?: string; }
+/** Mirrors github-sync-desired.cts's `DesiredMilestone` — not imported (D-28's single planning-file reader lives there, not here). */
+interface DesiredMilestoneLike { version: string; name: string; title: string; description: string; archived: boolean; }
+interface DesiredStateLike { available: boolean; reason?: string; milestones?: DesiredMilestoneLike[]; }
 interface BootstrapTarget { owner: string; repo: string; repositoryNumber: number; projectNumber: number | null; }
 interface PlanBootstrapInput {
   desired: DesiredStateLike;
@@ -860,7 +1095,7 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
     return { ...emptyPlan(), blocked: [{ reason: BOOTSTRAP_OPERATION_REASON.DESIRED_UNAVAILABLE, detail: input.desired.reason }] };
   }
   if (!input.remote.available) {
-    return { ...emptyPlan(), uncertain: [{ reason: BOOTSTRAP_OPERATION_REASON.REMOTE_UNAVAILABLE }] };
+    return { ...emptyPlan(), uncertain: [{ reason: translateRemoteReason(input.remote.reason) }] };
   }
   if (input.strictMap.kind === 'blocking') {
     return { ...emptyPlan(), blocked: [{ reason: BOOTSTRAP_OPERATION_REASON.MAP_BLOCKING, detail: input.strictMap.reason ?? 'invalid_schema' }] };
@@ -897,11 +1132,16 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
     if (fieldsPlan.blocked.length > 0) {
       return { ...emptyPlan(), blocked: fieldsPlan.blocked };
     }
-    // Filled in further by plan 03-05 (labels, milestones).
+    // Labels then milestones, after fields (plan 03-05 Task 3) — one `init`
+    // run's structure pass now covers project, fields, labels, and
+    // milestones, in that order.
+    const labelsPlan = planLabels(input.remote, input.strictMap, context);
+    const milestonesPlan = planMilestones(input.desired, input.remote, input.strictMap, context);
     return {
       ...emptyPlan(),
-      operations: [...projectPlan.operations, ...fieldsPlan.operations],
-      checkpoints: [...projectPlan.checkpoints, ...fieldsPlan.checkpoints],
+      operations: [...projectPlan.operations, ...fieldsPlan.operations, ...labelsPlan.operations, ...milestonesPlan.operations],
+      checkpoints: [...projectPlan.checkpoints, ...fieldsPlan.checkpoints, ...labelsPlan.checkpoints, ...milestonesPlan.checkpoints],
+      noops: [...labelsPlan.noops, ...milestonesPlan.noops],
     };
   }
 
@@ -927,6 +1167,9 @@ export = {
   planStatusOptionMerge,
   planFields,
   planAutonomousOptions,
+  planLabels,
+  planMilestones,
+  parseMilestoneVersionToken,
   validateFatalConditions,
   optionInputArgv,
   BOOTSTRAP_LOGICAL_KEY,
@@ -936,6 +1179,7 @@ export = {
   GSD_STATUS_OPTIONS,
   GSD_FIELDS,
   GSD_AUTONOMOUS_OPTIONS,
+  GSD_LABELS,
   STATUS_FIELD_NAME,
   DEFAULT_PROJECT_TITLE_SUFFIX,
   CREATE_PROJECT_DOCUMENT,
