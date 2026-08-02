@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createTempDir, cleanup } = require('./helpers.cjs');
 
-const { readDesiredState, DESIRED_REASON, dedupeMilestonesByVersion } = require('../gsd-core/bin/lib/github-sync-desired.cjs');
+const { readDesiredState, DESIRED_REASON, dedupeMilestonesByVersion, PHASE_STATUS } = require('../gsd-core/bin/lib/github-sync-desired.cjs');
 
 function write(repoDir, relativePath, content) {
   const target = path.join(repoDir, relativePath);
@@ -355,6 +355,216 @@ test('the real repository roadmap parses: phase 04 yields its three PHASE-* requ
   assert.ok(phase04, 'phase 04 must be present in the real repository roadmap');
   assert.deepEqual(phase04.requirements, ['PHASE-01', 'PHASE-02', 'PHASE-03']);
   assert.equal(phase04.successCriteria.length, 4);
+});
+
+// ─── readDesiredState: derived Status (plan 04-02 Task 2) ─────────────────
+
+test('a phase whose checklist entry is checked yields Done, regardless of whether it is the current phase', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-done-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    '# Roadmap\n\n- [x] **Phase 1: One** - done\n\n### Phase 01: One\n\n**Goal**: one\n',
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.phases[0].status, PHASE_STATUS.DONE);
+});
+
+test('a phase whose checklist entry is unchecked and whose id equals current_phase yields In Progress', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-inprogress-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    '# Roadmap\n\n- [ ] **Phase 1: One** - not done\n\n### Phase 01: One\n\n**Goal**: one\n',
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.phases[0].status, PHASE_STATUS.IN_PROGRESS);
+});
+
+test('a phase whose checklist entry is unchecked and whose id differs from current_phase yields Todo', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-todo-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    '# Roadmap\n\n- [ ] **Phase 2: Two** - not done\n\n### Phase 02: Two\n\n**Goal**: two\n',
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.phases[0].status, PHASE_STATUS.TODO);
+});
+
+test('checklist ids are normalized before comparison: `- [ ] **Phase 4:` matches `### Phase 04:` and STATE current_phase 04', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-normalize-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    '# Roadmap\n\n- [ ] **Phase 4: Four** - not done\n\n### Phase 04: Four\n\n**Goal**: four\n',
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 04\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.phases.length, 1);
+  assert.equal(result.phases[0].status, PHASE_STATUS.IN_PROGRESS);
+});
+
+test('a decimal-id phase (2.1) in both the checklist and the details resolves to its own status, not phase 02\'s', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-decimal-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    [
+      '# Roadmap',
+      '',
+      '- [x] **Phase 2: Two** - done',
+      '- [ ] **Phase 2.1: Two Point One** - not done',
+      '',
+      '### Phase 02: Two',
+      '',
+      '**Goal**: two',
+      '',
+      '### Phase 2.1: Two Point One',
+      '',
+      '**Goal**: inserted',
+      '',
+    ].join('\n'),
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  const phase02 = result.phases.find((phase) => phase.id === '02');
+  const phase21 = result.phases.find((phase) => phase.id === '2.1');
+  assert.equal(phase02.status, PHASE_STATUS.DONE);
+  assert.equal(phase21.status, PHASE_STATUS.TODO);
+});
+
+test('a phase present in the phase details but absent from the checklist falls back to the current-phase test, never null/undefined/empty', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-nochecklist-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.phases[0].status, PHASE_STATUS.IN_PROGRESS);
+  assert.notEqual(result.phases[0].status, null);
+  assert.notEqual(result.phases[0].status, undefined);
+  assert.notEqual(result.phases[0].status, '');
+});
+
+test('a checklist entry present with no matching detail heading contributes no phase at all', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-orphanchecklist-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    '# Roadmap\n\n- [x] **Phase 9: Nine** - phantom\n\n### Phase 01: One\n\n**Goal**: one\n',
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.phases.length, 1);
+  assert.equal(result.phases[0].id, '01');
+});
+
+test('every phase in the returned desired state carries a status drawn from the fixed PHASE_STATUS member set', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-memberset-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    [
+      '# Roadmap',
+      '',
+      '- [x] **Phase 1: One** - done',
+      '- [ ] **Phase 2: Two** - not done',
+      '',
+      '### Phase 01: One',
+      '',
+      '**Goal**: one',
+      '',
+      '### Phase 02: Two',
+      '',
+      '**Goal**: two',
+      '',
+      '### Phase 03: Three',
+      '',
+      '**Goal**: three',
+      '',
+    ].join('\n'),
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 02\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  const memberSet = new Set(Object.values(PHASE_STATUS));
+  for (const phase of result.phases) {
+    assert.ok(memberSet.has(phase.status), `phase ${phase.id} status ${phase.status} must be a PHASE_STATUS member`);
+  }
+});
+
+test('no fixture in this suite ever yields Blocked or Deferred', (t) => {
+  const repoDir = createTempDir('github-sync-desired-status-noblockeddeferred-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    [
+      '# Roadmap',
+      '',
+      '- [x] **Phase 1: One** - done',
+      '- [ ] **Phase 2: Two** - not done',
+      '',
+      '### Phase 01: One',
+      '',
+      '**Goal**: one',
+      '',
+      '### Phase 02: Two',
+      '',
+      '**Goal**: two',
+      '',
+    ].join('\n'),
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 02\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  for (const phase of result.phases) {
+    assert.notEqual(phase.status, 'Blocked');
+    assert.notEqual(phase.status, 'Deferred');
+  }
+});
+
+test('reading the repository\'s own ROADMAP.md and STATE.md yields Done for phases 01-03, In Progress for phase 04, and Todo for phases 05-08', () => {
+  const repoRoot = path.join(__dirname, '..');
+
+  const result = readDesiredState(repoRoot);
+
+  assert.equal(result.available, true);
+  const statusFor = (id) => result.phases.find((phase) => phase.id === id).status;
+  assert.equal(statusFor('01'), PHASE_STATUS.DONE);
+  assert.equal(statusFor('02'), PHASE_STATUS.DONE);
+  assert.equal(statusFor('03'), PHASE_STATUS.DONE);
+  assert.equal(statusFor('04'), PHASE_STATUS.IN_PROGRESS);
+  assert.equal(statusFor('05'), PHASE_STATUS.TODO);
+  assert.equal(statusFor('06'), PHASE_STATUS.TODO);
+  assert.equal(statusFor('07'), PHASE_STATUS.TODO);
+  assert.equal(statusFor('08'), PHASE_STATUS.TODO);
 });
 
 test('every fixture in this suite produces a milestone array with no two entries sharing a version', (t) => {

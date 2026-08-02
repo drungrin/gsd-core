@@ -15,6 +15,24 @@ const DESIRED_REASON = Object.freeze({
 
 type DesiredReason = typeof DESIRED_REASON[keyof typeof DESIRED_REASON];
 
+/**
+ * The three status-option names this projection can derive from disk truth,
+ * spelled exactly as `GSD_STATUS_OPTIONS` declares them
+ * (`src/github-sync-bootstrap-plan.cts`) — the reconciler resolves this
+ * value against that catalog's option ids, so a spelling drift here would
+ * make every phase item land in a No-Status column. `Blocked` and
+ * `Deferred` are deliberately absent: neither is derivable from disk truth
+ * today, and emitting a guess would silently overwrite a value a developer
+ * set by hand on the board (D-16).
+ */
+const PHASE_STATUS = Object.freeze({
+  TODO: 'Todo',
+  IN_PROGRESS: 'In Progress',
+  DONE: 'Done',
+} as const);
+
+type PhaseStatus = typeof PHASE_STATUS[keyof typeof PHASE_STATUS];
+
 interface DesiredPhase {
   id: string;
   title: string;
@@ -23,6 +41,8 @@ interface DesiredPhase {
   successCriteria: string[];
   /** Ordered, trimmed requirement IDs. Empty when the phase declares none — a real state, never an unavailable read. */
   requirements: string[];
+  /** Total by construction: every phase carries one of the three `PHASE_STATUS` members. */
+  status: PhaseStatus;
 }
 
 interface DesiredPlan {
@@ -144,7 +164,40 @@ function extractSuccessCriteria(section: string): string[] {
   return items;
 }
 
-function parseRoadmap(raw: string): DesiredPhase[] | null {
+/**
+ * D-16: milestone-phase-checklist line shape — a hyphen, a bracketed space
+ * or `x`, a bold span opening with the word `Phase`, the id, and a colon.
+ * This is a distinct construct from the `### Phase N:` heading `parseRoadmap`
+ * walks (a different section of ROADMAP.md, and the two can legitimately
+ * disagree in count), so it gets its own regex rather than widening that
+ * one. Ids are normalized through `normalizeId` so a checklist id and a
+ * detail-heading id are comparable.
+ */
+function parsePhaseChecklist(roadmapRaw: string): Map<string, boolean> {
+  const checklist = new Map<string, boolean>();
+  const pattern = /^-\s*\[([ xX])\]\s*\*\*Phase\s+(\d+(?:\.\d+)?):/gm;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(roadmapRaw)) !== null) {
+    checklist.set(normalizeId(match[2]), match[1].toLowerCase() === 'x');
+  }
+  return checklist;
+}
+
+/**
+ * D-16's status derivation, total by construction: a checked checklist
+ * entry is Done; an unchecked entry whose normalized id equals the current
+ * phase id is In Progress; any other unchecked entry is Todo; a phase with
+ * no checklist entry at all falls back to the same current-phase test. No
+ * branch can produce a null, which is what keeps "no card without a value"
+ * true.
+ */
+function derivePhaseStatus(id: string, checklist: Map<string, boolean>, currentPhaseId: string | null): PhaseStatus {
+  const checked = checklist.get(id);
+  if (checked === true) return PHASE_STATUS.DONE;
+  return id === currentPhaseId ? PHASE_STATUS.IN_PROGRESS : PHASE_STATUS.TODO;
+}
+
+function parseRoadmap(raw: string, checklist: Map<string, boolean>, currentPhaseId: string | null): DesiredPhase[] | null {
   const matches = [...raw.matchAll(/^### Phase (\d+(?:\.\d+)?):\s*(.+)$/gm)];
   if (matches.length === 0) return null;
   const phases: DesiredPhase[] = [];
@@ -153,12 +206,14 @@ function parseRoadmap(raw: string): DesiredPhase[] | null {
     const nextOffset = matches[index + 1]?.index ?? raw.length;
     const section = raw.slice(match.index + match[0].length, nextOffset);
     const goal = /^\*\*Goal\*\*:\s*(.+)$/m.exec(section)?.[1]?.trim() ?? '';
+    const id = normalizeId(match[1]);
     phases.push({
-      id: normalizeId(match[1]),
+      id,
       title: match[2].trim(),
       goal,
       successCriteria: extractSuccessCriteria(section),
       requirements: extractRequirements(section),
+      status: derivePhaseStatus(id, checklist, currentPhaseId),
     });
   }
   return phases.sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
@@ -377,8 +432,9 @@ function readDesiredState(cwd: string): DesiredState {
     const planningDir = path.join(cwd, '.planning');
     const roadmapRaw = fs.readFileSync(path.join(planningDir, 'ROADMAP.md'), 'utf8');
     const stateRaw = fs.readFileSync(path.join(planningDir, 'STATE.md'), 'utf8');
-    const phases = parseRoadmap(roadmapRaw);
     const currentPhase = parseCurrentPhase(stateRaw);
+    const checklist = parsePhaseChecklist(roadmapRaw);
+    const phases = parseRoadmap(roadmapRaw, checklist, currentPhase);
     const plans = readPlans(planningDir);
     const milestonesResult = parseMilestones(roadmapRaw, stateRaw, planningDir);
     if (!phases || !currentPhase || !plans || !milestonesResult) return unavailable();
@@ -396,4 +452,4 @@ function readDesiredState(cwd: string): DesiredState {
   }
 }
 
-export = { readDesiredState, DESIRED_REASON, dedupeMilestonesByVersion };
+export = { readDesiredState, DESIRED_REASON, dedupeMilestonesByVersion, PHASE_STATUS, parsePhaseChecklist };
