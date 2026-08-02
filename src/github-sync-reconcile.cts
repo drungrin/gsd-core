@@ -39,32 +39,42 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 /**
- * Emits the shared `MutationOperation` shape (plan 03-02 migration). The
- * response capture walks precisely the path the deleted hardcoded decoder
- * used to walk — the mutation payload key, then the project item, then its
- * `id`; and the same payload key, the project item, its `content`, then
- * `number` — so Phase 2's behavior is preserved exactly. The argv field
- * keeps its existing name (`args`) and `operationFor`'s flag choices are
- * unchanged: two opaque node-id string variables on the typed `-F` flag,
- * the pre-existing documented exception to the raw-flag rule
- * (`src/github-sync-operation.cts`'s module header).
+ * Emits the shared `MutationOperation` shape (plan 03-02 migration).
+ *
+ * Resolved in Phase 04 (plan 04-01): a live schema probe (see
+ * `.planning/phases/03-project-bootstrap/deferred-items.md`'s "Resolved in
+ * Phase 04" entry for the verbatim output) confirmed GitHub's `Mutation`
+ * root type carries no `addProjectV2Item` field at all — only
+ * `addProjectV2ItemById` exists — and no `rateLimit` field, which lives
+ * solely on `Query`. This document therefore selects no `rateLimit` block,
+ * declares `hasPointsBudget: false`, dispatches `addProjectV2ItemById`, and
+ * reads its response back through that mutation's own payload shape
+ * (`item`, not `projectV2Item` — also settled by the same live probe, not
+ * assumed unchanged). The response capture walks the mutation payload key,
+ * then the added item, then its `id`; and the same payload key, the item,
+ * its `content`, then `number`. `projectId`/`contentId` now ride the raw
+ * `-f` flag rather than the typed `-F` flag: this is new code (a rewrite of
+ * the prior defective document), not the pre-existing exception
+ * `src/github-sync-operation.cts`'s module header used to name at this call
+ * site.
  */
 function operationFor(logicalKey: string, projectNodeId: string, contentNodeId: string, target: NonNullable<RemoteSnapshot['target']>): MutationOperation {
-  const query = 'mutation($projectId:ID!,$contentId:ID!){ rateLimit { cost remaining resetAt } addProjectV2Item(input:{projectId:$projectId,contentId:$contentId}) { projectV2Item { id content { ... on Issue { number } } } } }';
+  const query = 'mutation($projectId:ID!,$contentId:ID!) { # github-sync:addProjectV2ItemById\n' +
+    'addProjectV2ItemById(input:{projectId:$projectId,contentId:$contentId}) { item { id content { ... on Issue { number } } } } }';
   return {
     kind: OPERATION_KIND.CREATE,
     logicalKey,
-    args: ['api', 'graphql', '-f', `query=${query}`, '-F', `projectId=${projectNodeId}`, '-F', `contentId=${contentNodeId}`],
+    args: ['api', 'graphql', '-f', `query=${query}`, '-f', `projectId=${projectNodeId}`, '-f', `contentId=${contentNodeId}`],
     completionContext: { owner: target.owner, repo: target.repo, repositoryNumber: target.repositoryNumber },
     transport: OPERATION_TRANSPORT.GRAPHQL,
     action: OPERATION_ACTION.CREATE,
-    hasPointsBudget: true,
+    hasPointsBudget: false,
     contentCreation: true,
     captures: [{
       kind: 'node',
       logicalKey,
-      nodeIdPath: 'addProjectV2Item.projectV2Item.id',
-      numberPath: 'addProjectV2Item.projectV2Item.content.number',
+      nodeIdPath: 'addProjectV2ItemById.item.id',
+      numberPath: 'addProjectV2ItemById.item.content.number',
     }],
   };
 }

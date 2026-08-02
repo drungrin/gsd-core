@@ -33,10 +33,12 @@
  * field/option/label/milestone name, title, colour, or description — rides
  * the raw `-f` flag. The typed `-F` flag is permitted only for validated
  * positive integers and for opaque node ids GitHub itself minted that GSD is
- * echoing back verbatim (the pre-existing case in
- * `src/github-sync-reconcile.cts:50`). New bootstrap code puts node ids on
- * the raw flag too: there is no typing benefit and the raw flag is strictly
- * safer. This module does not itself choose `-f`/`-F` — that choice lives in
+ * echoing back verbatim. As of plan 04-01, no call site in this codebase
+ * exercises that permission: `src/github-sync-reconcile.cts`'s add-to-project
+ * operation (the prior sole exception) was rewritten to put its node ids on
+ * the raw flag too, closing the one case that used to justify the typed
+ * flag's node-id allowance. New code puts node ids on the raw flag: there is
+ * no typing benefit and the raw flag is strictly safer. This module does not itself choose `-f`/`-F` — that choice lives in
  * each `ArgvEntry`'s literal flag string, supplied by the operation's
  * builder — but the rule is recorded here so no builder has to rediscover
  * it.

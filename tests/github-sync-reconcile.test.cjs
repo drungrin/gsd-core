@@ -48,25 +48,52 @@ test('planReconciliation emits a create operation with opaque project and issue 
   assert.deepEqual(operation.captures[0], {
     kind: 'node',
     logicalKey: 'phase:01',
-    nodeIdPath: 'addProjectV2Item.projectV2Item.id',
-    numberPath: 'addProjectV2Item.projectV2Item.content.number',
+    nodeIdPath: 'addProjectV2ItemById.item.id',
+    numberPath: 'addProjectV2ItemById.item.content.number',
   });
   assert.equal(operation.transport, 'graphql');
   assert.equal(operation.action, 'create');
-  assert.equal(operation.hasPointsBudget, true);
+  assert.equal(operation.hasPointsBudget, false);
   assert.equal(operation.contentCreation, true);
   assert.ok(operation.args.includes('api'));
   assert.ok(operation.args.includes('graphql'));
-  assert.equal(operation.args.filter((arg) => arg === '-f').length, 1);
   const query = operation.args.find((arg) => arg.startsWith('query='));
   assert.ok(query?.startsWith('query=mutation'));
-  assert.match(query, /rateLimit \{ cost remaining resetAt \}/);
-  assert.match(query, /addProjectV2Item\(input:/);
-  assert.match(query, /projectV2Item \{ id content \{ \.\.\. on Issue \{ number \} \} \}/);
-  assert.deepEqual(operation.args.filter((arg) => arg === '-F').length, 2);
+  // LIVE FINDING (plan 04-01, gh 2.96.0, 2026-08-02): rateLimit does not exist
+  // on GitHub's Mutation root type — the document must select no such field,
+  // and the operation must declare no points budget for it.
+  assert.doesNotMatch(query, /rateLimit/);
+  assert.match(query, /addProjectV2ItemById\(input:/);
+  // The live probe found only `addProjectV2ItemById` on Mutation (no bare
+  // `addProjectV2Item`) — assert its absence specifically, not merely that
+  // the `...ById` form is present, so a future partial revert is caught.
+  // (A literal "addProjectV2Item(" with no "ById" in between never matches
+  // the confirmed mutation name, which always has "ById" before its paren.)
+  assert.doesNotMatch(query, /addProjectV2Item\(/);
+  assert.match(query, /item \{ id content \{ \.\.\. on Issue \{ number \} \} \}/);
+  assert.deepEqual(operation.args.filter((arg) => arg === '-F').length, 0);
   assert.ok(operation.args.includes('projectId=PVT_proj_node_1'));
   assert.ok(operation.args.includes('contentId=ISSUE_NODE_101'));
   assert.equal(operation.args.some((arg) => /^projectId=7$/.test(arg) || /^contentId=0?2$/.test(arg)), false);
+
+  // The mutation name and both capture paths must all agree on the same
+  // root payload key, so a future rename of one cannot silently desync from
+  // the others.
+  const mutationNameMatch = /(addProjectV2ItemById)\(input:/.exec(query);
+  assert.ok(mutationNameMatch);
+  const mutationName = mutationNameMatch[1];
+  assert.ok(operation.captures[0].nodeIdPath.startsWith(`${mutationName}.`));
+  assert.ok(operation.captures[0].numberPath.startsWith(`${mutationName}.`));
+
+  // Every GraphQL variable carrying an opaque node id rides the raw value
+  // flag (`-f`), never the typed flag (`-F`) — walk the argv array and check
+  // the flag immediately preceding each projectId=/contentId= value.
+  for (let index = 0; index < operation.args.length - 1; index += 1) {
+    const value = operation.args[index + 1];
+    if (typeof value === 'string' && (value.startsWith('projectId=') || value.startsWith('contentId='))) {
+      assert.equal(operation.args[index], '-f', `expected raw flag before ${value}`);
+    }
+  }
 });
 
 test('planReconciliation ignores coincidental remote issue numbers and blocks identity when no stable binding exists', () => {
