@@ -1206,6 +1206,30 @@ gsd capability remove my-cap --scope project          # Turn the installed overl
 
 **Programmatic access:** `node gsd-tools.cjs capability <subcommand>` — see [CLI Tools Reference](CLI-TOOLS.md).
 
+### `gsd-tools github-sync`
+
+Mirror `.planning/` phase and plan state into a GitHub Project v2 board, one-way (disk →
+GitHub). Default-off (`github_sync.enabled: false`); with it off, every subcommand — including
+`init` — is a silent no-op. See the [`github-sync` command reference](reference/github-sync.md)
+for the full contract, including what `init` creates, what it records without creating, and its
+deliberate non-actions.
+
+| Subcommand | Description |
+|------------|-------------|
+| `preflight` | Probe whether the configured `gh` credentials can reach GitHub Projects v2 |
+| `status [--raw]` | Read-only report of what a `sync` run would create, update, or leave unchanged |
+| `sync [--raw]` | Reconcile phase/plan state into GitHub Issues linked to the Project board |
+| `init [--raw]` | Idempotent Project bootstrap/repair — creates or adopts the board, its five custom fields, the reconciled `Status` options, the two GSD labels, and one Milestone per GSD milestone |
+
+```bash
+gsd-tools github-sync preflight        # Verify gh credentials can reach Projects v2
+gsd-tools github-sync init --raw       # Bootstrap or repair the board; machine-readable report
+gsd-tools github-sync status           # What sync would do, without doing it
+gsd-tools github-sync sync             # Reconcile phase/plan Issues
+```
+
+**Programmatic access:** `node gsd-tools.cjs github-sync <preflight|status|sync|init>` — see [CLI Tools Reference](CLI-TOOLS.md).
+
 ---
 
 ## Brownfield Commands

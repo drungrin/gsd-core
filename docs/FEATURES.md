@@ -3369,3 +3369,17 @@ The load-bearing wire is the `plan-phase` lift into `must_haves.prohibitions`, s
 **Backward compatibility:** A project with no `.planning/WINDOWS.md` reports `open_count: 0` and ships cleanly; the gate only activates once windows are recorded.
 
 **Configuration:** `graphify.graph_path`
+
+---
+
+### 159. GitHub Project Sync (`github-sync`)
+
+**Command:** `gsd-tools github-sync <preflight|status|sync|init>`
+
+**Purpose:** A default-off, first-party capability that mirrors `.planning/` phase and plan state into a GitHub Project v2 board, one-way (disk → GitHub) (#2763).
+
+**Behavior:** `init` is an idempotent bootstrap-and-repair command — it creates a Project v2 board under the repository owner (or adopts and records an already-existing one), the five typed GSD custom fields, the reconciled built-in `Status` options, the `gsd:phase`/`gsd:plan` labels, and one GitHub Milestone per GSD milestone. Running `init` again, or against a board built by hand, converges to zero mutations while still recording every object it finds. `sync` reconciles phase/plan state into linked Issues; `status` reports what `sync` would do without doing it; `preflight` verifies the configured `gh` credentials can reach Projects v2 (the `project` OAuth scope). Every subcommand degrades to a named, actionable failure — missing `gh`, no token, wrong scope, rate limit, GitHub outage — without ever gating the GSD loop (`onError: skip`).
+
+**Configuration:** `github_sync.enabled` (default `false`), `github_sync.target.*`, `github_sync.project_title`.
+
+**Reference:** [`github-sync` command reference](reference/github-sync.md)

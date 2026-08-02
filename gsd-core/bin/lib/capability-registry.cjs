@@ -1395,7 +1395,7 @@ const capabilities = {
     "role": "feature",
     "version": "1.8.0",
     "title": "GitHub Project mirror",
-    "description": "Mirrors `.planning/` phase and plan state into a GitHub Project v2 board, one-way (disk → GitHub). Default-off. Phase 1 ships only the capability shell and an auth preflight (`gsd-tools github-sync preflight`); the sync engine, bootstrap, and issue/sub-issue writes land in later phases.",
+    "description": "Mirrors `.planning/` phase and plan state into a GitHub Project v2 board, one-way (disk → GitHub). Default-off. Ships an auth preflight (`gsd-tools github-sync preflight`), a read-only status report (`status`), a reconciling sync engine for phase/plan issues (`sync`), and an idempotent Project bootstrap that creates and repairs the board itself — fields, the Status merge, labels, and milestones (`init`).",
     "tier": "full",
     "requires": [],
     "engines": {
