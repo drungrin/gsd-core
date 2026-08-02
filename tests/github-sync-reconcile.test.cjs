@@ -3,7 +3,10 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { planReconciliation, OPERATION_KIND, OPERATION_REASON, issueKeyFor } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
+const {
+  planReconciliation, OPERATION_KIND, OPERATION_REASON, issueKeyFor,
+  buildFieldValueOperations,
+} = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
 const { GSD_LABELS, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const { renderPhaseRegion, contentHash, renderFieldState } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
@@ -172,12 +175,12 @@ function remoteWith(overrides) {
   };
 }
 
-test('a phase absent from the map, with a checkpointed milestone, produces exactly the two create operations in order', () => {
+test('a phase absent from the map, with a checkpointed milestone but no field completions, produces exactly the two create operations and one field_unresolved blocked entry (plan 04-05: zero field operations, never a partial write)', () => {
   const single = desiredWithMilestone([{ id: '04', title: 'Phase Four', goal: 'ship it' }]);
   const map = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 } } } };
 
   const plan = planReconciliation(single, remoteWith(), map);
-  assert.deepEqual(plan.blocked, []);
+  assert.deepEqual(plan.blocked, [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: 'field:gsd-id has no resolved completion' }]);
   assert.deepEqual(plan.operations.map((entry) => entry.logicalKey), [issueKeyFor('04'), 'phase:04']);
   assert.equal(plan.operations[0].action, OPERATION_KIND.CREATE);
   assert.equal(plan.operations[0].transport, 'rest');
@@ -409,24 +412,38 @@ test('a completion carrying no content hash at all is treated as a mismatch and 
   assert.equal(plan.pendingIssueUpdates.length, 1);
 });
 
-test('a create operation attaches the content hash to its REST capture and the field state to the add-to-project capture, so an immediate re-plan is a no-op with no extra write', () => {
-  const phase = { id: '05', title: 'Phase Five', goal: 'ship' };
+test('a create operation attaches the content hash to its REST capture and the field state to the LAST field-value operation\'s capture (never the add-to-project capture), so an immediate re-plan is a no-op with no extra write', () => {
+  const phase = { id: '05', title: 'Phase Five', goal: 'ship', requirements: [], status: 'Todo' };
   const single = desiredWithMilestone([phase]);
-  const map = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 } } } };
+  const bootstrapCompletions = {
+    [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+    'field:gsd-id': { nodeId: 'FIELD_GSD_ID' },
+    'field:phase': { nodeId: 'FIELD_PHASE' },
+    'field:requirements': { nodeId: 'FIELD_REQUIREMENTS' },
+    'field:status': { nodeId: 'FIELD_STATUS' },
+    'option:status:todo': { nodeId: 'OPTION_TODO' },
+  };
+  const map = { kind: 'valid', map: { completions: bootstrapCompletions } };
 
   const plan = planReconciliation(single, remoteWith(), map);
-  const [createOp, addOp] = plan.operations;
+  assert.deepEqual(plan.blocked, []);
+  assert.equal(plan.operations.length, 6);
+  const [createOp, addOp, gsdIdOp, phaseOp, requirementsOp, statusOp] = plan.operations;
   assert.equal(typeof createOp.captures[0].plannerFields.contentHash, 'string');
   assert.ok(createOp.captures[0].plannerFields.contentHash.length > 0);
-  assert.equal(typeof addOp.captures[0].plannerFields.fieldState, 'string');
-  assert.deepEqual(JSON.parse(addOp.captures[0].plannerFields.fieldState), { gsdId: 'phase:05', phaseId: '05', requirements: [], status: '' });
+  assert.equal(addOp.captures[0].plannerFields, undefined, 'plan 04-05: fieldState no longer rides the add-to-project capture');
+  assert.equal(gsdIdOp.captures[0].plannerFields, undefined);
+  assert.equal(phaseOp.captures[0].plannerFields, undefined);
+  assert.equal(requirementsOp.captures[0].plannerFields, undefined);
+  assert.equal(typeof statusOp.captures[0].plannerFields.fieldState, 'string');
+  assert.deepEqual(JSON.parse(statusOp.captures[0].plannerFields.fieldState), { gsdId: 'phase:05', phaseId: '05', requirements: [], status: 'Todo' });
 
   const resultingMap = {
     kind: 'valid',
     map: {
       completions: {
-        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
-        'phase:05': { nodeId: 'item-05-node', issueNumber: 900, fieldState: addOp.captures[0].plannerFields.fieldState },
+        ...bootstrapCompletions,
+        'phase:05': { nodeId: 'item-05-node', issueNumber: 900, fieldState: statusOp.captures[0].plannerFields.fieldState },
         'issue:phase:05': { nodeId: 'ISSUE_NODE_900', issueNumber: 900, contentHash: createOp.captures[0].plannerFields.contentHash },
       },
     },
@@ -509,4 +526,257 @@ test('orphan entries are emitted in ascending logical-key order and are stable a
   const second = planReconciliation(single, remoteWith(), map);
   assert.deepEqual(first.orphans, [{ logicalKey: 'phase:02', issueNumber: 20 }, { logicalKey: 'phase:10', issueNumber: 100 }]);
   assert.deepEqual(first.orphans, second.orphans);
+});
+
+// ─── Plan 04-05 Task 2: item field values (buildFieldValueOperations) ─────
+
+const FIELD_KEY = {
+  gsdId: BOOTSTRAP_LOGICAL_KEY.field('GSD ID'),
+  phase: BOOTSTRAP_LOGICAL_KEY.field('Phase'),
+  requirements: BOOTSTRAP_LOGICAL_KEY.field('Requirements'),
+  status: BOOTSTRAP_LOGICAL_KEY.field('Status'),
+};
+
+function fieldBootstrapCompletions() {
+  return {
+    [FIELD_KEY.gsdId]: { nodeId: 'FIELD_GSD_ID' },
+    [FIELD_KEY.phase]: { nodeId: 'FIELD_PHASE' },
+    [FIELD_KEY.requirements]: { nodeId: 'FIELD_REQUIREMENTS' },
+    [FIELD_KEY.status]: { nodeId: 'FIELD_STATUS' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('Todo')]: { nodeId: 'OPTION_TODO' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('In Progress')]: { nodeId: 'OPTION_IN_PROGRESS' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('Done')]: { nodeId: 'OPTION_DONE' },
+  };
+}
+
+const CONTEXT = { owner: 'octo', repo: 'repo', repositoryNumber: 42 };
+
+function fieldIdOf(op) {
+  return op.args.find((arg) => typeof arg === 'string' && arg.startsWith('fieldId=')).slice('fieldId='.length);
+}
+function queryOf(op) {
+  return op.args.find((arg) => typeof arg === 'string' && arg.startsWith('query=')).slice('query='.length);
+}
+
+test('buildFieldValueOperations: a phase whose field state is unknown produces exactly four operations, in the order GSD ID, Phase, Requirements, Status', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: ['PHASE-01'], status: 'In Progress' };
+  const result = buildFieldValueOperations(phase, ['gsdId', 'phaseId', 'requirements', 'status'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  assert.deepEqual(result.blocked, []);
+  assert.equal(result.operations.length, 4);
+  assert.deepEqual(result.operations.map(fieldIdOf), ['FIELD_GSD_ID', 'FIELD_PHASE', 'FIELD_REQUIREMENTS', 'FIELD_STATUS']);
+});
+
+test('buildFieldValueOperations: a changed set of exactly one field ("status") produces exactly one operation, the status one', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: [], status: 'Done' };
+  const result = buildFieldValueOperations(phase, ['status'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  assert.equal(result.operations.length, 1);
+  assert.equal(fieldIdOf(result.operations[0]), 'FIELD_STATUS');
+});
+
+test('buildFieldValueOperations: an empty changed set produces zero operations and zero blocked entries', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: [], status: 'Done' };
+  const result = buildFieldValueOperations(phase, [], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  assert.deepEqual(result, { operations: [], blocked: [] });
+});
+
+test('planReconciliation: two phases both needing all four field writes produce eight operations grouped by phase, each phase\'s four contiguous and in the fixed order, phases in ascending id order', () => {
+  const phaseA = { id: '02', title: 'A', goal: 'ga', requirements: ['PHASE-01'], status: 'Todo' };
+  const phaseB = { id: '10', title: 'B', goal: 'gb', requirements: ['PHASE-02'], status: 'Done' };
+  // Deliberately supplied out of id order: planReconciliation's own sort is
+  // what must produce the ascending-id ordering guarantee, not input order.
+  const desiredTwo = {
+    available: true, reason: 'ok', currentPhase: '02',
+    phases: [phaseB, phaseA],
+    plans: [],
+    milestones: [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }],
+  };
+  const hashA = contentHash({ title: phaseA.title, region: renderPhaseRegion(phaseA), milestoneNumber: 3 });
+  const hashB = contentHash({ title: phaseB.title, region: renderPhaseRegion(phaseB), milestoneNumber: 3 });
+  const remoteTwo = {
+    available: true, reason: 'ok',
+    target: { owner: 'octo', repo: 'repo', repositoryNumber: 42, projectNumber: 7, projectNodeId: 'PVT_proj_node_1' },
+    items: [
+      { id: 'item-02', content: { id: 'ISSUE_NODE_02', number: 20 } },
+      { id: 'item-10', content: { id: 'ISSUE_NODE_10', number: 100 } },
+    ],
+    fields: [], subIssues: [], issueNodeIds: {},
+  };
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        ...fieldBootstrapCompletions(),
+        // Neither phase carries a fieldState at all (unknown -> all 4 changed).
+        'phase:02': { nodeId: 'item-02', issueNumber: 20 },
+        'issue:phase:02': { nodeId: 'ISSUE_NODE_02', issueNumber: 20, contentHash: hashA },
+        'phase:10': { nodeId: 'item-10', issueNumber: 100 },
+        'issue:phase:10': { nodeId: 'ISSUE_NODE_10', issueNumber: 100, contentHash: hashB },
+      },
+    },
+  };
+
+  const plan = planReconciliation(desiredTwo, remoteTwo, map);
+  assert.deepEqual(plan.blocked, []);
+  assert.deepEqual(plan.pendingIssueUpdates, []);
+  assert.equal(plan.operations.length, 8);
+  assert.deepEqual(plan.operations.map((op) => op.logicalKey), [
+    'phase:02', 'phase:02', 'phase:02', 'phase:02',
+    'phase:10', 'phase:10', 'phase:10', 'phase:10',
+  ]);
+  assert.deepEqual(plan.operations.map(fieldIdOf), [
+    'FIELD_GSD_ID', 'FIELD_PHASE', 'FIELD_REQUIREMENTS', 'FIELD_STATUS',
+    'FIELD_GSD_ID', 'FIELD_PHASE', 'FIELD_REQUIREMENTS', 'FIELD_STATUS',
+  ]);
+  // Only the last operation of each phase's four carries the field state.
+  assert.deepEqual(plan.operations.map((op) => op.captures[0].plannerFields !== undefined), [
+    false, false, false, true, false, false, false, true,
+  ]);
+});
+
+test('buildFieldValueOperations: the three TEXT operations use the text document (wrapper key "text"); the status operation uses the single-select document (wrapper key "singleSelectOptionId")', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: ['R1'], status: 'Todo' };
+  const result = buildFieldValueOperations(phase, ['gsdId', 'phaseId', 'requirements', 'status'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  const [gsdIdOp, phaseOp, requirementsOp, statusOp] = result.operations;
+  for (const op of [gsdIdOp, phaseOp, requirementsOp]) {
+    assert.match(queryOf(op), /\{text:\$value\}/);
+    assert.doesNotMatch(queryOf(op), /singleSelectOptionId/);
+  }
+  assert.match(queryOf(statusOp), /\{singleSelectOptionId:\$value\}/);
+  assert.doesNotMatch(queryOf(statusOp), /\{text:\$value\}/);
+});
+
+test('buildFieldValueOperations: neither document declares a points-budget selection, and neither operation declares a points budget', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: ['R1'], status: 'Todo' };
+  const result = buildFieldValueOperations(phase, ['gsdId', 'phaseId', 'requirements', 'status'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  for (const op of result.operations) {
+    assert.equal(op.hasPointsBudget, false);
+    assert.equal(op.contentCreation, false);
+    assert.doesNotMatch(queryOf(op), /rateLimit/);
+  }
+});
+
+test('buildFieldValueOperations: every developer-sourced value (the phase id, the requirement list, the logical key) rides the raw value flag; no value rides the typed flag', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: ['R1', 'R2'], status: 'Todo' };
+  const result = buildFieldValueOperations(phase, ['gsdId', 'phaseId', 'requirements', 'status'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  for (const op of result.operations) {
+    assert.equal(op.args.filter((arg) => arg === '-F').length, 0, 'no -F flag anywhere in a field-value operation');
+  }
+  const requirementsOp = result.operations[2];
+  assert.ok(requirementsOp.args.includes('value=R1, R2'));
+});
+
+test('buildFieldValueOperations: the status operation\'s value is an ArgvRef resolving the option:status:<slug> completion\'s node id, not a literal name and not a literal id', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: [], status: 'Todo' };
+  const completions = fieldBootstrapCompletions();
+  const result = buildFieldValueOperations(phase, ['status'], completions, 'phase:04', CONTEXT);
+  const [statusOp] = result.operations;
+  const valueArg = statusOp.args.find((arg) => typeof arg === 'object' && arg.prefix === 'value=');
+  assert.ok(valueArg, 'the status value must be an ArgvRef object, not a literal string');
+  assert.deepEqual(valueArg, { from: BOOTSTRAP_LOGICAL_KEY.statusOption('Todo'), part: 'nodeId', prefix: 'value=' });
+  assert.equal(statusOp.args.includes('value=Todo'), false, 'must not be a literal status name');
+  assert.equal(statusOp.args.includes(`value=${completions[BOOTSTRAP_LOGICAL_KEY.statusOption('Todo')].nodeId}`), false, 'must not be a literal option id');
+});
+
+test('buildFieldValueOperations: the item id in every operation is an ArgvRef resolving from the phase\'s own project-item completion, and the project id resolves from the project completion', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: [], status: 'Todo' };
+  const result = buildFieldValueOperations(phase, ['gsdId'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  const [op] = result.operations;
+  const itemIdArg = op.args.find((arg) => typeof arg === 'object' && arg.prefix === 'itemId=');
+  assert.deepEqual(itemIdArg, { from: 'phase:04', part: 'nodeId', prefix: 'itemId=' });
+  const projectIdArg = op.args.find((arg) => typeof arg === 'object' && arg.prefix === 'projectId=');
+  assert.deepEqual(projectIdArg, { from: BOOTSTRAP_LOGICAL_KEY.project(), part: 'nodeId', prefix: 'projectId=' });
+});
+
+test('buildFieldValueOperations: Wave and Autonomous never produce an operation, even when both fields exist as completions in the map', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: [], status: 'Todo' };
+  const completions = {
+    ...fieldBootstrapCompletions(),
+    [BOOTSTRAP_LOGICAL_KEY.field('Wave')]: { nodeId: 'FIELD_WAVE' },
+    [BOOTSTRAP_LOGICAL_KEY.field('Autonomous')]: { nodeId: 'FIELD_AUTONOMOUS' },
+  };
+  const result = buildFieldValueOperations(phase, ['gsdId', 'phaseId', 'requirements', 'status'], completions, 'phase:04', CONTEXT);
+  assert.equal(result.operations.length, 4);
+  for (const op of result.operations) {
+    assert.ok(!op.args.some((arg) => typeof arg === 'string' && (arg.includes('FIELD_WAVE') || arg.includes('FIELD_AUTONOMOUS'))));
+  }
+});
+
+test('buildFieldValueOperations: a missing field:requirements completion produces zero operations and one typed blocked entry naming the unresolved field', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: ['R1'], status: 'Todo' };
+  const completions = fieldBootstrapCompletions();
+  delete completions[FIELD_KEY.requirements];
+  const result = buildFieldValueOperations(phase, ['gsdId', 'phaseId', 'requirements', 'status'], completions, 'phase:04', CONTEXT);
+  assert.deepEqual(result.operations, []);
+  assert.deepEqual(result.blocked, [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${FIELD_KEY.requirements} has no resolved completion` }]);
+});
+
+test('buildFieldValueOperations: a missing option:status:<slug> completion for the phase\'s derived status produces zero operations and one typed blocked entry', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: [], status: 'Blocked' };
+  const result = buildFieldValueOperations(phase, ['status'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  assert.deepEqual(result.operations, []);
+  assert.deepEqual(result.blocked, [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${BOOTSTRAP_LOGICAL_KEY.statusOption('Blocked')} has no resolved completion` }]);
+});
+
+test('planReconciliation: a phase whose field:requirements completion is absent produces zero field operations for that phase and one typed blocked entry — and does not suppress a sibling phase in the same run', () => {
+  const phaseA = { id: '02', title: 'A', goal: 'ga', requirements: ['R1'], status: 'Todo' }; // unknown field state -> needs all four
+  const phaseB = { id: '03', title: 'B', goal: 'gb', requirements: [], status: 'Done' }; // stale in status only
+  const desiredTwo = {
+    available: true, reason: 'ok', currentPhase: '02',
+    phases: [phaseA, phaseB],
+    plans: [],
+    milestones: [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }],
+  };
+  const hashA = contentHash({ title: phaseA.title, region: renderPhaseRegion(phaseA), milestoneNumber: 3 });
+  const hashB = contentHash({ title: phaseB.title, region: renderPhaseRegion(phaseB), milestoneNumber: 3 });
+  const remoteTwo = {
+    available: true, reason: 'ok',
+    target: { owner: 'octo', repo: 'repo', repositoryNumber: 42, projectNumber: 7, projectNodeId: 'PVT_proj_node_1' },
+    items: [
+      { id: 'item-02', content: { id: 'ISSUE_NODE_02', number: 20 } },
+      { id: 'item-03', content: { id: 'ISSUE_NODE_03', number: 30 } },
+    ],
+    fields: [], subIssues: [], issueNodeIds: {},
+  };
+  const noRequirementsFieldCompletions = fieldBootstrapCompletions();
+  delete noRequirementsFieldCompletions[FIELD_KEY.requirements];
+  const staleStatusOnlyFieldState = renderFieldState({ gsdId: 'phase:03', phaseId: '03', requirements: [], status: 'Todo' });
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        ...noRequirementsFieldCompletions,
+        'phase:02': { nodeId: 'item-02', issueNumber: 20 },
+        'issue:phase:02': { nodeId: 'ISSUE_NODE_02', issueNumber: 20, contentHash: hashA },
+        'phase:03': { nodeId: 'item-03', issueNumber: 30, fieldState: staleStatusOnlyFieldState },
+        'issue:phase:03': { nodeId: 'ISSUE_NODE_03', issueNumber: 30, contentHash: hashB },
+      },
+    },
+  };
+
+  const plan = planReconciliation(desiredTwo, remoteTwo, map);
+  assert.deepEqual(plan.blocked, [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${FIELD_KEY.requirements} has no resolved completion` }]);
+  assert.equal(plan.operations.length, 1);
+  assert.equal(plan.operations[0].logicalKey, 'phase:03');
+  assert.equal(fieldIdOf(plan.operations[0]), 'FIELD_STATUS');
+});
+
+test('buildFieldValueOperations: a one-operation case still carries the field state on its own capture (the "last" operation is also the "only" operation)', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: [], status: 'Done' };
+  const result = buildFieldValueOperations(phase, ['status'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  assert.equal(result.operations.length, 1);
+  assert.equal(typeof result.operations[0].captures[0].plannerFields.fieldState, 'string');
+});
+
+test('buildFieldValueOperations: every operation\'s capture is keyed on the phase\'s project-item key and declares both a node-id path and a number path', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: ['R1'], status: 'Todo' };
+  const result = buildFieldValueOperations(phase, ['gsdId', 'phaseId', 'requirements', 'status'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  for (const op of result.operations) {
+    assert.equal(op.captures.length, 1);
+    assert.equal(op.captures[0].kind, 'node');
+    assert.equal(op.captures[0].logicalKey, 'phase:04');
+    assert.ok(op.captures[0].nodeIdPath.length > 0);
+    assert.ok(op.captures[0].numberPath.length > 0);
+  }
 });

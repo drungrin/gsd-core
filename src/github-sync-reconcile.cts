@@ -11,7 +11,7 @@ import issueBodyMod = require('./github-sync-issue-body.cjs');
 import type { FieldValues, FieldName, ParsedFieldState } from './github-sync-issue-body.cts';
 
 const { OPERATION_TRANSPORT, OPERATION_ACTION, ARGV_REF_PART } = operationMod;
-const { BOOTSTRAP_LOGICAL_KEY, GSD_LABELS } = bootstrapPlanMod;
+const { BOOTSTRAP_LOGICAL_KEY, GSD_LABELS, STATUS_FIELD_NAME } = bootstrapPlanMod;
 const { renderNewIssueBody, renderPhaseRegion, contentHash, renderFieldState, parseFieldState, changedFields } = issueBodyMod;
 
 const OPERATION_KIND = Object.freeze({ CREATE: 'create', UPDATE: 'update' } as const);
@@ -39,6 +39,12 @@ const OPERATION_REASON = Object.freeze({
   // `sync` handler) — but `blocked`'s reason union is widened here so a
   // future caller that folds the two together type-checks without a cast.
   REGION_DAMAGED: 'region_damaged',
+  // Plan 04-05 Task 2 (T-04-18): a phase whose `field:<slug>` or
+  // `option:status:<slug>` completion is absent from the map — a field write
+  // is never dispatched against an id that does not exist. Scoped to the one
+  // phase whose id the field/option belongs to; every other phase in the
+  // same run is unaffected.
+  FIELD_UNRESOLVED: 'field_unresolved',
 } as const);
 
 /** The `gsd:phase` label's own name, as declared in `GSD_LABELS` (github-sync-bootstrap-plan.cts) — never re-spelled. */
@@ -68,6 +74,8 @@ interface DesiredPhase {
   id: string;
   title: string;
   goal: string;
+  /** Plan 04-05: optional for the same fixture-compatibility reason as `requirements`/`status`; feeds `renderPhaseRegion`'s Success Criteria section. */
+  successCriteria?: string[];
   /** Plan 04-04: optional so pre-04-02-shaped fixtures still type-check; `readDesiredState` always supplies it now. */
   requirements?: string[];
   /** Plan 04-04: optional for the same reason as `requirements`. */
@@ -124,7 +132,8 @@ interface ReconciliationPlan {
       | typeof OPERATION_REASON.IDENTITY_UNRESOLVABLE
       | typeof OPERATION_REASON.MILESTONE_UNRESOLVED
       | typeof OPERATION_REASON.UNSAFE_TARGET
-      | typeof OPERATION_REASON.REGION_DAMAGED;
+      | typeof OPERATION_REASON.REGION_DAMAGED
+      | typeof OPERATION_REASON.FIELD_UNRESOLVED;
     detail?: string;
   }>;
   uncertain: Array<{ reason: typeof OPERATION_REASON.REMOTE_UNAVAILABLE }>;
@@ -182,6 +191,172 @@ function desiredFieldValuesFor(phase: DesiredPhase, logicalKey: string): FieldVa
     requirements: phase.requirements ?? [],
     status: phase.status ?? '',
   };
+}
+
+/**
+ * Plan 04-05 Task 2: the four item fields, in the fixed declared write order
+ * (D-15/D-16) — `GSD ID`, `Phase`, `Requirements`, `Status`. Mirrors
+ * `github-sync-issue-body.cts`'s `FIELD_NAMES` order exactly, so a run's
+ * emitted operations group by phase with each phase's writes contiguous and
+ * in this same order. `Wave` and `Autonomous` never appear here: both are
+ * plan-level facts belonging to Phase 5 (D-15) — a phase-level guess written
+ * into them would have to be unwritten later.
+ */
+const FIELD_VALUE_DATA_TYPE = Object.freeze({ TEXT: 'TEXT', SINGLE_SELECT: 'SINGLE_SELECT' } as const);
+type FieldValueDataType = typeof FIELD_VALUE_DATA_TYPE[keyof typeof FIELD_VALUE_DATA_TYPE];
+const FIELD_VALUE_SPEC: ReadonlyArray<{ fieldName: FieldName; declaredName: string; dataType: FieldValueDataType }> = Object.freeze([
+  Object.freeze({ fieldName: 'gsdId' as const, declaredName: 'GSD ID', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
+  Object.freeze({ fieldName: 'phaseId' as const, declaredName: 'Phase', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
+  Object.freeze({ fieldName: 'requirements' as const, declaredName: 'Requirements', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
+  Object.freeze({ fieldName: 'status' as const, declaredName: STATUS_FIELD_NAME, dataType: FIELD_VALUE_DATA_TYPE.SINGLE_SELECT }),
+]);
+
+/**
+ * RESEARCH.md Pitfall 4: `gh api graphql`'s `-f`/`-F` flags cannot encode
+ * `updateProjectV2ItemFieldValue`'s `value` argument (a oneof-style input
+ * object) as a single flag value — every published example inlines the whole
+ * object with the value interpolated, which would concatenate a
+ * developer-influenced string into a query document
+ * (`github-sync-operation.cts`'s SECURITY rule forbids this outright). The
+ * resolution mirrors `CREATE_FIELD_TEXT_DOCUMENT`/
+ * `CREATE_FIELD_SINGLE_SELECT_DOCUMENT` (github-sync-bootstrap-plan.cts) in
+ * shape: one document per data type, the wrapper key (`text`/
+ * `singleSelectOptionId`) a literal in the query text, only the scalar leaf
+ * riding a variable. Both documents select
+ * `projectV2Item { id content { ... on Issue { number } } }`, not merely
+ * `id` — so re-recording the phase's project-item completion after a field
+ * write preserves the issue number the add-to-project capture stored;
+ * selecting only `id` would silently drop it. No `rateLimit` selection and
+ * no points-budget selection, for the same live-verified reason every other
+ * document in this capability declares `hasPointsBudget: false`.
+ */
+const UPDATE_FIELD_VALUE_TEXT_DOCUMENT =
+  'mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:String!) { # github-sync:updateFieldValueText\n' +
+  'updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,fieldId:$fieldId,value:{text:$value}}) { ' +
+  'projectV2Item { id content { ... on Issue { number } } } } }';
+const UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT =
+  'mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:String!) { # github-sync:updateFieldValueSingleSelect\n' +
+  'updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,fieldId:$fieldId,value:{singleSelectOptionId:$value}}) { ' +
+  'projectV2Item { id content { ... on Issue { number } } } } }';
+
+/** Mirrors `fieldCreateDocument`'s shape (github-sync-bootstrap-plan.cts). */
+function documentForFieldType(dataType: FieldValueDataType): string {
+  return dataType === FIELD_VALUE_DATA_TYPE.SINGLE_SELECT ? UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT : UPDATE_FIELD_VALUE_TEXT_DOCUMENT;
+}
+
+/** The raw text value for one of the three TEXT fields (never called for `status`, whose value is an `ArgvRef`). */
+function textValueFor(fieldName: FieldName, values: FieldValues): string {
+  if (fieldName === 'gsdId') return values.gsdId;
+  if (fieldName === 'phaseId') return values.phaseId;
+  return values.requirements.join(', ');
+}
+
+/**
+ * Plan 04-05 Task 2: one `MutationOperation` per changed field, in
+ * `FIELD_VALUE_SPEC`'s fixed order. Resolves each changed field's id — and,
+ * for `status`, the phase's derived status option's id — synchronously
+ * against `completions` (the reserved-key catalog Phase 3 populated, never a
+ * live read). The first unresolved id stops the whole phase: zero operations,
+ * one typed `FIELD_UNRESOLVED` blocked entry (T-04-18) — a field write is
+ * never dispatched against an id that does not exist, and one phase's
+ * unresolved field never suppresses a sibling phase in the same run (that
+ * guarantee lives in the caller, which calls this function once per phase).
+ *
+ * Project id and item id ride `ArgvRef`s resolving from the `project`
+ * completion and `projectItemKey`'s own completion — late-bound the same way
+ * `buildCreateIssueOperation`'s milestone reference already is (D-12's
+ * precedent), so a brand-new phase's own item id (recorded earlier in the
+ * same run by the add-to-project operation, under this same logical key)
+ * resolves correctly even though it does not exist yet when this function is
+ * called. The status value is likewise an `ArgvRef` resolving the matched
+ * `option:status:<slug>` completion's node id — never a literal name and
+ * never a literal id. The three text values ride the raw value flag as
+ * literals: the logical key for `GSD ID`, the phase id exactly as it appears
+ * on disk for `Phase`, and the comma-separated requirement IDs for
+ * `Requirements`.
+ *
+ * Only the LAST emitted operation's capture carries
+ * `plannerFields.fieldState` (T-04-19): recording it on an earlier operation
+ * would claim a write that has not happened yet, and leaving it off entirely
+ * would mean the state never converges. An interrupted sequence therefore
+ * leaves the field state unknown, which `changedFields` reads as every field
+ * differing — the next run rewrites all four and converges, never silently
+ * skips a write it cannot justify.
+ */
+function buildFieldValueOperations(
+  phase: DesiredPhase,
+  changed: FieldName[],
+  completions: Record<string, StrictMapCompletion>,
+  projectItemKey: string,
+  context: CompletionContext,
+): { operations: MutationOperation[]; blocked: Array<{ reason: typeof OPERATION_REASON.FIELD_UNRESOLVED; detail: string }> } {
+  if (changed.length === 0) return { operations: [], blocked: [] };
+
+  const changedSet = new Set(changed);
+  const desiredValues = desiredFieldValuesFor(phase, projectItemKey);
+
+  const resolved: Array<{ fieldName: FieldName; dataType: FieldValueDataType; fieldId: string; statusOptionKey?: string }> = [];
+
+  for (const spec of FIELD_VALUE_SPEC) {
+    if (!changedSet.has(spec.fieldName)) continue;
+    const fieldKey = BOOTSTRAP_LOGICAL_KEY.field(spec.declaredName);
+    const fieldCompletion = completions[fieldKey];
+    if (!fieldCompletion || !isNonEmptyString(fieldCompletion.nodeId)) {
+      return { operations: [], blocked: [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${fieldKey} has no resolved completion` }] };
+    }
+
+    let statusOptionKey: string | undefined;
+    if (spec.fieldName === 'status') {
+      statusOptionKey = BOOTSTRAP_LOGICAL_KEY.statusOption(desiredValues.status);
+      const optionCompletion = completions[statusOptionKey];
+      if (!optionCompletion || !isNonEmptyString(optionCompletion.nodeId)) {
+        return { operations: [], blocked: [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${statusOptionKey} has no resolved completion` }] };
+      }
+    }
+
+    resolved.push({ fieldName: spec.fieldName, dataType: spec.dataType, fieldId: fieldCompletion.nodeId, statusOptionKey });
+  }
+
+  const operations: MutationOperation[] = resolved.map((entry, index) => {
+    const isLast = index === resolved.length - 1;
+    const valueEntry: ArgvEntry = entry.statusOptionKey !== undefined
+      ? { from: entry.statusOptionKey, part: ARGV_REF_PART.NODE_ID, prefix: 'value=' }
+      : `value=${textValueFor(entry.fieldName, desiredValues)}`;
+
+    const args: ArgvEntry[] = [
+      'api', 'graphql',
+      '-f', `query=${documentForFieldType(entry.dataType)}`,
+      // SECURITY: projectId/itemId/fieldId are all opaque GitHub node ids and
+      // ride the raw -f flag, never the typed -F flag (github-sync-operation
+      // .cts's module header: new code puts node ids on the raw flag).
+      '-f', { from: BOOTSTRAP_LOGICAL_KEY.project(), part: ARGV_REF_PART.NODE_ID, prefix: 'projectId=' },
+      '-f', { from: projectItemKey, part: ARGV_REF_PART.NODE_ID, prefix: 'itemId=' },
+      '-f', `fieldId=${entry.fieldId}`,
+      '-f', valueEntry,
+    ];
+
+    return {
+      kind: 'update-field-value',
+      logicalKey: projectItemKey,
+      args,
+      completionContext: context,
+      transport: OPERATION_TRANSPORT.GRAPHQL,
+      action: OPERATION_ACTION.UPDATE,
+      hasPointsBudget: false,
+      // A field write creates no content and must not consume the
+      // content-creation pacing budget the two create operations share.
+      contentCreation: false,
+      captures: [{
+        kind: 'node',
+        logicalKey: projectItemKey,
+        nodeIdPath: 'updateProjectV2ItemFieldValue.projectV2Item.id',
+        numberPath: 'updateProjectV2ItemFieldValue.projectV2Item.content.number',
+        ...(isLast ? { plannerFields: { fieldState: renderFieldState(desiredValues) } } : {}),
+      }],
+    };
+  });
+
+  return { operations, blocked: [] };
 }
 
 /**
@@ -428,7 +603,15 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
           completionContext: context,
         });
       }
-      if (changed.length > 0) pendingFieldChanges.push({ logicalKey, changed });
+      if (changed.length > 0) {
+        pendingFieldChanges.push({ logicalKey, changed });
+        // Plan 04-05 Task 2: the builder consumes this same `changed` set
+        // rather than re-deriving the comparison — extends, not replaces,
+        // plan 04-04's seam.
+        const fieldResult = buildFieldValueOperations(phase, changed, completions, logicalKey, context);
+        operations.push(...fieldResult.operations);
+        blocked.push(...fieldResult.blocked);
+      }
       if (contentConverged && changed.length === 0) noops.push({ logicalKey });
       continue;
     }
@@ -465,10 +648,23 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
     const region = renderPhaseRegion(phase);
     const milestoneNumber = milestoneCompletion.issueNumber;
     const desiredHash = contentHash({ title: phase.title, region, milestoneNumber });
-    const desiredFieldValues = desiredFieldValuesFor(phase, logicalKey);
 
     operations.push(buildCreateIssueOperation(phase, issueKey, milestoneKey as string, restApiPath, context, { contentHash: desiredHash }));
-    operations.push(operationFor(logicalKey, remote.target.projectNodeId, { from: issueKey }, remote.target, { fieldState: renderFieldState(desiredFieldValues) }));
+    operations.push(operationFor(logicalKey, remote.target.projectNodeId, { from: issueKey }, remote.target));
+
+    // Plan 04-05 Task 2: a brand-new phase carries no previous field state at
+    // all — every field is "changed" by construction, mirroring
+    // `changedFields({ kind: 'unknown' }, ...)`'s own all-four result — so
+    // every field write is attempted in the same run, late-binding its item
+    // id to this very add-to-project operation's own capture (both share
+    // `logicalKey`). `fieldState` no longer rides the add-to-project
+    // operation's planner fields (plan 04-04's mechanism): it now rides only
+    // the LAST field-value operation's capture, so an interrupted sequence
+    // reads as unknown rather than claiming a write that has not happened.
+    const allFieldNames = changedFields({ kind: 'unknown' }, desiredFieldValuesFor(phase, logicalKey));
+    const fieldResult = buildFieldValueOperations(phase, allFieldNames, completions, logicalKey, context);
+    operations.push(...fieldResult.operations);
+    blocked.push(...fieldResult.blocked);
   }
 
   // Plan 04-04 Task 1 (D-11): a post-loop pass, scoped to the two phase
@@ -493,4 +689,16 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
   return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges };
 }
 
-export = { planReconciliation, OPERATION_KIND, OPERATION_REASON, issueKeyFor, phaseIssueRestPath, PATH_SAFE_TARGET, buildCreateIssueOperation };
+export = {
+  planReconciliation,
+  OPERATION_KIND,
+  OPERATION_REASON,
+  issueKeyFor,
+  phaseIssueRestPath,
+  PATH_SAFE_TARGET,
+  buildCreateIssueOperation,
+  buildFieldValueOperations,
+  documentForFieldType,
+  UPDATE_FIELD_VALUE_TEXT_DOCUMENT,
+  UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT,
+};

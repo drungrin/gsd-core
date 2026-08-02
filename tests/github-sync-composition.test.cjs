@@ -33,9 +33,34 @@ const ID_ALLOWLIST = new Set([
   'I_node_phase_04', 'PVTI_item_phase_04',
   'I_node_phase_04_second', 'PVTI_item_phase_04_second',
   'I_node_phase_05', 'PVTI_item_phase_05',
+  // plan 04-05: the four GSD item fields' own node ids and the status option
+  // ids a bootstrapped board records — resolved through the reserved-key
+  // catalog, never invented by this codebase.
+  'FIELD_GSD_ID', 'FIELD_PHASE', 'FIELD_REQUIREMENTS', 'FIELD_STATUS',
+  'OPTION_TODO', 'OPTION_IN_PROGRESS', 'OPTION_DONE',
 ]);
 const { BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const { renderPhaseRegion, contentHash, renderFieldState } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+
+const FIELD_KEY = {
+  gsdId: BOOTSTRAP_LOGICAL_KEY.field('GSD ID'),
+  phase: BOOTSTRAP_LOGICAL_KEY.field('Phase'),
+  requirements: BOOTSTRAP_LOGICAL_KEY.field('Requirements'),
+  status: BOOTSTRAP_LOGICAL_KEY.field('Status'),
+};
+
+/** Plan 04-05: the four field/option completions a bootstrapped board (`init`) already recorded — the same shape `field(name)`/`statusOption(name)` resolve against, never a live read. */
+function fieldBootstrapCompletions() {
+  return {
+    [FIELD_KEY.gsdId]: { nodeId: 'FIELD_GSD_ID' },
+    [FIELD_KEY.phase]: { nodeId: 'FIELD_PHASE' },
+    [FIELD_KEY.requirements]: { nodeId: 'FIELD_REQUIREMENTS' },
+    [FIELD_KEY.status]: { nodeId: 'FIELD_STATUS' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('Todo')]: { nodeId: 'OPTION_TODO' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('In Progress')]: { nodeId: 'OPTION_IN_PROGRESS' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('Done')]: { nodeId: 'OPTION_DONE' },
+  };
+}
 
 function desired() {
   return {
@@ -82,6 +107,20 @@ function restIssueCreateResponse(nodeId, number) {
     exitCode: 0,
     reason: 'ok',
     stdout: JSON.stringify({ id: 555000 + number, node_id: nodeId, number }),
+    stderr: '',
+  };
+}
+
+/** Plan 04-05: the shape `updateProjectV2ItemFieldValue`'s response actually decodes through — both `UPDATE_FIELD_VALUE_TEXT_DOCUMENT` and `UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT` select this same payload shape. */
+function fieldValueResponse(nodeId, number) {
+  return {
+    exitCode: 0,
+    reason: 'ok',
+    stdout: JSON.stringify({
+      data: {
+        updateProjectV2ItemFieldValue: { projectV2Item: { id: nodeId, content: { number } } },
+      },
+    }),
     stderr: '',
   };
 }
@@ -134,7 +173,11 @@ function assertOpaqueIdPairs(argvCalls) {
   }
 
   assert.ok(idPairs.length > 0, 'expected at least one ID-typed argument');
-  assert.ok([...new Set(idPairs.map(({ key }) => key))].every((key) => key === 'contentId' || key === 'projectId'));
+  // Plan 04-05: field-value operations introduce two more ID-typed argv keys
+  // (itemId, fieldId) — both opaque GitHub node ids, both allowed alongside
+  // the pre-existing contentId/projectId.
+  const ALLOWED_ID_KEYS = new Set(['contentId', 'projectId', 'itemId', 'fieldId']);
+  assert.ok([...new Set(idPairs.map(({ key }) => key))].every((key) => ALLOWED_ID_KEYS.has(key)));
   for (const { raw, value } of idPairs) {
     assert.ok(ID_ALLOWLIST.has(value), `${raw} must use an opaque node ID from the allowlist`);
   }
@@ -312,30 +355,39 @@ function desiredTwoPhases(phaseA, phaseB) {
   };
 }
 
-function seedMilestoneOnlyMap(cwd) {
+/** Plan 04-05: the milestone completion plus a fully bootstrapped board's project/field/option completions — the shape a real `init` run would have already recorded before `sync` ever runs. */
+function seedMilestoneAndFieldsMap(cwd) {
   let map = null;
   map = recordCompletion(map, makeSeedCompletion(PHASE_MILESTONE_KEY, 'MI_node_1', PHASE_MILESTONE_NUMBER));
+  map = recordCompletion(map, makeSeedCompletion(BOOTSTRAP_LOGICAL_KEY.project(), TARGET.projectNodeId, undefined));
+  for (const [logicalKey, completion] of Object.entries(fieldBootstrapCompletions())) {
+    map = recordCompletion(map, makeSeedCompletion(logicalKey, completion.nodeId, undefined));
+  }
   writeSyncMapAtomically(cwd, map);
   const reopened = readSyncMapStrict(cwd, REPOSITORY);
   assert.equal(reopened.kind, 'valid');
   return reopened;
 }
 
-test('one roadmap phase travels end-to-end: REST create then add-to-project, both identity keys recorded, no third phase-scoped key', (t) => {
+test('one roadmap phase travels end-to-end: REST create, add-to-project, and four field writes; both identity keys recorded, no third phase-scoped key', (t) => {
   const cwd = createTempProject('github-sync-composition-tracer-');
   t.after(() => cleanup(cwd));
 
-  const phase = { id: '04', title: 'Phase Four', goal: 'ship the tracer' };
+  const phase = { id: '04', title: 'Phase Four', goal: 'ship the tracer', requirements: ['PHASE-01'], status: 'Todo' };
   const singleDesired = desiredSinglePhase(phase);
-  const seeded = seedMilestoneOnlyMap(cwd);
+  const seeded = seedMilestoneAndFieldsMap(cwd);
   const clock = fixedClock();
   const dispatchedArgv = [];
 
   const plan = planReconciliation(singleDesired, remote([]), seeded);
   assert.deepEqual(plan.blocked, []);
-  assert.deepEqual(plan.operations.map((op) => op.logicalKey), ['issue:phase:04', 'phase:04']);
+  // Plan 04-05: the create branch now also emits the four field-value
+  // writes, all sharing the phase's own project-item logical key.
+  assert.deepEqual(plan.operations.map((op) => op.logicalKey), [
+    'issue:phase:04', 'phase:04', 'phase:04', 'phase:04', 'phase:04', 'phase:04',
+  ]);
   assert.equal(plan.operations[0].transport, 'rest');
-  assert.equal(plan.operations[1].transport, 'graphql');
+  for (const op of plan.operations.slice(1)) assert.equal(op.transport, 'graphql');
 
   const run = applyMutationPlan(plan, {
     cwd,
@@ -343,16 +395,24 @@ test('one roadmap phase travels end-to-end: REST create then add-to-project, bot
     clock,
     execGh(args) {
       dispatchedArgv.push(args);
-      if (dispatchedArgv.length === 1) {
+      const callIndex = dispatchedArgv.length;
+      if (callIndex === 1) {
         // The REST create call: its milestone= value must already be
         // resolved from the seeded map (late-bound, not hardcoded).
         assert.ok(args.includes(`milestone=${PHASE_MILESTONE_NUMBER}`), 'REST create must carry the milestone number resolved from the map');
         return restIssueCreateResponse('I_node_phase_04', 55);
       }
-      // The add-to-project call: its contentId must be the REST create's own
-      // capture from THIS SAME run, not any value known ahead of time.
-      assert.ok(args.includes('contentId=I_node_phase_04'), 'add-to-project must late-bind to the REST create\'s own capture within the same run');
-      return response('PVTI_item_phase_04', 55);
+      if (callIndex === 2) {
+        // The add-to-project call: its contentId must be the REST create's own
+        // capture from THIS SAME run, not any value known ahead of time.
+        assert.ok(args.includes('contentId=I_node_phase_04'), 'add-to-project must late-bind to the REST create\'s own capture within the same run');
+        return response('PVTI_item_phase_04', 55);
+      }
+      // The four field-value calls: each late-binds its item id to the
+      // add-to-project operation's own capture, recorded earlier in this
+      // same run under the same `phase:04` logical key.
+      assert.ok(args.includes('itemId=PVTI_item_phase_04'), 'a field write must late-bind to the add-to-project operation\'s own capture within the same run');
+      return fieldValueResponse('PVTI_item_phase_04', 55);
     },
     recordCompletion,
     writeSyncMapAtomically,
@@ -362,12 +422,13 @@ test('one roadmap phase travels end-to-end: REST create then add-to-project, bot
 
   const reopened = readSyncMapStrict(cwd, REPOSITORY);
   assert.equal(reopened.kind, 'valid');
-  // Plan 04-04 Task 1: the create's REST capture and the add-to-project
-  // capture now carry the freshly computed content hash / field state in
-  // their planner fields, so the recorded completions carry them too — this
-  // is what lets the immediate re-plan below stay a no-op.
+  // Plan 04-04 Task 1: the create's REST capture carries the freshly
+  // computed content hash. Plan 04-05: the field state no longer rides the
+  // add-to-project capture — it now rides only the LAST field-value
+  // operation's capture, so the recorded `phase:04` completion carries it
+  // from there instead.
   const expectedContentHash = contentHash({ title: phase.title, region: renderPhaseRegion(phase), milestoneNumber: PHASE_MILESTONE_NUMBER });
-  const expectedFieldState = renderFieldState({ gsdId: 'phase:04', phaseId: '04', requirements: [], status: '' });
+  const expectedFieldState = renderFieldState({ gsdId: 'phase:04', phaseId: '04', requirements: ['PHASE-01'], status: 'Todo' });
   assert.deepEqual(reopened.map.completions['issue:phase:04'], {
     logicalKey: 'issue:phase:04',
     nodeId: 'I_node_phase_04',
@@ -416,19 +477,30 @@ test('one roadmap phase travels end-to-end: REST create then add-to-project, bot
   assert.deepEqual(Object.keys(finalMap.map.completions).sort(), Object.keys(reopened.map.completions).sort(), 'no new key added by the identical re-run');
 });
 
-test('two phases in the desired state produce four operations grouped by phase in ascending id order, each REST create immediately preceding its own add-to-project', () => {
+test('two phases in the desired state produce twelve operations grouped by phase in ascending id order, each REST create immediately preceding its own add-to-project and four field writes', () => {
   const twoDesired = desiredTwoPhases(
-    { id: '05', title: 'Phase Five', goal: 'g5' },
-    { id: '04', title: 'Phase Four', goal: 'g4' },
+    { id: '05', title: 'Phase Five', goal: 'g5', requirements: [], status: 'Todo' },
+    { id: '04', title: 'Phase Four', goal: 'g4', requirements: [], status: 'Todo' },
   );
-  const map = { kind: 'valid', map: { completions: { [PHASE_MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: PHASE_MILESTONE_NUMBER } } } };
+  const map = {
+    kind: 'valid',
+    map: { completions: { [PHASE_MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: PHASE_MILESTONE_NUMBER }, ...fieldBootstrapCompletions() } },
+  };
 
   const plan = planReconciliation(twoDesired, remote([]), map);
   assert.deepEqual(plan.blocked, []);
   assert.deepEqual(plan.operations.map((op) => [op.transport, op.logicalKey]), [
     ['rest', 'issue:phase:04'],
     ['graphql', 'phase:04'],
+    ['graphql', 'phase:04'],
+    ['graphql', 'phase:04'],
+    ['graphql', 'phase:04'],
+    ['graphql', 'phase:04'],
     ['rest', 'issue:phase:05'],
+    ['graphql', 'phase:05'],
+    ['graphql', 'phase:05'],
+    ['graphql', 'phase:05'],
+    ['graphql', 'phase:05'],
     ['graphql', 'phase:05'],
   ]);
 });
