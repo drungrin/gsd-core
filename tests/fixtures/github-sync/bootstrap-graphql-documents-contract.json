@@ -1,5 +1,5 @@
 {
-  "provenance": "Schema facts probed live against drungrin/gsd-core's repositoryOwner/projectV2 surface with `project` scope, 2026-08-01 (plan 03-02 Task 2). A sibling of tests/fixtures/github-sync/graphql-documents-contract.json (Phase 2) scoped to the documents github-sync-bootstrap-remote.cts adds. Re-verify against the live schema before editing this file rather than guessing. Updated 2026-08-01 (plan 03-03 Task 2, D-14/HIGH-C): `repository` widened with a `projectsV2` linked-project connection for link-state reads; `createProject`/`linkProjectToRepository` mutation documents registered for completeness (dispatched only via planProject's emitted operations, byte-pinned against github-sync-bootstrap-plan.cts's local copies by a differential test in tests/github-sync-bootstrap-plan.test.cjs — not captured by readBootstrapRemoteState's own dispatch, so they are exempted from Guard 1's capture-driven completeness check).",
+  "provenance": "Schema facts probed live against drungrin/gsd-core's repositoryOwner/projectV2 surface with `project` scope, 2026-08-01 (plan 03-02 Task 2). A sibling of tests/fixtures/github-sync/graphql-documents-contract.json (Phase 2) scoped to the documents github-sync-bootstrap-remote.cts adds. Re-verify against the live schema before editing this file rather than guessing. Updated 2026-08-01 (plan 03-03 Task 2, D-14/HIGH-C): `repository` widened with a `projectsV2` linked-project connection for link-state reads; `createProject`/`linkProjectToRepository` mutation documents registered for completeness (dispatched only via planProject's emitted operations, byte-pinned against github-sync-bootstrap-plan.cts's local copies by a differential test in tests/github-sync-bootstrap-plan.test.cjs — captured in the same harness fashion, so they DO participate in Guard 1's completeness equality despite never being dispatched by readBootstrapRemoteState itself). Updated 2026-08-02 (plan 03-04 Task 2, D-20/D-23): `createFieldText`/`createFieldNumber`/`createFieldSingleSelect`/`renameField` registered — dispatched by planFields, captured the same way createProject/linkProjectToRepository are, each selecting through the ProjectV2FieldCommon fragment only (no options selection needed on a create/rename response).",
   "documents": {
     "repository": {
       "connection": null,
@@ -34,6 +34,42 @@
       "selects": ["repository"],
       "paginated": false,
       "dispatchedBy": "planProject (not readBootstrapRemoteState) — exempt from Guard 1"
+    },
+    "createFieldText": {
+      "connection": null,
+      "nodeType": "ProjectV2FieldConfiguration",
+      "nodeKind": "UNION",
+      "fragmentTargets": ["ProjectV2FieldCommon"],
+      "selects": ["projectV2Field"],
+      "paginated": false,
+      "dispatchedBy": "planFields (not readBootstrapRemoteState) — exempt from Guard 1"
+    },
+    "createFieldNumber": {
+      "connection": null,
+      "nodeType": "ProjectV2FieldConfiguration",
+      "nodeKind": "UNION",
+      "fragmentTargets": ["ProjectV2FieldCommon"],
+      "selects": ["projectV2Field"],
+      "paginated": false,
+      "dispatchedBy": "planFields (not readBootstrapRemoteState) — exempt from Guard 1"
+    },
+    "createFieldSingleSelect": {
+      "connection": null,
+      "nodeType": "ProjectV2FieldConfiguration",
+      "nodeKind": "UNION",
+      "fragmentTargets": ["ProjectV2FieldCommon"],
+      "selects": ["projectV2Field"],
+      "paginated": false,
+      "dispatchedBy": "planFields (not readBootstrapRemoteState) — exempt from Guard 1"
+    },
+    "renameField": {
+      "connection": null,
+      "nodeType": "ProjectV2FieldConfiguration",
+      "nodeKind": "UNION",
+      "fragmentTargets": ["ProjectV2FieldCommon"],
+      "selects": ["projectV2Field"],
+      "paginated": false,
+      "dispatchedBy": "planFields (not readBootstrapRemoteState) — exempt from Guard 1"
     }
   }
 }

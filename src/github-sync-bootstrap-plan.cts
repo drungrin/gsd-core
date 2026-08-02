@@ -119,6 +119,8 @@ interface BootstrapRemoteForMerge {
   statusField: RemoteStatusField | null;
   repository?: BootstrapRepositoryLike | null;
   projectNodeId?: string | null;
+  /** Every field on the project, `Status` included — the shape plan 03-04's planFields/planAutonomousOptions consume. */
+  fields?: RemoteStatusField[];
 }
 interface StrictMapCompletion { nodeId: string; }
 interface StrictMapLike {
@@ -291,6 +293,355 @@ function planStatusOptionMerge(remote: BootstrapRemoteForMerge, strictMap: Stric
     }],
   };
   return { kind: 'operation', operation };
+}
+
+// ─── planFields ─────────────────────────────────────────────────────────────
+
+/**
+ * The stage a builder's operation/checkpoint was produced by — read by plan
+ * 03-06's report instead of inferred from the logical key's prefix (plan
+ * 03-04 Task 3). `planAutonomousOptions`' merged write is the case that
+ * forces this: it is produced by the AUTONOMOUS stage but its logical key
+ * carries the `field:` prefix (the `Autonomous` field's own reserved key),
+ * so a prefix-inferring report would silently file it under FIELDS instead.
+ * Declared here (not in `github-sync-operation.cts`, which this plan does
+ * not touch) as a local intersection type — `MutationOperation` and
+ * `AdoptionCheckpoint` accept any variable carrying their required shape
+ * plus extra properties, so a stage-tagged value still satisfies both.
+ */
+const BOOTSTRAP_STAGE = Object.freeze({
+  PROJECT: 'project',
+  FIELDS: 'fields',
+  STATUS: 'status',
+  AUTONOMOUS: 'autonomous',
+  LABELS: 'labels',
+  MILESTONES: 'milestones',
+} as const);
+type BootstrapStage = typeof BOOTSTRAP_STAGE[keyof typeof BOOTSTRAP_STAGE];
+type StageTaggedOperation = MutationOperation & { stage: BootstrapStage };
+type StageTaggedCheckpoint = AdoptionCheckpoint & { stage: BootstrapStage };
+
+const FIELD_DATA_TYPE = Object.freeze({
+  TEXT: 'TEXT',
+  NUMBER: 'NUMBER',
+  SINGLE_SELECT: 'SINGLE_SELECT',
+} as const);
+type FieldDataType = typeof FIELD_DATA_TYPE[keyof typeof FIELD_DATA_TYPE];
+
+interface GsdFieldDeclaration { name: string; dataType: FieldDataType; }
+
+/**
+ * D-20's five fixed field declarations, in create order. `Phase` is TEXT so
+ * an inserted decimal phase id (e.g. `2.1`) round-trips exactly as it
+ * appears on disk — a NUMBER field would coerce or reject it. `Wave` is
+ * NUMBER so Phase 6's By-Wave view can sort and filter numerically — a TEXT
+ * field would only ever string-sort. Slugs are never concatenated inline;
+ * every consumer derives the reserved key through `BOOTSTRAP_LOGICAL_KEY.field`.
+ */
+const GSD_FIELDS: readonly GsdFieldDeclaration[] = Object.freeze([
+  Object.freeze({ name: 'GSD ID', dataType: FIELD_DATA_TYPE.TEXT }),
+  Object.freeze({ name: 'Phase', dataType: FIELD_DATA_TYPE.TEXT }),
+  Object.freeze({ name: 'Requirements', dataType: FIELD_DATA_TYPE.TEXT }),
+  Object.freeze({ name: 'Wave', dataType: FIELD_DATA_TYPE.NUMBER }),
+  Object.freeze({ name: 'Autonomous', dataType: FIELD_DATA_TYPE.SINGLE_SELECT }),
+]);
+
+/**
+ * D-22: the `Autonomous` single-select GSD itself creates. Colours/
+ * descriptions are set once on create and never reconciled afterward (D-18,
+ * the same rule `GSD_STATUS_OPTIONS` follows) — chosen to match the create
+ * example RESEARCH.md records for this exact field.
+ */
+const GSD_AUTONOMOUS_OPTIONS = Object.freeze([
+  Object.freeze({ name: 'Yes', color: 'GREEN', description: '' }),
+  Object.freeze({ name: 'No', color: 'RED', description: '' }),
+] as const);
+
+const AUTONOMOUS_FIELD_NAME = 'Autonomous';
+
+// Duplicated from src/github-sync-bootstrap-remote.cts's BOOTSTRAP_DOCUMENTS,
+// byte-for-byte — a differential test pins the copies against each other, the
+// same pattern CREATE_PROJECT_DOCUMENT/LINK_PROJECT_DOCUMENT establish above.
+// No `rateLimit` selection, for the same live-verified reason.
+const CREATE_FIELD_TEXT_DOCUMENT =
+  'mutation($projectId:ID!,$name:String!) { # github-sync-bootstrap:createFieldText\n' +
+  ' createProjectV2Field(input:{projectId:$projectId,dataType:TEXT,name:$name}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }';
+const CREATE_FIELD_NUMBER_DOCUMENT =
+  'mutation($projectId:ID!,$name:String!) { # github-sync-bootstrap:createFieldNumber\n' +
+  ' createProjectV2Field(input:{projectId:$projectId,dataType:NUMBER,name:$name}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }';
+const CREATE_FIELD_SINGLE_SELECT_DOCUMENT =
+  'mutation($projectId:ID!,$name:String!,$options:[ProjectV2SingleSelectFieldOptionInput!]!) { # github-sync-bootstrap:createFieldSingleSelect\n' +
+  ' createProjectV2Field(input:{projectId:$projectId,dataType:SINGLE_SELECT,name:$name,singleSelectOptions:$options}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }';
+const RENAME_FIELD_DOCUMENT =
+  'mutation($fieldId:ID!,$name:String!) { # github-sync-bootstrap:renameField\n' +
+  ' updateProjectV2Field(input:{fieldId:$fieldId,name:$name}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }';
+
+function fieldCreateDocument(dataType: FieldDataType): string {
+  if (dataType === FIELD_DATA_TYPE.TEXT) return CREATE_FIELD_TEXT_DOCUMENT;
+  if (dataType === FIELD_DATA_TYPE.NUMBER) return CREATE_FIELD_NUMBER_DOCUMENT;
+  return CREATE_FIELD_SINGLE_SELECT_DOCUMENT;
+}
+
+function fieldTypeMismatchDetail(gsdField: GsdFieldDeclaration, observedDataType: string): string {
+  return `field "${gsdField.name}" is ${observedDataType} but GSD requires ${gsdField.dataType}`;
+}
+
+/**
+ * D-23/D-17's shared identity rule: resolve a GSD field declaration against
+ * the remote's field list by the sync map's stored node id first (survives a
+ * remote rename), then by exact name. `claimedRemoteIds` excludes a remote
+ * field already matched to an earlier GSD field in the same pass — the same
+ * cross-contamination guard `mergedOptionsArray` carries (LIVE FINDING, plan
+ * 03-03 -> plan 03-04): a stale or duplicated stored id must never let two
+ * different GSD fields resolve to the same remote object.
+ */
+function resolveFieldIdentity(
+  gsdField: GsdFieldDeclaration,
+  remoteFields: RemoteStatusField[],
+  strictMap: StrictMapLike,
+  claimedRemoteIds: Set<string>,
+): { field: RemoteStatusField; matchedBy: 'id' | 'name' } | undefined {
+  const completions = strictMap.kind === 'valid' ? strictMap.map?.completions ?? {} : {};
+  const storedId = completions[BOOTSTRAP_LOGICAL_KEY.field(gsdField.name)]?.nodeId;
+  if (storedId) {
+    const byId = remoteFields.find((field) => field.id === storedId && !claimedRemoteIds.has(field.id));
+    if (byId) return { field: byId, matchedBy: 'id' };
+  }
+  const byName = remoteFields.find((field) => field.name === gsdField.name && !claimedRemoteIds.has(field.id));
+  if (byName) return { field: byName, matchedBy: 'name' };
+  return undefined;
+}
+
+/**
+ * Every run-fatal condition this phase declares — today exactly a field
+ * whose name matches a GSD declaration but whose `dataType` does not (D-21).
+ * Run first in `planBootstrap`, before any stage builder contributes
+ * anything, for both passes: because it runs before the pass dispatch rather
+ * than inside `planFields` itself, it suppresses every stage the dispatch
+ * would otherwise have reached — the project create, the `Status` merge, and
+ * every checkpoint alike — never only the field stage. The
+ * `deleteProjectV2Field` mutation is never referenced anywhere in this
+ * module; a wrong-typed field is reported, not repaired, because that
+ * mutation destroys every value the field holds and for a field GSD did not
+ * create that is the developer's data.
+ */
+function validateFatalConditions(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike): Array<{ reason: string; detail?: string }> {
+  const remoteFields = remote.fields ?? [];
+  const claimedRemoteIds = new Set<string>();
+  const blocked: Array<{ reason: string; detail?: string }> = [];
+  for (const gsdField of GSD_FIELDS) {
+    const match = resolveFieldIdentity(gsdField, remoteFields, strictMap, claimedRemoteIds);
+    if (!match) continue;
+    claimedRemoteIds.add(match.field.id);
+    if (match.field.dataType !== gsdField.dataType) {
+      blocked.push({ reason: BOOTSTRAP_OPERATION_REASON.FIELD_TYPE_MISMATCH, detail: fieldTypeMismatchDetail(gsdField, match.field.dataType) });
+    }
+  }
+  return blocked;
+}
+
+interface FieldPlanResult {
+  operations: StageTaggedOperation[];
+  checkpoints: StageTaggedCheckpoint[];
+  blocked: Array<{ reason: string; detail?: string }>;
+}
+
+function buildCreateFieldOperation(gsdField: GsdFieldDeclaration, fieldKey: string, context: CompletionContext): StageTaggedOperation {
+  const projectRef: ArgvEntry = { from: BOOTSTRAP_LOGICAL_KEY.project(), part: ARGV_REF_PART.NODE_ID, prefix: 'projectId=' };
+  const args: ArgvEntry[] = [
+    'api', 'graphql',
+    '-f', `query=${fieldCreateDocument(gsdField.dataType)}`,
+    '-f', projectRef,
+    '-f', `name=${gsdField.name}`,
+  ];
+  if (gsdField.dataType === FIELD_DATA_TYPE.SINGLE_SELECT) {
+    args.push(...optionInputArgv('options', GSD_AUTONOMOUS_OPTIONS.map((option) => ({ ...option }))));
+  }
+  return {
+    kind: 'create-field',
+    logicalKey: fieldKey,
+    args,
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.CREATE,
+    hasPointsBudget: false,
+    // Every operation that brings a new GitHub-side object into existence
+    // declares content creation true (decided once for the whole phase — see
+    // the paragraph at this flag's first use in planProject's create path).
+    contentCreation: true,
+    captures: [{ kind: 'node', logicalKey: fieldKey, nodeIdPath: 'createProjectV2Field.projectV2Field.id' }],
+    stage: BOOTSTRAP_STAGE.FIELDS,
+  };
+}
+
+function buildRenameFieldOperation(matchedField: RemoteStatusField, gsdField: GsdFieldDeclaration, fieldKey: string, context: CompletionContext): StageTaggedOperation {
+  return {
+    kind: 'rename-field',
+    logicalKey: fieldKey,
+    args: [
+      'api', 'graphql',
+      '-f', `query=${RENAME_FIELD_DOCUMENT}`,
+      // The matched field's id is already known (observed on this run's
+      // remote read), so it rides a literal, not a late-bound reference.
+      '-f', `fieldId=${matchedField.id}`,
+      '-f', `name=${gsdField.name}`,
+    ],
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.UPDATE,
+    hasPointsBudget: false,
+    // Re-points an existing field's name — mints nothing new.
+    contentCreation: false,
+    captures: [{ kind: 'node', logicalKey: fieldKey, nodeIdPath: 'updateProjectV2Field.projectV2Field.id' }],
+    stage: BOOTSTRAP_STAGE.FIELDS,
+  };
+}
+
+/**
+ * D-20/D-21/D-23's field composer. For each `GSD_FIELDS` declaration,
+ * resolves identity via `resolveFieldIdentity` and branches:
+ *
+ * - **no match** → create, project id late-bound (the field may be planned
+ *   before the project exists — the same late-binding `planProject`'s link
+ *   operation uses).
+ * - **matched, correct type, canonical name** (by id or by name) → no
+ *   operation; a checkpoint carrying the observed node id, unconditionally.
+ *   The by-id case keeps an already-recorded entry current at zero I/O cost
+ *   (plan 03-02's fold compares and skips the write when nothing changed);
+ *   the by-name case is BOTH the HIGH-A repair path for a board GSD did not
+ *   create AND the stale-id repair (non-HIGH #7's field analogue) in one
+ *   branch, because `recordCompletion` replaces the entry at a repeated key.
+ * - **matched, correct type, name differs** → one rename operation
+ *   restoring the canonical name, no checkpoint (the rename's own capture
+ *   records it from the confirmed response).
+ * - **matched, `dataType` differs** → a blocked entry. In practice
+ *   `validateFatalConditions` already suppressed the whole run before this
+ *   function is even called from `planBootstrap` — this branch exists so
+ *   `planFields` is independently correct when exercised directly.
+ *
+ * The built-in `Status` field, when present in the remote snapshot, is
+ * always checkpointed under its own field-namespace key: BOOT-06 needs its
+ * node id, and it arrives in the same read this function already consumes.
+ */
+function planFields(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, context: CompletionContext): FieldPlanResult {
+  const remoteFields = remote.fields ?? [];
+  const claimedRemoteIds = new Set<string>();
+  const operations: StageTaggedOperation[] = [];
+  const checkpoints: StageTaggedCheckpoint[] = [];
+  const blocked: Array<{ reason: string; detail?: string }> = [];
+
+  for (const gsdField of GSD_FIELDS) {
+    const fieldKey = BOOTSTRAP_LOGICAL_KEY.field(gsdField.name);
+    const match = resolveFieldIdentity(gsdField, remoteFields, strictMap, claimedRemoteIds);
+    if (!match) {
+      operations.push(buildCreateFieldOperation(gsdField, fieldKey, context));
+      continue;
+    }
+    claimedRemoteIds.add(match.field.id);
+    if (match.field.dataType !== gsdField.dataType) {
+      blocked.push({ reason: BOOTSTRAP_OPERATION_REASON.FIELD_TYPE_MISMATCH, detail: fieldTypeMismatchDetail(gsdField, match.field.dataType) });
+      continue;
+    }
+    if (match.field.name !== gsdField.name) {
+      operations.push(buildRenameFieldOperation(match.field, gsdField, fieldKey, context));
+      continue;
+    }
+    checkpoints.push({ logicalKey: fieldKey, nodeId: match.field.id, completionContext: context, stage: BOOTSTRAP_STAGE.FIELDS });
+  }
+
+  if (remote.statusField) {
+    checkpoints.push({
+      logicalKey: BOOTSTRAP_LOGICAL_KEY.field(STATUS_FIELD_NAME),
+      nodeId: remote.statusField.id,
+      completionContext: context,
+      stage: BOOTSTRAP_STAGE.FIELDS,
+    });
+  }
+
+  return { operations, checkpoints, blocked };
+}
+
+// ─── planAutonomousOptions ──────────────────────────────────────────────────
+
+interface AutonomousPlanResult {
+  operations: StageTaggedOperation[];
+}
+
+/**
+ * D-22's prune-to-exactly-declared composer for `Autonomous`, the one
+ * single-select GSD itself creates. Deliberately the opposite policy from
+ * `planStatusOptionMerge`'s preserve-and-append: `Status` is a built-in field
+ * a developer may already be using, so every existing option (GSD-named or
+ * custom) is kept; `Autonomous` carries no prior developer claim, so its
+ * option set is exactly `GSD_AUTONOMOUS_OPTIONS` and any extra is dropped.
+ * Two policies, each with a stated reason (D-16 vs D-22) — not an
+ * inconsistency.
+ *
+ * Resolves the field by its own reserved completion first, then by exact
+ * name (the same identity rule `planFields` uses for the field itself — this
+ * builder never re-derives it independently). Absent from the snapshot ->
+ * zero operations, both because the field genuinely does not exist yet (its
+ * own create call already supplies both options in the same request) and
+ * because a field created THIS run may not yet be visible in a stale
+ * snapshot — the caller re-reads before calling this builder in that case
+ * (the router's mutated-key re-read boundary).
+ */
+function planAutonomousOptions(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, context: CompletionContext): AutonomousPlanResult {
+  const remoteFields = remote.fields ?? [];
+  const claimedRemoteIds = new Set<string>();
+  const match = resolveFieldIdentity({ name: AUTONOMOUS_FIELD_NAME, dataType: FIELD_DATA_TYPE.SINGLE_SELECT }, remoteFields, strictMap, claimedRemoteIds);
+  if (!match) return { operations: [] };
+
+  const remoteOptions = match.field.options ?? [];
+  const merged: OptionInput[] = [];
+  const matchedRemoteOptionIds = new Set<string>();
+  for (const gsdOption of GSD_AUTONOMOUS_OPTIONS) {
+    const byName = remoteOptions.find((option) => option.name === gsdOption.name && !matchedRemoteOptionIds.has(option.id));
+    if (byName) {
+      matchedRemoteOptionIds.add(byName.id);
+      // D-18: colour/description are echoed verbatim from the remote, never
+      // overwritten from the local declaration once an option exists.
+      merged.push({ id: byName.id, name: byName.name, color: byName.color, description: byName.description });
+    } else {
+      merged.push({ name: gsdOption.name, color: gsdOption.color, description: gsdOption.description });
+    }
+  }
+  // Every remote option not corresponding to a declared GSD option is
+  // omitted here (D-22's prune) — the deliberate opposite of
+  // mergedOptionsArray's catch-all append.
+
+  const alreadyConverged = merged.length === remoteOptions.length && merged.every((entry) => {
+    const remoteOption = remoteOptions.find((option) => option.id === entry.id);
+    return !!remoteOption && entry.name === remoteOption.name && entry.color === remoteOption.color && entry.description === remoteOption.description;
+  });
+  if (alreadyConverged) return { operations: [] };
+
+  const mintsNewOption = merged.some((entry) => entry.id === undefined);
+  const fieldKey = BOOTSTRAP_LOGICAL_KEY.field(AUTONOMOUS_FIELD_NAME);
+  const operation: StageTaggedOperation = {
+    kind: 'update',
+    logicalKey: fieldKey,
+    args: [
+      'api', 'graphql',
+      '-f', `query=${STATUS_MERGE_DOCUMENT}`,
+      '-F', `fieldId=${match.field.id}`,
+      ...optionInputArgv('options', merged),
+    ],
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.UPDATE,
+    hasPointsBudget: false,
+    contentCreation: mintsNewOption,
+    // A single node capture under the field's own key — not an each-capture:
+    // only Status options get per-option completions (D-08), because only
+    // Status options are individually referenced by later phases.
+    captures: [{ kind: 'node', logicalKey: fieldKey, nodeIdPath: 'updateProjectV2Field.projectV2Field.id' }],
+    // Produced by the AUTONOMOUS stage even though its logical key carries
+    // the field: prefix — the case that breaks prefix-inferred reporting
+    // (plan 03-04 Task 3 / plan 03-06's per-stage counts).
+    stage: BOOTSTRAP_STAGE.AUTONOMOUS,
+  };
+  return { operations: [operation] };
 }
 
 // ─── planProject ────────────────────────────────────────────────────────────
@@ -515,6 +866,19 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
     return { ...emptyPlan(), blocked: [{ reason: BOOTSTRAP_OPERATION_REASON.MAP_BLOCKING, detail: input.strictMap.reason ?? 'invalid_schema' }] };
   }
 
+  // Run-scoped suppression (D-21), before any stage builder contributes
+  // anything and before the pass dispatch below — the four stages that exist
+  // at this wave (project, fields, Status, Autonomous) are all reached only
+  // after this point, so a fatal condition here suppresses every one of them
+  // with zero operations and zero checkpoints, not merely the field stage.
+  // Plan 03-05's labels/milestones stages arrive after this gate too, once
+  // they exist; plan 03-06's run-fatal composition case covers all six
+  // together.
+  const fatalBlocked = validateFatalConditions(input.remote, input.strictMap);
+  if (fatalBlocked.length > 0) {
+    return { ...emptyPlan(), blocked: fatalBlocked };
+  }
+
   // Checkpoint contract clause 1a: one CompletionContext, built once here
   // from the resolved target, threaded verbatim to every stage builder.
   // planProject does not derive its own from the `target` it also receives.
@@ -529,29 +893,55 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
     if (projectPlan.blocked.length > 0) {
       return { ...emptyPlan(), blocked: projectPlan.blocked };
     }
-    // Filled in further by plans 03-04/03-05 (fields, labels, milestones).
-    return { ...emptyPlan(), operations: projectPlan.operations, checkpoints: projectPlan.checkpoints };
+    const fieldsPlan = planFields(input.remote, input.strictMap, context);
+    if (fieldsPlan.blocked.length > 0) {
+      return { ...emptyPlan(), blocked: fieldsPlan.blocked };
+    }
+    // Filled in further by plan 03-05 (labels, milestones).
+    return {
+      ...emptyPlan(),
+      operations: [...projectPlan.operations, ...fieldsPlan.operations],
+      checkpoints: [...projectPlan.checkpoints, ...fieldsPlan.checkpoints],
+    };
   }
 
   const merge = planStatusOptionMerge(input.remote, input.strictMap, context);
   if (!merge) return emptyPlan();
-  if (merge.kind === 'noop') return { ...emptyPlan(), noops: [{ reason: merge.reason }] };
   if (merge.kind === 'blocked') return { ...emptyPlan(), blocked: [{ reason: merge.reason }] };
-  if (merge.kind === 'converged') return { ...emptyPlan(), checkpoints: merge.checkpoints };
-  return { ...emptyPlan(), operations: [merge.operation] };
+
+  // planAutonomousOptions runs after planStatusOptionMerge, on every
+  // non-null, non-blocked merge outcome — its own identity resolution
+  // naturally contributes zero operations when the Autonomous field does not
+  // yet exist in this snapshot (an unset/fresh-create project, or a project
+  // whose structure pass has not created it yet).
+  const autonomousPlan = planAutonomousOptions(input.remote, input.strictMap, context);
+
+  if (merge.kind === 'noop') return { ...emptyPlan(), noops: [{ reason: merge.reason }], operations: autonomousPlan.operations };
+  if (merge.kind === 'converged') return { ...emptyPlan(), checkpoints: merge.checkpoints, operations: autonomousPlan.operations };
+  return { ...emptyPlan(), operations: [merge.operation, ...autonomousPlan.operations] };
 }
 
 export = {
   planBootstrap,
   planProject,
   planStatusOptionMerge,
+  planFields,
+  planAutonomousOptions,
+  validateFatalConditions,
   optionInputArgv,
   BOOTSTRAP_LOGICAL_KEY,
   BOOTSTRAP_OPERATION_REASON,
   BOOTSTRAP_PASS,
+  BOOTSTRAP_STAGE,
   GSD_STATUS_OPTIONS,
+  GSD_FIELDS,
+  GSD_AUTONOMOUS_OPTIONS,
   STATUS_FIELD_NAME,
   DEFAULT_PROJECT_TITLE_SUFFIX,
   CREATE_PROJECT_DOCUMENT,
   LINK_PROJECT_DOCUMENT,
+  CREATE_FIELD_TEXT_DOCUMENT,
+  CREATE_FIELD_NUMBER_DOCUMENT,
+  CREATE_FIELD_SINGLE_SELECT_DOCUMENT,
+  RENAME_FIELD_DOCUMENT,
 };

@@ -94,6 +94,18 @@ const BOOTSTRAP_DOCUMENTS = Object.freeze({
   // D-14: its own operation, its own logical key, so a link failure retries
   // independently of the project's own (already-confirmed) checkpoint.
   linkProjectToRepository: 'mutation($projectId:ID!,$repositoryId:ID!) { # github-sync-bootstrap:linkProjectToRepository\n linkProjectV2ToRepository(input:{projectId:$projectId,repositoryId:$repositoryId}) { repository { id } } }',
+  // D-20 field creates (plan 03-04 Task 2), dispatched by
+  // github-sync-bootstrap-plan.cts's planFields, not this module — pinned
+  // byte-identical to that module's local copies by a differential test, the
+  // same pattern createProject/linkProjectToRepository establish above. No
+  // `rateLimit` selection, for the same live-verified reason.
+  createFieldText: 'mutation($projectId:ID!,$name:String!) { # github-sync-bootstrap:createFieldText\n createProjectV2Field(input:{projectId:$projectId,dataType:TEXT,name:$name}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }',
+  createFieldNumber: 'mutation($projectId:ID!,$name:String!) { # github-sync-bootstrap:createFieldNumber\n createProjectV2Field(input:{projectId:$projectId,dataType:NUMBER,name:$name}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }',
+  createFieldSingleSelect: 'mutation($projectId:ID!,$name:String!,$options:[ProjectV2SingleSelectFieldOptionInput!]!) { # github-sync-bootstrap:createFieldSingleSelect\n createProjectV2Field(input:{projectId:$projectId,dataType:SINGLE_SELECT,name:$name,singleSelectOptions:$options}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }',
+  // D-23: its own operation, its own logical key — a renamed GSD field is
+  // followed by its mapped id and restored to its canonical name, never
+  // re-created as a duplicate.
+  renameField: 'mutation($fieldId:ID!,$name:String!) { # github-sync-bootstrap:renameField\n updateProjectV2Field(input:{fieldId:$fieldId,name:$name}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }',
 });
 
 const STATUS_FIELD_NAME = 'Status';
