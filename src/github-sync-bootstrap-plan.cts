@@ -156,10 +156,21 @@ function mergedOptionsArray(remoteOptions: RemoteSingleSelectOption[], strictMap
 
   for (const gsdOption of GSD_STATUS_OPTIONS) {
     // D-17: match by the sync map's stored option id first (survives a
-    // remote rename), then by exact name (BOOT-03 adjacency edge).
+    // remote rename), then by exact name (BOOT-03 adjacency edge). Both
+    // lookups exclude a remote id already claimed by an earlier GSD option in
+    // this same loop (LIVE FINDING, plan 03-03 -> plan 03-04): a stale or
+    // cross-contaminated stored id could otherwise let two different GSD
+    // options both resolve to the same remote entry, leaving the genuinely
+    // correct remote option for the second name unmatched and pushed through
+    // the catch-all below as if it were an unrelated custom option — the
+    // outgoing array would then carry the same id twice under two different
+    // names, which is exactly the shape a full-replace write cannot honor for
+    // both entries.
     const storedId = completions[BOOTSTRAP_LOGICAL_KEY.statusOption(gsdOption.name)]?.nodeId;
-    const byStoredId = storedId ? remoteOptions.find((option) => option.id === storedId) : undefined;
-    const byName = byStoredId ?? remoteOptions.find((option) => option.name === gsdOption.name);
+    const byStoredId = storedId
+      ? remoteOptions.find((option) => option.id === storedId && !matchedRemoteIds.has(option.id))
+      : undefined;
+    const byName = byStoredId ?? remoteOptions.find((option) => option.name === gsdOption.name && !matchedRemoteIds.has(option.id));
     if (byName) {
       matchedRemoteIds.add(byName.id);
       merged.push({ id: byName.id, name: byName.name, color: byName.color, description: byName.description });
@@ -169,18 +180,52 @@ function mergedOptionsArray(remoteOptions: RemoteSingleSelectOption[], strictMap
   }
   for (const remoteOption of remoteOptions) {
     if (!matchedRemoteIds.has(remoteOption.id)) {
+      matchedRemoteIds.add(remoteOption.id);
       merged.push({ id: remoteOption.id, name: remoteOption.name, color: remoteOption.color, description: remoteOption.description });
     }
   }
   return { merged, matchedRemoteIds };
 }
 
+/**
+ * LIVE FINDING (plan 03-03 -> plan 03-04): the original implementation
+ * compared `merged` against `remoteOptions` by ARRAY POSITION. `merged` is
+ * always built in `GSD_STATUS_OPTIONS`' fixed declaration order followed by
+ * unmatched remote options in their read order; `remoteOptions` is whatever
+ * order the live read returns, which is not contractually the write-time
+ * order (observed live, 2026-08-01, board #9: a positional comparison
+ * disagreed with a byName-correct merge for `Blocked`/`Deferred`/a custom
+ * option purely because their remote-read position did not match
+ * `GSD_STATUS_OPTIONS`' declared position, even though every one of them had
+ * already matched by id or by name in `mergedOptionsArray`). A positional
+ * mismatch alone triggered a real, destructive `singleSelectOptions`
+ * full-replace write for options that were already correctly identified —
+ * exactly the needless-write exposure D-16/T-03-22 exist to avoid, and the
+ * live evidence shows that exposure is not merely theoretical: some of those
+ * options came back from that live write re-minted under fresh ids despite
+ * the merge having sent their existing ones.
+ *
+ * Convergence is therefore now a multiset comparison keyed by id, order
+ * -independent: every remote option must appear exactly once in `merged`
+ * under the same id, name, color, and description, and vice versa. Only a
+ * genuine content divergence (a missing/extra option, or a changed name,
+ * color, or description) is a real divergence; a same-content reordering is
+ * not.
+ */
 function isConverged(merged: OptionInput[], remoteOptions: RemoteSingleSelectOption[]): boolean {
   if (merged.length !== remoteOptions.length) return false;
-  return merged.every((entry, index) => {
-    const remote = remoteOptions[index];
-    return entry.id === remote.id && entry.name === remote.name && entry.color === remote.color && entry.description === remote.description;
-  });
+  const remoteById = new Map(remoteOptions.map((option) => [option.id, option]));
+  if (remoteById.size !== remoteOptions.length) return false; // duplicate remote ids: never claim convergence
+  const seenIds = new Set<string>();
+  for (const entry of merged) {
+    if (entry.id === undefined) return false; // an id-less entry has no remote counterpart yet
+    if (seenIds.has(entry.id)) return false; // merged itself must carry no duplicate id
+    seenIds.add(entry.id);
+    const remote = remoteById.get(entry.id);
+    if (!remote) return false;
+    if (entry.name !== remote.name || entry.color !== remote.color || entry.description !== remote.description) return false;
+  }
+  return true;
 }
 
 /**
