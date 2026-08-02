@@ -5,9 +5,14 @@
  * body write composes through this module rather than string-building its
  * own marker or fence inline.
  *
- * Zero I/O imports: this module reads no file, no environment variable, and
- * makes no network or filesystem call. Every input is a typed
- * phase-shaped value already produced by `github-sync-desired.cts`.
+ * Zero filesystem and network imports: this module reads no file, no
+ * environment variable, and makes no network or filesystem call. Every
+ * input is a typed phase-shaped value already produced by
+ * `github-sync-desired.cts`. Plan 04-03 Task 2 adds the module's only
+ * import, Node's stdlib `crypto` module, for the non-cryptographic content
+ * hash below — this is change detection, not authentication, so the
+ * "zero I/O" framing is narrowed to what it always meant: no file, network,
+ * or environment read.
  *
  * Two distinct token families, deliberately kept apart (D-01/D-02):
  *
@@ -25,6 +30,8 @@
  * ever appears inside a GSD-owned region — a one-way mirror must never
  * invite an edit it will silently discard on the next sync.
  */
+
+import crypto from 'node:crypto';
 
 interface RenderablePhase {
   id: string;
@@ -159,4 +166,130 @@ export function spliceRegion(currentBody: string, region: string): SpliceOutcome
     kind: SPLICE_RESULT.DAMAGED,
     detail: `expected exactly one begin fence and one end fence; found ${beginCount} begin fence(s) and ${endCount} end fence(s)`,
   };
+}
+
+/**
+ * D-13: the full issue-content projection — title, rendered region, and
+ * milestone number together — so a rename or a milestone reassignment
+ * cannot hash-equal a stale record and silently never converge.
+ */
+export interface ContentProjection {
+  title: string;
+  region: string;
+  milestoneNumber: number;
+}
+
+/**
+ * D-08: a pure function of its inputs, with no I/O and no clock — the same
+ * projection hashes identically across processes and machines, which is
+ * what lets `planReconciliation` decide the no-op branch offline with no
+ * remote body read at all.
+ *
+ * Serializes via `JSON.stringify` over an object literal whose keys are
+ * written in this fixed order — unambiguous under any input, including one
+ * whose title or region contains the serialization's own delimiter
+ * characters (04-RESEARCH.md "Don't Hand-Roll": `JSON.stringify` needs no
+ * encoding rules of its own, unlike a delimiter-joined concatenation). This
+ * is change detection, not authentication: no keyed or HMAC construction is
+ * warranted, and none is used.
+ */
+export function contentHash(projection: ContentProjection): string {
+  const canonical = JSON.stringify({
+    title: projection.title,
+    region: projection.region,
+    milestoneNumber: projection.milestoneNumber,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * D-12: the four item field values compared as their own convergence unit,
+ * independent of the issue-content projection above — advancing a phase
+ * emits one field write and touches no issue body.
+ */
+export interface FieldValues {
+  gsdId: string;
+  phaseId: string;
+  requirements: string[];
+  status: string;
+}
+
+/** The four `FieldValues` keys, in the fixed order `changedFields` reports them. */
+const FIELD_NAMES = ['gsdId', 'phaseId', 'requirements', 'status'] as const;
+export type FieldName = typeof FIELD_NAMES[number];
+
+/**
+ * A parsed field-state record: `known` when the serialized string decoded
+ * to a well-shaped `FieldValues`, `unknown` for anything else — absent,
+ * unparseable, or shape-mismatched input. An `unknown` previous state must
+ * read as "every field differs", so the next run rewrites all four and
+ * converges rather than skipping a write it cannot justify (see
+ * `changedFields` below).
+ */
+export type ParsedFieldState =
+  | { kind: 'known'; values: FieldValues }
+  | { kind: 'unknown' };
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Serializes the four item field values as a flat string via
+ * `JSON.stringify`, for the same reason `contentHash` uses it. Stored as a
+ * flat string on the completion record: the sync map's validator is a
+ * closed schema of scalars, and a nested object would need a new validator
+ * branch for no benefit.
+ */
+export function renderFieldState(values: FieldValues): string {
+  return JSON.stringify({
+    gsdId: values.gsdId,
+    phaseId: values.phaseId,
+    requirements: values.requirements,
+    status: values.status,
+  });
+}
+
+/**
+ * Parses a serialized field state. Never throws: any JSON parse failure,
+ * any non-record top level, or any field whose shape does not match
+ * `FieldValues` exactly (including a requirements entry that is not a
+ * string) yields `{ kind: 'unknown' }` rather than a partial result.
+ */
+export function parseFieldState(serialized: string): ParsedFieldState {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    return { kind: 'unknown' };
+  }
+  if (!isPlainRecord(parsed)) return { kind: 'unknown' };
+  const { gsdId, phaseId, requirements, status } = parsed;
+  if (typeof gsdId !== 'string' || typeof phaseId !== 'string' || typeof status !== 'string') {
+    return { kind: 'unknown' };
+  }
+  if (!Array.isArray(requirements) || !requirements.every((entry) => typeof entry === 'string')) {
+    return { kind: 'unknown' };
+  }
+  return { kind: 'known', values: { gsdId, phaseId, requirements, status } };
+}
+
+function sameRequirements(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
+/**
+ * D-12's predicate: the subset of the four field names whose values differ
+ * between `previous` and `desired`, treating an unknown previous state as
+ * all four differing. Kept beside `renderFieldState`/`parseFieldState` so
+ * the write decision and the state format cannot disagree.
+ */
+export function changedFields(previous: ParsedFieldState, desired: FieldValues): FieldName[] {
+  if (previous.kind === 'unknown') return [...FIELD_NAMES];
+  const changed: FieldName[] = [];
+  if (previous.values.gsdId !== desired.gsdId) changed.push('gsdId');
+  if (previous.values.phaseId !== desired.phaseId) changed.push('phaseId');
+  if (!sameRequirements(previous.values.requirements, desired.requirements)) changed.push('requirements');
+  if (previous.values.status !== desired.status) changed.push('status');
+  return changed;
 }

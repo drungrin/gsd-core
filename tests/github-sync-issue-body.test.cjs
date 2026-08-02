@@ -3,6 +3,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const {
   phaseMarker,
   FENCE_BEGIN,
@@ -11,6 +12,10 @@ const {
   renderNewIssueBody,
   spliceRegion,
   SPLICE_RESULT,
+  contentHash,
+  renderFieldState,
+  parseFieldState,
+  changedFields,
 } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
 const PHASE = { id: '04', title: 'Phase → Issue Sync', goal: 'Sync roadmap phases as GitHub issues.' };
@@ -177,4 +182,108 @@ test('spliceRegion: never throws for any adversarial fence arrangement, includin
   for (const input of inputs) {
     assert.doesNotThrow(() => spliceRegion(input, 'region'));
   }
+});
+
+/* --- contentHash / renderFieldState / parseFieldState / changedFields (plan 04-03 Task 2) --- */
+
+test('contentHash: returns a lowercase hex string of fixed length (sha256 = 64 chars), stable across repeated calls', () => {
+  const projection = { title: 'T', region: 'R', milestoneNumber: 1 };
+  const hash = contentHash(projection);
+  assert.match(hash, /^[0-9a-f]{64}$/);
+  assert.equal(hash, contentHash(projection));
+});
+
+test('contentHash: is a pure function with no I/O and no clock — matches a value the test itself computes from the documented JSON.stringify({title, region, milestoneNumber}) serialization, not a hardcoded digest', () => {
+  const projection = { title: 'Phase Title', region: 'region body text', milestoneNumber: 3 };
+  const expected = crypto.createHash('sha256')
+    .update(JSON.stringify({ title: projection.title, region: projection.region, milestoneNumber: projection.milestoneNumber }))
+    .digest('hex');
+  assert.equal(contentHash(projection), expected);
+});
+
+test('contentHash: changing only the title changes the hash', () => {
+  const base = { title: 'A', region: 'R', milestoneNumber: 1 };
+  assert.notEqual(contentHash(base), contentHash({ ...base, title: 'B' }));
+});
+
+test('contentHash: changing only the region changes the hash', () => {
+  const base = { title: 'A', region: 'R', milestoneNumber: 1 };
+  assert.notEqual(contentHash(base), contentHash({ ...base, region: 'S' }));
+});
+
+test('contentHash: changing only the milestone number changes the hash', () => {
+  const base = { title: 'A', region: 'R', milestoneNumber: 1 };
+  assert.notEqual(contentHash(base), contentHash({ ...base, milestoneNumber: 2 }));
+});
+
+test('contentHash: a title of "a" with a region of "b" does not collide with a title of "b" with a region of "a"', () => {
+  const first = contentHash({ title: 'a', region: 'b', milestoneNumber: 1 });
+  const second = contentHash({ title: 'b', region: 'a', milestoneNumber: 1 });
+  assert.notEqual(first, second);
+});
+
+test('contentHash: a title or region containing the serialization\'s own delimiter characters still round-trips to a stable, non-colliding hash', () => {
+  const withDelims = { title: 'Title","region":"injected', region: 'plain', milestoneNumber: 1 };
+  const plain = { title: 'plain-title', region: 'plain', milestoneNumber: 1 };
+  const hash1 = contentHash(withDelims);
+  assert.equal(hash1, contentHash(withDelims));
+  assert.notEqual(hash1, contentHash(plain));
+});
+
+test('renderFieldState/parseFieldState: round-trips the four field values, including an empty requirements list and a status carrying a space', () => {
+  const values = { gsdId: 'issue:phase:04', phaseId: '04', requirements: [], status: 'In Progress' };
+  const serialized = renderFieldState(values);
+  assert.equal(typeof serialized, 'string');
+  const parsed = parseFieldState(serialized);
+  assert.equal(parsed.kind, 'known');
+  assert.deepEqual(parsed.values, values);
+});
+
+test('renderFieldState/parseFieldState: round-trips a non-empty requirements list unchanged, in order', () => {
+  const values = { gsdId: 'issue:phase:04', phaseId: '04', requirements: ['PHASE-01', 'PHASE-02'], status: 'Todo' };
+  const parsed = parseFieldState(renderFieldState(values));
+  assert.equal(parsed.kind, 'known');
+  assert.deepEqual(parsed.values.requirements, values.requirements);
+});
+
+test('parseFieldState: a malformed or empty string returns a typed unknown result rather than throwing or returning partial values', () => {
+  const malformed = [
+    '',
+    'not json',
+    '{"gsdId":"x"}',
+    '[]',
+    'null',
+    '{"gsdId":1,"phaseId":"04","requirements":[],"status":"Todo"}',
+    '{"gsdId":"x","phaseId":"04","requirements":["ok",1],"status":"Todo"}',
+  ];
+  for (const input of malformed) {
+    const result = parseFieldState(input);
+    assert.equal(result.kind, 'unknown', `expected unknown for input: ${input}`);
+    assert.equal(Object.prototype.hasOwnProperty.call(result, 'values'), false);
+  }
+});
+
+test('parseFieldState: never throws for any malformed input', () => {
+  for (const input of ['', 'not json', '{{{', 'undefined', '42']) {
+    assert.doesNotThrow(() => parseFieldState(input));
+  }
+});
+
+test('changedFields: a previous and desired state differing in exactly one field reports exactly that field', () => {
+  const previousValues = { gsdId: 'a', phaseId: '04', requirements: ['R1'], status: 'Todo' };
+  const previous = { kind: 'known', values: previousValues };
+  const desired = { ...previousValues, status: 'Done' };
+  assert.deepEqual(changedFields(previous, desired), ['status']);
+});
+
+test('changedFields: an unknown previous state reports all four fields as changed', () => {
+  const desired = { gsdId: 'a', phaseId: '04', requirements: ['R1'], status: 'Todo' };
+  const changed = changedFields({ kind: 'unknown' }, desired);
+  assert.deepEqual([...changed].sort(), ['gsdId', 'phaseId', 'requirements', 'status'].sort());
+});
+
+test('changedFields: an identical previous and desired state reports no fields as changed', () => {
+  const values = { gsdId: 'a', phaseId: '04', requirements: ['R1', 'R2'], status: 'Todo' };
+  const previous = { kind: 'known', values: { ...values, requirements: [...values.requirements] } };
+  assert.deepEqual(changedFields(previous, values), []);
 });
