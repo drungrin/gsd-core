@@ -1,0 +1,356 @@
+{
+  "provenance": "Live captures against gh 2.96.0, repo drungrin/gsd-core, account drungrin, 2026-08-02. Every temporary label/milestone object created for this capture (gsd-sync-test-tmp, gsd-sync-test-tmp-2, gsd-sync-test-tmp-milestone, gsd-sync-test-open, gsd-sync-test-closed) was deleted immediately after capture, verified by a post-cleanup live re-read showing exactly the 9 GitHub default labels and zero milestones, matching the repository state before this capture began. The labelAlreadyExists422Body is DERIVED from tests/fixtures/github-sync/header-framing.json live-422 case (captured 2026-08-01, same repo/account/gh version) rather than re-captured, since that fixture already carries the real recorded protocol header block this plan conflict recovery needs; emptyLabelsList is SYNTHETIC because the maintained repository always carries GitHub default labels and deleting all of them for a capture would be destructive to the project. LIVE FINDING: gh api defaults to POST, not GET, the instant any -f/-F value is supplied on a path with no explicit --method/-X — this was discovered live while capturing this fixture (a GET-intent per_page query landed on the label-create POST endpoint) and is why restApiPath reads always pass -X GET explicitly.",
+  "multiPageLabelsList": [
+    [
+      {
+        "id": 11563893340,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCXA",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/bug",
+        "name": "bug",
+        "color": "d73a4a",
+        "default": true,
+        "description": "Something isn't working"
+      },
+      {
+        "id": 11563893351,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCZw",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/documentation",
+        "name": "documentation",
+        "color": "0075ca",
+        "default": true,
+        "description": "Improvements or additions to documentation"
+      }
+    ],
+    [
+      {
+        "id": 11563893357,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCbQ",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/duplicate",
+        "name": "duplicate",
+        "color": "cfd3d7",
+        "default": true,
+        "description": "This issue or pull request already exists"
+      },
+      {
+        "id": 11563893362,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCcg",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/enhancement",
+        "name": "enhancement",
+        "color": "a2eeef",
+        "default": true,
+        "description": "New feature or request"
+      }
+    ],
+    [
+      {
+        "id": 11563893375,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCfw",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/good%20first%20issue",
+        "name": "good first issue",
+        "color": "7057ff",
+        "default": true,
+        "description": "Good for newcomers"
+      },
+      {
+        "id": 11698564087,
+        "node_id": "LA_kwDOTctX3c8AAAACuUnr9w",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/gsd-sync-test-tmp",
+        "name": "gsd-sync-test-tmp",
+        "color": "d73a4a",
+        "default": false,
+        "description": "temporary label for 03-05 fixture capture, deleted immediately"
+      }
+    ],
+    [
+      {
+        "id": 11563893368,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCeA",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/help%20wanted",
+        "name": "help wanted",
+        "color": "008672",
+        "default": true,
+        "description": "Extra attention is needed"
+      },
+      {
+        "id": 11563893381,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMChQ",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/invalid",
+        "name": "invalid",
+        "color": "e4e669",
+        "default": true,
+        "description": "This doesn't seem right"
+      }
+    ],
+    [
+      {
+        "id": 11563893386,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCig",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/question",
+        "name": "question",
+        "color": "d876e3",
+        "default": true,
+        "description": "Further information is requested"
+      },
+      {
+        "id": 11563893393,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCkQ",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/wontfix",
+        "name": "wontfix",
+        "color": "ffffff",
+        "default": true,
+        "description": "This will not be worked on"
+      }
+    ]
+  ],
+  "singlePageLabelsList": [
+    [
+      {
+        "id": 11563893340,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCXA",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/bug",
+        "name": "bug",
+        "color": "d73a4a",
+        "default": true,
+        "description": "Something isn't working"
+      },
+      {
+        "id": 11563893351,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCZw",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/documentation",
+        "name": "documentation",
+        "color": "0075ca",
+        "default": true,
+        "description": "Improvements or additions to documentation"
+      },
+      {
+        "id": 11563893357,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCbQ",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/duplicate",
+        "name": "duplicate",
+        "color": "cfd3d7",
+        "default": true,
+        "description": "This issue or pull request already exists"
+      },
+      {
+        "id": 11563893362,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCcg",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/enhancement",
+        "name": "enhancement",
+        "color": "a2eeef",
+        "default": true,
+        "description": "New feature or request"
+      },
+      {
+        "id": 11563893375,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCfw",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/good%20first%20issue",
+        "name": "good first issue",
+        "color": "7057ff",
+        "default": true,
+        "description": "Good for newcomers"
+      },
+      {
+        "id": 11698564087,
+        "node_id": "LA_kwDOTctX3c8AAAACuUnr9w",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/gsd-sync-test-tmp",
+        "name": "gsd-sync-test-tmp",
+        "color": "d73a4a",
+        "default": false,
+        "description": "temporary label for 03-05 fixture capture, deleted immediately"
+      },
+      {
+        "id": 11563893368,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCeA",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/help%20wanted",
+        "name": "help wanted",
+        "color": "008672",
+        "default": true,
+        "description": "Extra attention is needed"
+      },
+      {
+        "id": 11563893381,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMChQ",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/invalid",
+        "name": "invalid",
+        "color": "e4e669",
+        "default": true,
+        "description": "This doesn't seem right"
+      },
+      {
+        "id": 11563893386,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCig",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/question",
+        "name": "question",
+        "color": "d876e3",
+        "default": true,
+        "description": "Further information is requested"
+      },
+      {
+        "id": 11563893393,
+        "node_id": "LA_kwDOTctX3c8AAAACsUMCkQ",
+        "url": "https://api.github.com/repos/drungrin/gsd-core/labels/wontfix",
+        "name": "wontfix",
+        "color": "ffffff",
+        "default": true,
+        "description": "This will not be worked on"
+      }
+    ]
+  ],
+  "emptyLabelsList": [
+    []
+  ],
+  "milestonesBothStatesList": [
+    [
+      {
+        "url": "https://api.github.com/repos/drungrin/gsd-core/milestones/2",
+        "html_url": "https://github.com/drungrin/gsd-core/milestone/2",
+        "labels_url": "https://api.github.com/repos/drungrin/gsd-core/milestones/2/labels",
+        "id": 17094283,
+        "node_id": "MI_kwDOTctX3c4BBNaL",
+        "number": 2,
+        "title": "gsd-sync-test-open",
+        "description": null,
+        "creator": {
+          "login": "drungrin",
+          "id": 13048606,
+          "node_id": "MDQ6VXNlcjEzMDQ4NjA2",
+          "avatar_url": "https://avatars.githubusercontent.com/u/13048606?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/drungrin",
+          "html_url": "https://github.com/drungrin",
+          "followers_url": "https://api.github.com/users/drungrin/followers",
+          "following_url": "https://api.github.com/users/drungrin/following{/other_user}",
+          "gists_url": "https://api.github.com/users/drungrin/gists{/gist_id}",
+          "starred_url": "https://api.github.com/users/drungrin/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/drungrin/subscriptions",
+          "organizations_url": "https://api.github.com/users/drungrin/orgs",
+          "repos_url": "https://api.github.com/users/drungrin/repos",
+          "events_url": "https://api.github.com/users/drungrin/events{/privacy}",
+          "received_events_url": "https://api.github.com/users/drungrin/received_events",
+          "type": "User",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "open_issues": 0,
+        "closed_issues": 0,
+        "state": "open",
+        "created_at": "2026-08-02T01:51:48Z",
+        "updated_at": "2026-08-02T01:51:48Z",
+        "due_on": null,
+        "closed_at": null
+      },
+      {
+        "url": "https://api.github.com/repos/drungrin/gsd-core/milestones/3",
+        "html_url": "https://github.com/drungrin/gsd-core/milestone/3",
+        "labels_url": "https://api.github.com/repos/drungrin/gsd-core/milestones/3/labels",
+        "id": 17094284,
+        "node_id": "MI_kwDOTctX3c4BBNaM",
+        "number": 3,
+        "title": "gsd-sync-test-closed",
+        "description": null,
+        "creator": {
+          "login": "drungrin",
+          "id": 13048606,
+          "node_id": "MDQ6VXNlcjEzMDQ4NjA2",
+          "avatar_url": "https://avatars.githubusercontent.com/u/13048606?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/drungrin",
+          "html_url": "https://github.com/drungrin",
+          "followers_url": "https://api.github.com/users/drungrin/followers",
+          "following_url": "https://api.github.com/users/drungrin/following{/other_user}",
+          "gists_url": "https://api.github.com/users/drungrin/gists{/gist_id}",
+          "starred_url": "https://api.github.com/users/drungrin/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/drungrin/subscriptions",
+          "organizations_url": "https://api.github.com/users/drungrin/orgs",
+          "repos_url": "https://api.github.com/users/drungrin/repos",
+          "events_url": "https://api.github.com/users/drungrin/events{/privacy}",
+          "received_events_url": "https://api.github.com/users/drungrin/received_events",
+          "type": "User",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "open_issues": 0,
+        "closed_issues": 0,
+        "state": "closed",
+        "created_at": "2026-08-02T01:51:49Z",
+        "updated_at": "2026-08-02T01:51:49Z",
+        "due_on": null,
+        "closed_at": "2026-08-02T01:51:49Z"
+      }
+    ]
+  ],
+  "emptyMilestonesList": [
+    []
+  ],
+  "labelCreateResponse": {
+    "id": 11698568989,
+    "node_id": "LA_kwDOTctX3c8AAAACuUn_HQ",
+    "url": "https://api.github.com/repos/drungrin/gsd-core/labels/gsd-sync-test-tmp-2",
+    "name": "gsd-sync-test-tmp-2",
+    "color": "0075ca",
+    "default": false,
+    "description": "temporary second label for 03-05 fixture capture"
+  },
+  "milestoneCreateResponse": {
+    "url": "https://api.github.com/repos/drungrin/gsd-core/milestones/1",
+    "html_url": "https://github.com/drungrin/gsd-core/milestone/1",
+    "labels_url": "https://api.github.com/repos/drungrin/gsd-core/milestones/1/labels",
+    "id": 17094282,
+    "node_id": "MI_kwDOTctX3c4BBNaK",
+    "number": 1,
+    "title": "gsd-sync-test-tmp-milestone",
+    "description": "temporary milestone for 03-05 fixture capture, deleted immediately",
+    "creator": {
+      "login": "drungrin",
+      "id": 13048606,
+      "node_id": "MDQ6VXNlcjEzMDQ4NjA2",
+      "avatar_url": "https://avatars.githubusercontent.com/u/13048606?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/drungrin",
+      "html_url": "https://github.com/drungrin",
+      "followers_url": "https://api.github.com/users/drungrin/followers",
+      "following_url": "https://api.github.com/users/drungrin/following{/other_user}",
+      "gists_url": "https://api.github.com/users/drungrin/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/drungrin/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/drungrin/subscriptions",
+      "organizations_url": "https://api.github.com/users/drungrin/orgs",
+      "repos_url": "https://api.github.com/users/drungrin/repos",
+      "events_url": "https://api.github.com/users/drungrin/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/drungrin/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "open_issues": 0,
+    "closed_issues": 0,
+    "state": "closed",
+    "created_at": "2026-08-02T01:50:59Z",
+    "updated_at": "2026-08-02T01:50:59Z",
+    "due_on": null,
+    "closed_at": "2026-08-02T01:50:59Z"
+  },
+  "labelAlreadyExists422Body": {
+    "message": "Validation Failed",
+    "errors": [
+      {
+        "resource": "Label",
+        "code": "already_exists",
+        "field": "name"
+      }
+    ],
+    "documentation_url": "https://docs.github.com/rest/issues/labels#create-a-label",
+    "status": "422"
+  },
+  "milestoneAlreadyExists422Body": {
+    "message": "Validation Failed",
+    "errors": [
+      {
+        "resource": "Milestone",
+        "code": "already_exists",
+        "field": "title"
+      }
+    ],
+    "documentation_url": "https://docs.github.com/rest/issues/milestones#create-a-milestone",
+    "status": "422"
+  }
+}

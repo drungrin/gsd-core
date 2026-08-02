@@ -8,10 +8,17 @@ const path = require('node:path');
 const {
   assertPathSafeTarget,
   readBootstrapRemoteState,
+  restPath,
+  readRepoLabels,
+  readRepoMilestones,
   BOOTSTRAP_REMOTE_REASON,
   PROJECT_OUTCOME,
   STATUS_FIELD_NAME,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
+
+const repoObjectsFixture = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/bootstrap-repo-objects.json'), 'utf8'),
+);
 const { planStatusOptionMerge, planProject, planFields, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 
 function envelope(data) {
@@ -47,7 +54,18 @@ function makeExecGh(sequence) {
       calls.push(args);
       const isRepoDoc = args.find((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:repository'));
       const isFieldsDoc = args.find((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:fieldsWithTypes'));
-      const kind = isRepoDoc ? 'repository' : isFieldsDoc ? 'fields' : 'unknown';
+      const isLabelsRest = typeof args[1] === 'string' && args[1].includes('/labels');
+      const isMilestonesRest = typeof args[1] === 'string' && args[1].includes('/milestones');
+      const kind = isRepoDoc ? 'repository' : isFieldsDoc ? 'fields' : isLabelsRest ? 'labels' : isMilestonesRest ? 'milestones' : 'unknown';
+      // Tests that never script 'labels'/'milestones' still exercise
+      // readBootstrapRemoteState's now-mandatory REST reads (Task 2); default
+      // both to a decodable empty list so every pre-Task-2 test keeps passing
+      // unchanged, and a test that cares about the REST shape scripts it
+      // explicitly via `sequence.labels`/`sequence.milestones`.
+      if (kind === 'labels' || kind === 'milestones') {
+        const next = sequence[kind]?.shift() ?? [[]];
+        return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify(next) };
+      }
       const next = sequence[kind]?.shift();
       if (!next) throw new Error(`no scripted response for ${kind}`);
       return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify(next) };
@@ -200,6 +218,184 @@ describe('readBootstrapRemoteState', () => {
     assert.equal(result.available, true);
     assert.equal(result.projectOutcome, PROJECT_OUTCOME.ABSENT);
   });
+
+  test('a real slurped multi-page label list is decoded and attached to the snapshot alongside the existing project/fields data', () => {
+    const seq = { repository: [repositoryResponse()], fields: [ownerFieldsResponse([])], labels: [repoObjectsFixture.multiPageLabelsList] };
+    const { execGh } = makeExecGh(seq);
+    const result = readBootstrapRemoteState({ cwd: '/repo', owner: 'octo', repo: 'repo', projectNumber: 7, execGh });
+    assert.equal(result.available, true);
+    assert.equal(result.labels.length, repoObjectsFixture.multiPageLabelsList.flat().length);
+    assert.equal(result.milestones.length, 0);
+  });
+
+  test('a REST-unavailable label read marks the whole snapshot unavailable rather than yielding an empty list', () => {
+    const seq = {
+      repository: [repositoryResponse()],
+      fields: [ownerFieldsResponse([])],
+      labels: [{ not: 'an array' }],
+    };
+    const { execGh } = makeExecGh(seq);
+    const result = readBootstrapRemoteState({ cwd: '/repo', owner: 'octo', repo: 'repo', projectNumber: 7, execGh });
+    assert.equal(result.available, false);
+    assert.equal(result.reason, BOOTSTRAP_REMOTE_REASON.REST_UNAVAILABLE);
+  });
+});
+
+// ─── restPath / readRepoLabels / readRepoMilestones (Task 2, REST reads) ──
+
+function restExecGh(bodies) {
+  const calls = [];
+  return {
+    calls,
+    execGh(args, opts) {
+      calls.push({ args, opts });
+      const next = bodies.shift();
+      if (next === undefined) throw new Error('no scripted REST response');
+      if (next.exitCode !== undefined) return next;
+      return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify(next) };
+    },
+  };
+}
+
+describe('restPath', () => {
+  test('returns the repos path with the two real UAT values appearing literally, for the labels suffix', () => {
+    assert.equal(restPath('drungrin', 'gsd-core', '/labels'), 'repos/drungrin/gsd-core/labels');
+    assert.equal(restPath('drungrin', 'gsd-core', '/milestones'), 'repos/drungrin/gsd-core/milestones');
+  });
+
+  test('returns null, never invoking execGh, for a brace, a slash, an at-sign, a space, and the empty string on the owner', () => {
+    for (const owner of ['{owner}', 'owner/evil', '@owner', 'owner name', '']) {
+      assert.equal(restPath(owner, 'repo', '/labels'), null);
+    }
+  });
+
+  test('returns null, never invoking execGh, for the same five hostile values on the repo', () => {
+    for (const repo of ['{repo}', 'repo/evil', '@repo', 'repo name', '']) {
+      assert.equal(restPath('owner', repo, '/labels'), null);
+    }
+  });
+
+  test('the literal three-character brace-owner token never reaches execGh', () => {
+    let called = false;
+    const result = readRepoLabels({ cwd: '/repo', owner: '{owner}', repo: 'repo', execGh: () => { called = true; throw new Error('must not call execGh'); } });
+    assert.equal(called, false);
+    assert.equal(result.available, false);
+    assert.equal(result.reason, BOOTSTRAP_REMOTE_REASON.UNSAFE_TARGET);
+  });
+});
+
+describe('readRepoLabels', () => {
+  test('passes an explicit page size of 100, the paginate and slurp flags, and includeHeaders false, in a single execGh call', () => {
+    const { execGh, calls } = restExecGh([[[]]]);
+    readRepoLabels({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    assert.equal(calls.length, 1);
+    const { args, opts } = calls[0];
+    assert.ok(args.includes('-f'));
+    assert.equal(args[args.indexOf('per_page=100') - 1], '-f');
+    assert.ok(args.includes('--paginate'));
+    assert.ok(args.includes('--slurp'));
+    assert.equal(opts.includeHeaders, false);
+  });
+
+  test('a real slurped multi-page label body flattens to the sum of every page, in first-page-then-second-page order, from exactly one execGh call', () => {
+    const { execGh, calls } = restExecGh([repoObjectsFixture.multiPageLabelsList]);
+    const result = readRepoLabels({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    assert.equal(calls.length, 1);
+    assert.equal(result.available, true);
+    const expectedNames = repoObjectsFixture.multiPageLabelsList.flat().map((l) => l.name);
+    assert.deepEqual(result.entries.map((e) => e.name), expectedNames);
+  });
+
+  test('a real single-page label body (still slurp-wrapped in one outer array) decodes to the same entry count', () => {
+    const { execGh } = restExecGh([repoObjectsFixture.singlePageLabelsList]);
+    const result = readRepoLabels({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    assert.equal(result.available, true);
+    assert.equal(result.entries.length, repoObjectsFixture.singlePageLabelsList.flat().length);
+  });
+
+  test('an array of one empty array decodes to an available result with zero entries — not conflated with an unavailable read', () => {
+    const { execGh } = restExecGh([repoObjectsFixture.emptyLabelsList]);
+    const result = readRepoLabels({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    assert.equal(result.available, true);
+    assert.deepEqual(result.entries, []);
+  });
+
+  test('a flat array of objects (the un-nested single-page shape some gh versions return) is also accepted', () => {
+    const flat = repoObjectsFixture.multiPageLabelsList.flat();
+    const { execGh } = restExecGh([flat]);
+    const result = readRepoLabels({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    assert.equal(result.available, true);
+    assert.equal(result.entries.length, flat.length);
+  });
+
+  test('every decoded label entry exposes a non-empty node id string', () => {
+    const { execGh } = restExecGh([repoObjectsFixture.multiPageLabelsList]);
+    const result = readRepoLabels({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    for (const entry of result.entries) {
+      assert.equal(typeof entry.nodeId, 'string');
+      assert.ok(entry.nodeId.length > 0);
+    }
+  });
+
+  test('an object body, a non-zero exit, and unparseable JSON each yield the REST-unavailable reason with no thrown error', () => {
+    const cases = [
+      { not: 'an array' },
+      { exitCode: 1, reason: 'gh_exit_nonzero', stdout: '', stderr: 'boom' },
+      'not json',
+    ];
+    for (const body of cases) {
+      const { execGh } = restExecGh([body]);
+      assert.doesNotThrow(() => {
+        const result = readRepoLabels({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+        assert.equal(result.available, false);
+        assert.equal(result.reason, BOOTSTRAP_REMOTE_REASON.REST_UNAVAILABLE);
+      });
+    }
+  });
+});
+
+describe('readRepoMilestones', () => {
+  test('the request includes the all-states parameter alongside the explicit page size', () => {
+    const { execGh, calls } = restExecGh([[[]]]);
+    readRepoMilestones({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    const { args } = calls[0];
+    assert.equal(args[args.indexOf('state=all') - 1], '-f');
+    assert.equal(args[args.indexOf('per_page=100') - 1], '-f');
+  });
+
+  test('a real milestone list carrying both an open and a closed entry decodes both, each with its own number and state', () => {
+    const { execGh } = restExecGh([repoObjectsFixture.milestonesBothStatesList]);
+    const result = readRepoMilestones({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    assert.equal(result.available, true);
+    assert.deepEqual(result.entries.map((e) => e.state).sort(), ['closed', 'open']);
+    for (const entry of result.entries) {
+      assert.equal(typeof entry.number, 'number');
+      assert.ok(entry.number > 0);
+    }
+  });
+
+  test('an empty milestone list (a real capture: the repository carried zero milestones) decodes to an available, zero-entry result', () => {
+    const { execGh } = restExecGh([repoObjectsFixture.emptyMilestonesList]);
+    const result = readRepoMilestones({ cwd: '/repo', owner: 'octo', repo: 'repo', execGh });
+    assert.equal(result.available, true);
+    assert.deepEqual(result.entries, []);
+  });
+});
+
+describe('bootstrap-repo-objects.json fixture', () => {
+  test('provenance names the repository, the capture date, and the gh version', () => {
+    assert.match(repoObjectsFixture.provenance, /drungrin\/gsd-core/);
+    assert.match(repoObjectsFixture.provenance, /2026-08-02/);
+    assert.match(repoObjectsFixture.provenance, /2\.96\.0/);
+  });
+
+  test('the label-already-exists 422 body decodes as GitHub\'s already-exists error shape (Task 3\'s conflict recovery input)', () => {
+    assert.equal(repoObjectsFixture.labelAlreadyExists422Body.errors[0].code, 'already_exists');
+  });
+
+  test('the milestone-already-exists 422 body decodes as GitHub\'s already-exists error shape too', () => {
+    assert.equal(repoObjectsFixture.milestoneAlreadyExists422Body.errors[0].code, 'already_exists');
+  });
 });
 
 // ─── the five bootstrap document guards (a bootstrap-local capture harness) ─
@@ -229,6 +425,11 @@ function captureDispatchedBootstrapDocuments() {
     cwd: '/tmp', owner: 'octo', repo: 'example', projectNumber: 7,
     execGh(args) {
       const query = args.find((arg) => arg.startsWith('query='));
+      // Task 2's REST label/milestone reads carry no `query=` argv entry at
+      // all — they are not GraphQL documents and are out of scope for this
+      // GraphQL-only document-contract harness (Guard 1 below asserts
+      // completeness over BOOTSTRAP_DOCUMENTS, not over every execGh call).
+      if (!query) return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify([[]]) };
       const name = ['repository', 'fieldsWithTypes'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
       if (!documents.has(name)) documents.set(name, query.slice('query='.length));
       if (name === 'repository') {
