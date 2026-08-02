@@ -235,6 +235,128 @@ test('dedupeMilestonesByVersion keeps the first entry in input order and reports
   assert.deepEqual(result.duplicates, [second.title]);
 });
 
+// ─── readDesiredState: success criteria and requirement IDs (plan 04-02 Task 1) ───
+
+test('a phase section carrying a comma-separated requirements label yields those IDs, trimmed, in source order, with no empty entries', (t) => {
+  const repoDir = createTempDir('github-sync-desired-requirements-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n**Requirements**: FOO-01,  FOO-02 ,FOO-03,\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  assert.deepEqual(result.phases[0].requirements, ['FOO-01', 'FOO-02', 'FOO-03']);
+});
+
+test('a phase section carrying no requirements label yields an empty requirements list rather than an unavailable read', (t) => {
+  const repoDir = createTempDir('github-sync-desired-norequirements-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  assert.deepEqual(result.phases[0].requirements, []);
+});
+
+test('a requirements list written with surrounding square brackets yields the same IDs with the brackets stripped', (t) => {
+  const repoDir = createTempDir('github-sync-desired-requirements-brackets-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n**Requirements**: [FOO-01, FOO-02]\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.deepEqual(result.phases[0].requirements, ['FOO-01', 'FOO-02']);
+});
+
+test('a phase section carrying a success-criteria label followed by two-space-indented numbered items yields those items with numbering removed and text trimmed', (t) => {
+  const repoDir = createTempDir('github-sync-desired-successcriteria-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n**Success Criteria** (what must be TRUE):\n\n  1. First criterion  \n  2. Second criterion\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.deepEqual(result.phases[0].successCriteria, ['First criterion', 'Second criterion']);
+});
+
+test('a success-criteria item that wraps onto a continuation line yields one entry joined with a single space, not two entries and not a truncation', (t) => {
+  const repoDir = createTempDir('github-sync-desired-successcriteria-wrap-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n**Success Criteria** (what must be TRUE):\n\n  1. First line of the item\n     continues right here\n  2. Second item\n',
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.deepEqual(result.phases[0].successCriteria, ['First line of the item continues right here', 'Second item']);
+});
+
+test('extraction stops at the next bold label line: a confidence-handling paragraph, an italic amendment note, and a Plans line contribute no entry', (t) => {
+  const repoDir = createTempDir('github-sync-desired-successcriteria-stop-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    [
+      '# Roadmap',
+      '',
+      '### Phase 01: One',
+      '',
+      '**Goal**: one',
+      '**Success Criteria** (what must be TRUE):',
+      '',
+      '  1. Only item',
+      '',
+      '*Amended note here spanning',
+      'multiple lines of italic prose.*',
+      '',
+      '**Confidence handling**: some prose that must never become an entry',
+      '',
+      '**Plans**: TBD',
+      '',
+      '### Phase 02: Two',
+      '',
+      '**Goal**: two',
+      '',
+    ].join('\n'),
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.deepEqual(result.phases[0].successCriteria, ['Only item']);
+});
+
+test('a phase section carrying no success-criteria label yields an empty success-criteria list rather than an unavailable read', (t) => {
+  const repoDir = createTempDir('github-sync-desired-nosuccesscriteria-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.deepEqual(result.phases[0].successCriteria, []);
+});
+
+test('the real repository roadmap parses: phase 04 yields its three PHASE-* requirement IDs and four success-criteria entries', () => {
+  const repoRoot = path.join(__dirname, '..');
+
+  const result = readDesiredState(repoRoot);
+
+  assert.equal(result.available, true);
+  const phase04 = result.phases.find((phase) => phase.id === '04');
+  assert.ok(phase04, 'phase 04 must be present in the real repository roadmap');
+  assert.deepEqual(phase04.requirements, ['PHASE-01', 'PHASE-02', 'PHASE-03']);
+  assert.equal(phase04.successCriteria.length, 4);
+});
+
 test('every fixture in this suite produces a milestone array with no two entries sharing a version', (t) => {
   const repoDir = createTempDir('github-sync-desired-uniqueness-');
   t.after(() => cleanup(repoDir));

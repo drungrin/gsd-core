@@ -19,6 +19,10 @@ interface DesiredPhase {
   id: string;
   title: string;
   goal: string;
+  /** Ordered, trimmed, numbering-stripped success-criteria items. Empty when the phase declares none — a real state, never an unavailable read. */
+  successCriteria: string[];
+  /** Ordered, trimmed requirement IDs. Empty when the phase declares none — a real state, never an unavailable read. */
+  requirements: string[];
 }
 
 interface DesiredPlan {
@@ -73,6 +77,73 @@ function normalizeId(value: string): string {
   return value.padStart(2, '0');
 }
 
+/**
+ * Line-anchored bold `Requirements` label on the per-phase section slice.
+ * Handles both spellings seen across GSD roadmaps — a bare comma-separated
+ * list and one wrapped in a single pair of square brackets — trimming each
+ * ID and dropping empties. Absent label yields an empty array: a phase with
+ * no declared requirements is a real state, never an unavailable read.
+ */
+function extractRequirements(section: string): string[] {
+  const match = /^\*\*Requirements\*\*:\s*(.+)$/m.exec(section);
+  if (!match) return [];
+  let value = match[1].trim();
+  if (value.startsWith('[') && value.endsWith(']')) {
+    value = value.slice(1, -1);
+  }
+  return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+/**
+ * Bold `Success Criteria` label on the per-phase section slice. Reads
+ * forward to the first following line that is a new bold label (a line
+ * whose first non-whitespace run opens a bold span and ends with a colon)
+ * or to the end of the slice, whichever comes first — that window is the
+ * hard outer boundary. Within it, an item begins at an optional-indent
+ * decimal-numbered line; every following non-blank line that does not start
+ * a new numbered item is a continuation, joined after a single space. A
+ * blank line ends the current item; the first non-numbered block reached
+ * after at least one item has been collected (an italic amendment note, a
+ * `**Confidence handling**:` paragraph inside the window, etc.) ends
+ * collection entirely rather than being swept in as a continuation. Absent
+ * label yields an empty array: a phase with no declared criteria is a real
+ * state, never an unavailable read.
+ */
+function extractSuccessCriteria(section: string): string[] {
+  const labelMatch = /^\*\*Success Criteria\*\*.*$/m.exec(section);
+  if (!labelMatch) return [];
+  const afterLabel = section.slice(labelMatch.index + labelMatch[0].length);
+  const stopMatch = /^\*\*[^*\n]+\*\*:.*$/m.exec(afterLabel);
+  const windowText = stopMatch ? afterLabel.slice(0, stopMatch.index) : afterLabel;
+
+  const items: string[] = [];
+  let current: string[] | null = null;
+  for (const line of windowText.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') {
+      if (current) {
+        items.push(current.join(' ').trim());
+        current = null;
+      }
+      continue;
+    }
+    const numberedMatch = /^\d+\.\s+(.*)$/.exec(trimmed);
+    if (numberedMatch) {
+      if (current) items.push(current.join(' ').trim());
+      current = [numberedMatch[1]];
+    } else if (current) {
+      current.push(trimmed);
+    } else if (items.length > 0) {
+      // Past the list (its last item was already flushed at a blank line)
+      // and this block does not open a new numbered item — an amendment
+      // note or similar prose inside the window. Stop collecting for good.
+      break;
+    }
+  }
+  if (current) items.push(current.join(' ').trim());
+  return items;
+}
+
 function parseRoadmap(raw: string): DesiredPhase[] | null {
   const matches = [...raw.matchAll(/^### Phase (\d+(?:\.\d+)?):\s*(.+)$/gm)];
   if (matches.length === 0) return null;
@@ -80,9 +151,15 @@ function parseRoadmap(raw: string): DesiredPhase[] | null {
   for (let index = 0; index < matches.length; index += 1) {
     const match = matches[index];
     const nextOffset = matches[index + 1]?.index ?? raw.length;
-    const section = raw.slice(match.index! + match[0].length, nextOffset);
+    const section = raw.slice(match.index + match[0].length, nextOffset);
     const goal = /^\*\*Goal\*\*:\s*(.+)$/m.exec(section)?.[1]?.trim() ?? '';
-    phases.push({ id: normalizeId(match[1]), title: match[2].trim(), goal });
+    phases.push({
+      id: normalizeId(match[1]),
+      title: match[2].trim(),
+      goal,
+      successCriteria: extractSuccessCriteria(section),
+      requirements: extractRequirements(section),
+    });
   }
   return phases.sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
 }
