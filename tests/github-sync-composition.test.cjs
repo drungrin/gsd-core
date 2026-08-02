@@ -40,7 +40,8 @@ const ID_ALLOWLIST = new Set([
   'OPTION_TODO', 'OPTION_IN_PROGRESS', 'OPTION_DONE',
 ]);
 const { BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
-const { renderPhaseRegion, contentHash, renderFieldState } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const { phaseMarker, FENCE_BEGIN, FENCE_END, renderPhaseRegion, contentHash, renderFieldState } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const { prepareIssueUpdates } = require('../gsd-core/bin/lib/github-sync-issue-update.cjs');
 
 const FIELD_KEY = {
   gsdId: BOOTSTRAP_LOGICAL_KEY.field('GSD ID'),
@@ -503,4 +504,283 @@ test('two phases in the desired state produce twelve operations grouped by phase
     ['graphql', 'phase:05'],
     ['graphql', 'phase:05'],
   ]);
+});
+
+// ─── Plan 04-05 Task 3: the four-run convergence sequence, end to end ─────
+
+const SIX_MILESTONE_VERSION = 'v2.0';
+const SIX_MILESTONE_KEY = BOOTSTRAP_LOGICAL_KEY.milestone(SIX_MILESTONE_VERSION);
+const SIX_MILESTONE_NUMBER = 9;
+
+function desiredOnePhase(phase) {
+  return {
+    available: true,
+    reason: 'ok',
+    phases: [phase],
+    milestones: [{ version: SIX_MILESTONE_VERSION, name: 'Two', title: `${SIX_MILESTONE_VERSION} — Two`, description: 'd', archived: false }],
+  };
+}
+
+/** Plan 04-05: the milestone completion plus a fully bootstrapped board's project/field/option completions, under the v2.0 milestone this section's fixtures share. */
+function seedFullBootstrapMap(cwd) {
+  let map = null;
+  map = recordCompletion(map, makeSeedCompletion(SIX_MILESTONE_KEY, 'MI_node_9', SIX_MILESTONE_NUMBER));
+  map = recordCompletion(map, makeSeedCompletion(BOOTSTRAP_LOGICAL_KEY.project(), TARGET.projectNodeId, undefined));
+  for (const [logicalKey, completion] of Object.entries(fieldBootstrapCompletions())) {
+    map = recordCompletion(map, makeSeedCompletion(logicalKey, completion.nodeId, undefined));
+  }
+  writeSyncMapAtomically(cwd, map);
+  const reopened = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(reopened.kind, 'valid');
+  return reopened;
+}
+
+test('four-run convergence: create, converge (byte-identical map), update in place preserving developer prose, advance status with no REST call at all — one fully populated phase, driven end to end', (t) => {
+  const cwd = createTempProject('github-sync-composition-convergence-');
+  t.after(() => cleanup(cwd));
+
+  const basePhase = {
+    id: '06',
+    title: 'Phase Six',
+    goal: 'Ship the whole thing',
+    successCriteria: ['First criterion.', 'Second criterion.', 'Third criterion.'],
+    requirements: ['PHASE-01', 'PHASE-02', 'PHASE-03'],
+    status: 'Todo',
+  };
+  const clock = fixedClock();
+
+  // ─── First run, empty map: six dispatched operations in order ─────────────
+  const seeded = seedFullBootstrapMap(cwd);
+  const firstDesired = desiredOnePhase(basePhase);
+  const firstPlan = planReconciliation(firstDesired, remote([]), seeded);
+  assert.deepEqual(firstPlan.blocked, []);
+  assert.equal(firstPlan.operations.length, 6);
+  assert.deepEqual(firstPlan.operations.map((op) => op.logicalKey), [
+    'issue:phase:06', 'phase:06', 'phase:06', 'phase:06', 'phase:06', 'phase:06',
+  ]);
+  assert.equal(firstPlan.operations[0].transport, 'rest');
+  for (const op of firstPlan.operations.slice(1)) assert.equal(op.transport, 'graphql');
+
+  const restBodyEntry = firstPlan.operations[0].args.find((arg) => typeof arg === 'string' && arg.startsWith('body='));
+  const restBody = restBodyEntry.slice('body='.length);
+  assert.ok(restBody.includes(phaseMarker('06')));
+  assert.ok(restBody.includes(FENCE_BEGIN));
+  assert.ok(restBody.includes(FENCE_END));
+  assert.ok(restBody.includes(basePhase.goal));
+  for (const criterion of basePhase.successCriteria) assert.ok(restBody.includes(criterion));
+  for (const requirementId of basePhase.requirements) assert.ok(restBody.includes(requirementId));
+
+  const firstDispatched = [];
+  const firstRun = applyMutationPlan(firstPlan, {
+    cwd,
+    map: seeded.map,
+    clock,
+    execGh(args) {
+      firstDispatched.push(args);
+      const callIndex = firstDispatched.length;
+      if (callIndex === 1) return restIssueCreateResponse('I_node_06', 600);
+      if (callIndex === 2) return response('PVTI_item_06', 600);
+      return fieldValueResponse('PVTI_item_06', 600);
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(firstRun.kind, 'completed');
+  assert.equal(firstDispatched.length, 6);
+
+  const afterFirst = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterFirst.kind, 'valid');
+  const region1 = renderPhaseRegion(basePhase);
+  const expectedHash1 = contentHash({ title: basePhase.title, region: region1, milestoneNumber: SIX_MILESTONE_NUMBER });
+  const expectedFieldState1 = renderFieldState({ gsdId: 'phase:06', phaseId: '06', requirements: basePhase.requirements, status: basePhase.status });
+  assert.equal(afterFirst.map.completions['issue:phase:06'].contentHash, expectedHash1);
+  assert.equal(afterFirst.map.completions['phase:06'].fieldState, expectedFieldState1);
+  assert.equal(afterFirst.map.completions['phase:06'].issueNumber, 600);
+
+  // ─── Second run, same input: zero operations, byte-identical map ─────────
+  const boundRemote = remote([{ id: 'PVTI_item_06', content: { id: 'I_node_06', number: 600 } }]);
+  const secondPlan = planReconciliation(firstDesired, boundRemote, afterFirst);
+  assert.deepEqual(secondPlan.operations, []);
+  assert.deepEqual(secondPlan.pendingIssueUpdates, []);
+  assert.deepEqual(secondPlan.noops, [{ logicalKey: 'phase:06' }]);
+
+  let secondDispatched = 0;
+  const secondRun = applyMutationPlan(secondPlan, {
+    cwd,
+    map: afterFirst.map,
+    clock,
+    execGh() {
+      secondDispatched += 1;
+      throw new Error('an unchanged second run must not dispatch');
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(secondRun.kind, 'completed');
+  assert.equal(secondDispatched, 0);
+  const afterSecond = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterSecond.kind, 'valid');
+  assert.deepEqual(afterSecond.map, afterFirst.map, 'second run\'s persisted map is byte-identical to the first run\'s');
+
+  // ─── Third run, goal edited: zero field operations, one pending update ───
+  const editedPhase = { ...basePhase, goal: 'Ship the whole thing, revised' };
+  const thirdDesired = desiredOnePhase(editedPhase);
+  const thirdPlan = planReconciliation(thirdDesired, boundRemote, afterSecond);
+  assert.deepEqual(thirdPlan.operations, []);
+  assert.deepEqual(thirdPlan.pendingFieldChanges, []);
+  assert.equal(thirdPlan.pendingIssueUpdates.length, 1);
+
+  const developerProseAbove = 'Some prose a developer added above the fence.';
+  const developerProseBelow = 'Some prose a developer added below the fence.';
+  const oldRegion = renderPhaseRegion(basePhase);
+  const fetchedBody = `${phaseMarker('06')}\n${developerProseAbove}\n${FENCE_BEGIN}\n${oldRegion}\n${FENCE_END}\n${developerProseBelow}\n`;
+
+  const prepared = prepareIssueUpdates(thirdPlan.pendingIssueUpdates, {
+    cwd,
+    execGh(args) {
+      assert.deepEqual(args.slice(0, 4), ['api', `repos/${TARGET.owner}/${TARGET.repo}/issues/600`, '-X', 'GET']);
+      return { exitCode: 0, stdout: JSON.stringify({ id: 900600, node_id: 'I_node_06', number: 600, body: fetchedBody }), stderr: '' };
+    },
+  });
+  assert.deepEqual(prepared.reports, []);
+  assert.equal(prepared.operations.length, 1);
+  const patchBodyEntry = prepared.operations[0].args.find((arg) => typeof arg === 'string' && arg.startsWith('body='));
+  const patchBody = patchBodyEntry.slice('body='.length);
+  assert.ok(patchBody.includes(developerProseAbove));
+  assert.ok(patchBody.includes(developerProseBelow));
+  assert.ok(patchBody.includes(editedPhase.goal));
+  assert.ok(patchBody.indexOf(developerProseAbove) < patchBody.indexOf(developerProseBelow), 'prose above must stay above prose below');
+  // Byte-for-byte: everything outside the fences survives exactly, in position.
+  assert.ok(patchBody.startsWith(`${phaseMarker('06')}\n${developerProseAbove}\n${FENCE_BEGIN}`));
+  assert.ok(patchBody.endsWith(`${FENCE_END}\n${developerProseBelow}\n`));
+
+  const thirdRun = applyMutationPlan({ operations: prepared.operations }, {
+    cwd,
+    map: afterSecond.map,
+    clock,
+    execGh(args) {
+      assert.ok(args.includes('-X'));
+      assert.ok(args.includes('PATCH'));
+      return { exitCode: 0, stdout: JSON.stringify({ id: 900600, node_id: 'I_node_06', number: 600 }), stderr: '' };
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(thirdRun.kind, 'completed');
+
+  const afterThird = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterThird.kind, 'valid');
+  const newRegion = renderPhaseRegion(editedPhase);
+  const expectedHash3 = contentHash({ title: editedPhase.title, region: newRegion, milestoneNumber: SIX_MILESTONE_NUMBER });
+  assert.equal(afterThird.map.completions['issue:phase:06'].contentHash, expectedHash3);
+  assert.notEqual(afterThird.map.completions['issue:phase:06'].contentHash, expectedHash1);
+  assert.equal(afterThird.map.completions['phase:06'].fieldState, expectedFieldState1, 'the field state is left untouched by the goal-edit run');
+
+  // ─── Fourth run, status advanced only: exactly one field operation, no REST call at all ───
+  const advancedPhase = { ...editedPhase, status: 'Done' };
+  const fourthDesired = desiredOnePhase(advancedPhase);
+  const fourthPlan = planReconciliation(fourthDesired, boundRemote, afterThird);
+  assert.deepEqual(fourthPlan.pendingIssueUpdates, []);
+  assert.equal(fourthPlan.operations.length, 1);
+  assert.equal(fourthPlan.operations[0].args.find((arg) => typeof arg === 'string' && arg.startsWith('fieldId=')), 'fieldId=FIELD_STATUS');
+
+  const fourthDispatched = [];
+  const fourthRun = applyMutationPlan(fourthPlan, {
+    cwd,
+    map: afterThird.map,
+    clock,
+    execGh(args) {
+      fourthDispatched.push(args);
+      return fieldValueResponse('PVTI_item_06', 600);
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(fourthRun.kind, 'completed');
+  assert.equal(fourthDispatched.length, 1);
+  assert.deepEqual(fourthDispatched[0].slice(0, 2), ['api', 'graphql'], 'advancing status must issue no REST call at all — the D-12 property proven end to end');
+
+  const afterFourth = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterFourth.kind, 'valid');
+  const expectedFieldState4 = renderFieldState({ gsdId: 'phase:06', phaseId: '06', requirements: advancedPhase.requirements, status: 'Done' });
+  assert.equal(afterFourth.map.completions['phase:06'].fieldState, expectedFieldState4);
+  assert.equal(afterFourth.map.completions['phase:06'].issueNumber, 600, 'the field write must still carry the issue number the add-to-project capture stored');
+
+  // ─── Across all four runs: exactly one issue:phase:06 key and one phase:06 key ───
+  const phaseScopedKeys = Object.keys(afterFourth.map.completions).filter((key) => key.startsWith('phase:') || key.startsWith('issue:phase:'));
+  assert.deepEqual(phaseScopedKeys.sort(), ['issue:phase:06', 'phase:06']);
+});
+
+test('interrupted run: killing the sequence after the second of four field writes and re-running re-emits all four (unknown state converges by rewriting) and never emits a duplicate create', (t) => {
+  const cwd = createTempProject('github-sync-composition-interrupted-');
+  t.after(() => cleanup(cwd));
+
+  const phase = { id: '07', title: 'Phase Seven', goal: 'ship it', successCriteria: [], requirements: [], status: 'Todo' };
+  const seeded = seedFullBootstrapMap(cwd);
+  const desiredPhase = desiredOnePhase(phase);
+  const clock = fixedClock();
+
+  const plan = planReconciliation(desiredPhase, remote([]), seeded);
+  assert.deepEqual(plan.blocked, []);
+  assert.equal(plan.operations.length, 6);
+
+  // Create + add-to-project + the first two of four field writes succeed;
+  // the third field write (the fifth dispatched call overall) "crashes".
+  let calls = 0;
+  const interruptedRun = applyMutationPlan(plan, {
+    cwd,
+    map: seeded.map,
+    clock,
+    execGh(_args) {
+      calls += 1;
+      if (calls === 1) return restIssueCreateResponse('I_node_07', 700);
+      if (calls === 2) return response('PVTI_item_07', 700);
+      if (calls <= 4) return fieldValueResponse('PVTI_item_07', 700);
+      // Simulate a crash (a non-retryable GitHub failure) on the third field
+      // write: applyMutationPlan expects execGh to RETURN a failure result,
+      // never to throw — a thrown JS exception here would propagate past
+      // the interpreter uncaught rather than exercising its failure path.
+      return { exitCode: 1, reason: 'gh_exit_nonzero', stdout: '', stderr: 'simulated crash after the second field write' };
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(interruptedRun.kind, 'failed');
+  assert.equal(calls, 5);
+
+  const afterInterrupted = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterInterrupted.kind, 'valid');
+  // The create, the add-to-project, and the first two field writes are all
+  // durably recorded (each is its own atomic write) — but `phase:07` carries
+  // no field state at all: only the LAST of the four field writes ever
+  // carries it, and the sequence never reached the last.
+  assert.equal(afterInterrupted.map.completions['phase:07'].fieldState, undefined);
+  assert.equal(afterInterrupted.map.completions['phase:07'].nodeId, 'PVTI_item_07');
+  assert.equal(afterInterrupted.map.completions['issue:phase:07'].nodeId, 'I_node_07');
+
+  const boundRemote = remote([{ id: 'PVTI_item_07', content: { id: 'I_node_07', number: 700 } }]);
+  const resumedPlan = planReconciliation(desiredPhase, boundRemote, afterInterrupted);
+  assert.deepEqual(resumedPlan.pendingIssueUpdates, [], 'the issue content already converged and is never re-created');
+  assert.equal(resumedPlan.operations.length, 4, 'an unknown field state converges by rewriting all four next run');
+  assert.ok(resumedPlan.operations.every((op) => op.kind !== 'create-issue'), 'never a duplicate create');
+
+  let resumedCalls = 0;
+  const resumedRun = applyMutationPlan(resumedPlan, {
+    cwd,
+    map: afterInterrupted.map,
+    clock,
+    execGh() {
+      resumedCalls += 1;
+      return fieldValueResponse('PVTI_item_07', 700);
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(resumedRun.kind, 'completed');
+  assert.equal(resumedCalls, 4);
+
+  const finalMap = readSyncMapStrict(cwd, REPOSITORY);
+  const finalKeys = Object.keys(finalMap.map.completions).filter((key) => key.startsWith('phase:') || key.startsWith('issue:phase:'));
+  assert.deepEqual(finalKeys.sort(), ['issue:phase:07', 'phase:07'], 'exactly two phase-scoped keys after the interruption and its resume');
+  assert.equal(finalMap.map.completions['phase:07'].issueNumber, 700, 'the item still carries its issue number after the resumed field writes');
 });
