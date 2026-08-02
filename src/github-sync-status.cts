@@ -25,6 +25,9 @@ interface ReconciliationPlan {
   noops: Array<{ logicalKey: string }>;
   blocked: Array<{ reason: string; detail?: string }>;
   uncertain: Array<{ reason: string }>;
+  /** Plan 04-04 Task 3: optional so a pre-04-04-shaped plan fixture still type-checks and renders as empty. */
+  pendingIssueUpdates?: Array<{ logicalKey: string }>;
+  orphans?: Array<{ logicalKey: string; issueNumber?: number }>;
 }
 
 interface StatusV1 {
@@ -36,6 +39,10 @@ interface StatusV1 {
   noops: string[];
   blocked: Array<{ reason: string; detail?: string }>;
   uncertain: Array<{ reason: string }>;
+  /** Plan 04-04 Task 3 (D-11): always present, empty when nothing applies — matches every other group. */
+  orphans: Array<{ logicalKey: string; issueNumber?: number }>;
+  /** Plan 04-04 Task 3: pending issue-content updates, by logical key only — `status` never reads the issue to learn more than the plan already named. */
+  pendingIssueUpdates: string[];
   limitations: string[];
 }
 
@@ -54,16 +61,18 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
         creates: [], updates: [], noops: [],
         blocked: [remote.field === undefined ? { reason: remote.reason } : { reason: remote.reason, detail: remote.field }],
         uncertain: [],
+        orphans: [], pendingIssueUpdates: [],
         limitations: ['The local github_sync.target configuration is invalid; no remote read was attempted.'],
       };
     }
     return {
       version: STATUS_SCHEMA_VERSION, available: false, message: UNAVAILABLE_MESSAGE,
       creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
+      orphans: [], pendingIssueUpdates: [],
       limitations: ['Remote data is currently unavailable; no changes were made.'],
     };
   }
-  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [] };
+  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], orphans: [] };
   return {
     version: STATUS_SCHEMA_VERSION, available: true,
     creates: safePlan.operations.filter((operation) => operation.kind === 'create').map((operation) => operation.logicalKey),
@@ -71,6 +80,8 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
     noops: safePlan.noops.map((operation) => operation.logicalKey),
     blocked: safePlan.blocked.map(({ reason, detail }) => detail === undefined ? { reason } : { reason, detail }),
     uncertain: safePlan.uncertain.map(({ reason }) => ({ reason })),
+    orphans: (safePlan.orphans ?? []).map(({ logicalKey, issueNumber }) => (issueNumber === undefined ? { logicalKey } : { logicalKey, issueNumber })),
+    pendingIssueUpdates: (safePlan.pendingIssueUpdates ?? []).map(({ logicalKey }) => logicalKey),
     limitations: [],
   };
 }
@@ -80,7 +91,11 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
  * update, and no-op by its logical key, and every blocked/uncertain entry by
  * its typed reason (blocked entries append a safe `detail` in parentheses
  * when present) — the summary a developer can act on without reading source
- * or JSON. All five groups always render their count line, even at zero.
+ * or JSON. Plan 04-04 Task 3 (D-11) adds two more groups after the original
+ * five: `orphans` (a phase's logical key, with its issue number in
+ * parentheses when known) and `updates-pending` (a pending issue-content
+ * update's logical key). All seven groups always render their count line,
+ * even at zero.
  *
  * Kept pure and total: reads only `status` fields, never the filesystem,
  * config, or a caught error (SAFE-04) — the raw branch stays the first
@@ -100,6 +115,11 @@ function renderStatusV1(status: StatusV1, raw: boolean): string {
   appendGroup('no-ops', status.noops);
   appendGroup('blocked', status.blocked.map(({ reason, detail }) => (detail === undefined ? reason : `${reason} (${detail})`)));
   appendGroup('uncertain', status.uncertain.map(({ reason }) => reason));
+  // Plan 04-04 Task 3 (D-11): an orphan renders as its logical key followed
+  // by its issue number in parentheses when present — the same shape the
+  // blocked group already uses for its detail.
+  appendGroup('orphans', status.orphans.map(({ logicalKey, issueNumber }) => (issueNumber === undefined ? logicalKey : `${logicalKey} (${issueNumber})`)));
+  appendGroup('updates-pending', status.pendingIssueUpdates);
   if (status.limitations.length > 0) {
     lines.push('limitations:');
     for (const limitation of status.limitations) lines.push(`  - ${limitation}`);

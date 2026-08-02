@@ -35,6 +35,7 @@ const ID_ALLOWLIST = new Set([
   'I_node_phase_05', 'PVTI_item_phase_05',
 ]);
 const { BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
+const { renderPhaseRegion, contentHash, renderFieldState } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
 function desired() {
   return {
@@ -361,6 +362,12 @@ test('one roadmap phase travels end-to-end: REST create then add-to-project, bot
 
   const reopened = readSyncMapStrict(cwd, REPOSITORY);
   assert.equal(reopened.kind, 'valid');
+  // Plan 04-04 Task 1: the create's REST capture and the add-to-project
+  // capture now carry the freshly computed content hash / field state in
+  // their planner fields, so the recorded completions carry them too — this
+  // is what lets the immediate re-plan below stay a no-op.
+  const expectedContentHash = contentHash({ title: phase.title, region: renderPhaseRegion(phase), milestoneNumber: PHASE_MILESTONE_NUMBER });
+  const expectedFieldState = renderFieldState({ gsdId: 'phase:04', phaseId: '04', requirements: [], status: '' });
   assert.deepEqual(reopened.map.completions['issue:phase:04'], {
     logicalKey: 'issue:phase:04',
     nodeId: 'I_node_phase_04',
@@ -369,6 +376,7 @@ test('one roadmap phase travels end-to-end: REST create then add-to-project, bot
     owner: TARGET.owner,
     repo: TARGET.repo,
     repositoryNumber: TARGET.repositoryNumber,
+    contentHash: expectedContentHash,
   });
   assert.deepEqual(reopened.map.completions['phase:04'], {
     logicalKey: 'phase:04',
@@ -378,6 +386,7 @@ test('one roadmap phase travels end-to-end: REST create then add-to-project, bot
     owner: TARGET.owner,
     repo: TARGET.repo,
     repositoryNumber: TARGET.repositoryNumber,
+    fieldState: expectedFieldState,
   });
   const phaseScopedKeys = Object.keys(reopened.map.completions).filter((key) => key === 'phase:04' || key === 'issue:phase:04' || key.startsWith('phase:') || key.startsWith('issue:phase:'));
   assert.deepEqual(phaseScopedKeys.sort(), ['issue:phase:04', 'phase:04'], 'no third phase-scoped key');

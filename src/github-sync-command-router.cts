@@ -36,6 +36,8 @@ import statusMod = require('./github-sync-status.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import applyMod = require('./github-sync-apply.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import issueUpdateMod = require('./github-sync-issue-update.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import targetMod = require('./github-sync-target.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import bootstrapRemoteMod = require('./github-sync-bootstrap-remote.cjs');
@@ -104,6 +106,10 @@ interface MapModule { readSyncMapStrict(cwd: string, repository: { owner: string
 interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
 interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
 interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string; map: unknown }): unknown; }
+/** Plan 04-04 Task 3: the read-splice-write preparation stage `sync` (never `status`) runs between planning and applying. */
+interface IssueUpdateModule {
+  prepareIssueUpdates(pending: unknown[], adapters: { cwd: string }): { operations: unknown[]; reports: unknown[] };
+}
 interface TargetReadResult { available: boolean; reason?: string; field?: string; target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number }; }
 interface TargetModule { readSyncTarget(cwd: string): TargetReadResult; }
 
@@ -194,6 +200,8 @@ interface RouteGithubSyncCommandRouterOptions {
   _reconcile?: ReconcileModule;
   _status?: StatusModule;
   _apply?: ApplyModule;
+  /** Test seam: inject a mock preparation-stage module. Defaults to the real module. */
+  _issueUpdate?: IssueUpdateModule;
   _target?: TargetModule;
   /** Test seam: inject a mock bootstrap remote reader. Defaults to the real module. */
   _bootstrapRemote?: BootstrapRemoteModule;
@@ -220,6 +228,7 @@ function routeGithubSyncCommandRouter({
   _reconcile,
   _status,
   _apply,
+  _issueUpdate,
   _target,
   _bootstrapRemote,
   _bootstrapPlan,
@@ -260,6 +269,7 @@ function routeGithubSyncCommandRouter({
   const reconcile: ReconcileModule = _reconcile ?? reconcileMod;
   const status: StatusModule = _status ?? statusMod;
   const apply: ApplyModule = _apply ?? applyMod;
+  const issueUpdate: IssueUpdateModule = _issueUpdate ?? issueUpdateMod;
   const target: TargetModule = _target ?? targetMod;
   const bootstrapRemote: BootstrapRemoteModule = _bootstrapRemote ?? bootstrapRemoteMod;
   const bootstrapPlan: BootstrapPlanModule = _bootstrapPlan ?? bootstrapPlanMod;
@@ -342,11 +352,24 @@ function routeGithubSyncCommandRouter({
                 if (strictMap?.kind === 'blocking') {
                   result = { kind: 'blocked', reason: 'sync_map_blocking' };
                 } else {
-                  const plan = reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap);
-                  result = apply.applyMutationPlan(plan, {
+                  const plan = reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap) as {
+                    operations: unknown[]; pendingIssueUpdates?: unknown[];
+                  };
+                  // Plan 04-04 Task 3: the read-splice-write preparation
+                  // stage runs here, between planning and applying — never
+                  // from `status`, which stays a dry run (SYNC-07/P2 D-13).
+                  // A stage that returns only reports and no operations is
+                  // not an error: the run proceeds with whatever operations
+                  // remain, and exits 0 either way (Phase 1 D-11). Prepared
+                  // operations are appended after the plan's own,
+                  // deterministically, so dispatch order is stable.
+                  const prepared = issueUpdate.prepareIssueUpdates(plan.pendingIssueUpdates ?? [], { cwd });
+                  const combinedPlan = { ...plan, operations: [...(plan.operations ?? []), ...prepared.operations] };
+                  const applyResult = apply.applyMutationPlan(combinedPlan, {
                     cwd,
                     map: strictMap?.kind === 'valid' ? strictMap.map ?? null : null,
-                  });
+                  }) as Record<string, unknown>;
+                  result = { ...applyResult, issueUpdateReports: prepared.reports };
                 }
               }
             }

@@ -8,15 +8,18 @@ a terminal, and `--raw` is for automation.
 
 ## Default output: the human summary (D-13)
 
-Running `status` with no flags prints a heading, then five group lines in this fixed order —
-`creates:`, `updates:`, `no-ops:`, `blocked:`, `uncertain:` — each showing its count. Every
-group always appears, even at zero (D-14). When a group is non-empty, each member follows on
-its own indented line: `creates`, `updates`, and `no-ops` list logical keys verbatim; `blocked`
-lists its typed reason, with a safe `detail` appended in parentheses when present; `uncertain`
-lists its typed reason. If the report carries any `limitations`, a final `limitations:` line
-lists each one, indented; the line is omitted entirely when there are none. This is the surface
-SYNC-07 promises: every planned create, update, and no-op is named, and every blocked or
-uncertain entry is named by its typed reason — actionable without reading source or JSON.
+Running `status` with no flags prints a heading, then seven group lines in this fixed order —
+`creates:`, `updates:`, `no-ops:`, `blocked:`, `uncertain:`, `orphans:`, `updates-pending:` —
+each showing its count. Every group always appears, even at zero (D-14). When a group is
+non-empty, each member follows on its own indented line: `creates`, `updates`, and `no-ops` list
+logical keys verbatim; `blocked` lists its typed reason, with a safe `detail` appended in
+parentheses when present; `uncertain` lists its typed reason; `orphans` lists a phase's logical
+key, with its issue number appended in parentheses when known (plan 04-04, D-11);
+`updates-pending` lists a pending issue-content update's logical key (plan 04-04). If the report
+carries any `limitations`, a final `limitations:` line lists each one, indented; the line is
+omitted entirely when there are none. This is the surface SYNC-07 promises: every planned
+create, update, no-op, orphan, and pending update is named, and every blocked or uncertain entry
+is named by its typed reason — actionable without reading source or JSON.
 
 When the remote snapshot is unavailable, the default output is instead the DTO's fixed
 operator-facing `message` (see below), and the command still exits successfully (D-16).
@@ -38,6 +41,8 @@ described above.
 | `noops` | Ordered logical keys already reconciled. |
 | `blocked` | Typed local/map blockers, optionally with a safe `detail`. |
 | `uncertain` | Typed operation or remote uncertainties. |
+| `orphans` | Logical keys of phases whose completions exist but are absent from the desired state, each optionally paired with its known issue number (plan 04-04, D-11). Never acted on — report-only. |
+| `pendingIssueUpdates` | Ordered logical keys of phases whose issue content (title/body/milestone) would be updated in place (plan 04-04). `status` names these without reading the issue body. |
 | `limitations` | Fixed, actionable limitations that apply to this report. |
 | `message` | Present only for unavailable status; a fixed operator-facing remediation. |
 

@@ -106,12 +106,13 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
       _desired: { readDesiredState(cwd) { calls.push(['desired', cwd]); return { available: true }; } },
       _remote: { readRemoteSnapshot(options) { calls.push(['remote', options]); return { available: true }; } },
       _map: { readSyncMapStrict(cwd, repository) { calls.push(['map', cwd, repository]); return { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } } }; } },
-      _reconcile: { planReconciliation(...inputs) { calls.push(['reconcile', inputs.length]); return { operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [] }; } },
+      _reconcile: { planReconciliation(...inputs) { calls.push(['reconcile', inputs.length]); return { operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }; } },
+      _issueUpdate: { prepareIssueUpdates(pending, adapters) { calls.push(['issueUpdate', pending.length, adapters.cwd]); return { operations: [], reports: [] }; } },
       _apply: { applyMutationPlan(plan, options) { calls.push(['apply', plan.operations[0].logicalKey, options.map]); return { kind: 'completed' }; } },
     });
   } finally { mock.restoreAll(); }
-  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101, 303] }], ['reconcile', 3], ['apply', 'phase:01', { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } }]]);
-  assert.deepEqual(chunks, ['{\n  "kind": "completed"\n}']);
+  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101, 303] }], ['reconcile', 3], ['issueUpdate', 0, '/fixture'], ['apply', 'phase:01', { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } }]]);
+  assert.deepEqual(chunks, ['{\n  "kind": "completed",\n  "issueUpdateReports": []\n}']);
 });
 
 test('enabled sync stops at preflight or unavailable desired state without reaching later seams', () => {
@@ -135,6 +136,123 @@ test('enabled sync stops at preflight or unavailable desired state without reach
     routeGithubSyncCommandRouter(makeOptions({ ok: true, reason: 'ok', message: 'ok' }));
     assert.deepEqual(calls, ['preflight', 'desired']);
   } finally { mock.restoreAll(); }
+});
+
+// ─── Plan 04-04 Task 3: wire the issue-update preparation stage into `sync`,
+// and report orphans/pending updates from `status` with no new authority ──
+
+describe('github-sync router: plan 04-04 Task 3 — issue-update preparation stage wiring', () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  test('status against a plan with pending updates and orphans emits both groups and never calls the preparation stage', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: false,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _status: realStatus,
+        _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
+        _desired: { readDesiredState() { return { available: true }; } },
+        _remote: { readRemoteSnapshot() { return { available: true, reason: 'ok' }; } },
+        _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+        _reconcile: {
+          planReconciliation() {
+            return {
+              operations: [], noops: [], blocked: [], uncertain: [],
+              orphans: [{ logicalKey: 'phase:09', issueNumber: 77 }],
+              pendingIssueUpdates: [{ logicalKey: 'phase:03' }],
+            };
+          },
+        },
+        // Never wired to `status` — a throw here would fail this test if it were.
+        _issueUpdate: { prepareIssueUpdates() { throw new Error('status must never call the preparation stage'); } },
+      });
+    } finally { mock.restoreAll(); }
+    const out = chunks.join('');
+    assert.match(out, /orphans: 1/);
+    assert.match(out, /phase:09 \(77\)/);
+    assert.match(out, /updates-pending: 1/);
+    assert.match(out, /\n {2}- phase:03\n/);
+  });
+
+  test("sync against a plan with one pending update calls the preparation stage once, appends its produced operation after the plan's own operations, and dispatches the combined list deterministically", () => {
+    const calls = [];
+    mock.method(fs, 'writeSync', () => 1);
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight() { return { ok: true, reason: 'ok', message: 'ok' }; } },
+        _desired: { readDesiredState() { return { available: true }; } },
+        _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
+        _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+        _remote: { readRemoteSnapshot() { return { available: true }; } },
+        _reconcile: {
+          planReconciliation() {
+            return {
+              operations: [{ logicalKey: 'phase:01', kind: 'create' }],
+              noops: [], blocked: [], uncertain: [],
+              pendingIssueUpdates: [{ logicalKey: 'phase:02' }],
+            };
+          },
+        },
+        _issueUpdate: {
+          prepareIssueUpdates(pending, adapters) {
+            calls.push(['issueUpdate', pending, adapters.cwd]);
+            return { operations: [{ logicalKey: 'issue:phase:02', kind: 'update-issue' }], reports: [] };
+          },
+        },
+        _apply: {
+          applyMutationPlan(plan) {
+            calls.push(['apply', plan.operations.map((op) => op.logicalKey)]);
+            return { kind: 'completed' };
+          },
+        },
+      });
+    } finally { mock.restoreAll(); }
+    assert.deepEqual(calls, [
+      ['issueUpdate', [{ logicalKey: 'phase:02' }], '/fixture'],
+      ['apply', ['phase:01', 'issue:phase:02']],
+    ]);
+  });
+
+  test('sync against a plan whose only pending update is damaged dispatches nothing for it, surfaces the report in its result, and still exits 0', () => {
+    process.exitCode = 0;
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight() { return { ok: true, reason: 'ok', message: 'ok' }; } },
+        _desired: { readDesiredState() { return { available: true }; } },
+        _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
+        _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+        _remote: { readRemoteSnapshot() { return { available: true }; } },
+        _reconcile: {
+          planReconciliation() {
+            return { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [{ logicalKey: 'phase:07' }] };
+          },
+        },
+        _issueUpdate: {
+          prepareIssueUpdates() {
+            return { operations: [], reports: [{ logicalKey: 'phase:07', reason: 'region_damaged', detail: 'two begin fences' }] };
+          },
+        },
+        _apply: { applyMutationPlan(plan) { return { kind: 'completed', operationsDispatched: plan.operations.length }; } },
+      });
+    } finally { mock.restoreAll(); }
+    assert.strictEqual(process.exitCode, 0);
+    const parsed = JSON.parse(chunks.join(''));
+    assert.equal(parsed.operationsDispatched, 0);
+    assert.deepEqual(parsed.issueUpdateReports, [{ logicalKey: 'phase:07', reason: 'region_damaged', detail: 'two begin fences' }]);
+  });
 });
 
 // ─── G-02-2: default status path renders human, --raw stays JSON ────────────
