@@ -115,6 +115,61 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
   assert.deepEqual(chunks, ['{\n  "kind": "completed",\n  "issueUpdateReports": []\n}']);
 });
 
+// ─── Bug fix: collectIssueNodeIdHints must not feed bootstrap completions
+// (project/milestone/field/option/label numbers) into the issue-number
+// lookup — only completions that represent a real GitHub issue. Discovered
+// live against UAT board #9 (`.planning/phases/04-phase-issue-sync/
+// deferred-items.md` § "Plan 04-06"): a `project` completion's issueNumber
+// (a project number) and a `milestone:<version>` completion's issueNumber (a
+// milestone number) were both fed into `readRemoteSnapshot`'s
+// issueNodeIdHints, which queried GitHub's issue-by-number lookup for each —
+// GitHub correctly returned NOT_FOUND, cascading to a full
+// `remote_unavailable`/`uncertain` failure on every `status`/`sync` call
+// once a target was bootstrapped. No prior fixture combined a bootstrap
+// completion with an issue-bearing one in the same map, which is exactly why
+// this went undetected until a live run against a real, previously adopted
+// board.
+test('status hint collection excludes bootstrap completions (project/milestone) and passes only issue-bearing phase numbers', () => {
+  const calls = [];
+  mock.method(fs, 'writeSync', () => 1);
+  try {
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 9 } }; } },
+      _desired: { readDesiredState() { return { available: true }; } },
+      _remote: { readRemoteSnapshot(options) { calls.push(['remote', options]); return { available: true }; } },
+      _map: {
+        readSyncMapStrict() {
+          return {
+            kind: 'valid',
+            map: {
+              completions: {
+                // Bootstrap completions (D-05/D-07): issueNumber is the
+                // generic remote-number slot reused for a project number and
+                // a milestone number — never a real issue number.
+                project: { logicalKey: 'project', nodeId: 'PVT_1', issueNumber: 9 },
+                'milestone:v1-0': { logicalKey: 'milestone:v1-0', nodeId: 'MI_1', issueNumber: 4 },
+                // Issue-bearing completions: the legacy pre-Phase-4
+                // `phase:<id>` key (github-sync-reconcile.cts's
+                // `resolvedIssueNodeId` still resolves these against
+                // issueNodeIdHints) and the Phase 4 `issue:phase:<id>` key.
+                'phase:01': { logicalKey: 'phase:01', nodeId: 'item-01', issueNumber: 101 },
+                'issue:phase:02': { logicalKey: 'issue:phase:02', nodeId: 'ISSUE_02', issueNumber: 202 },
+              },
+            },
+          };
+        },
+      },
+      _reconcile: { planReconciliation() { return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
+      _status: { buildStatusV1(remote, plan) { calls.push(['status', remote.available, plan.operations.length]); return { version: 1, available: remote.available }; }, renderStatusV1(dto) { return JSON.stringify(dto); } },
+    });
+  } finally { mock.restoreAll(); }
+  const remoteCall = calls.find(([label]) => label === 'remote');
+  assert.deepEqual(remoteCall[1].issueNodeIdHints, [101, 202]);
+});
+
 test('enabled sync stops at preflight or unavailable desired state without reaching later seams', () => {
   const calls = [];
   const makeOptions = (preflight) => ({

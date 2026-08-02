@@ -175,12 +175,47 @@ function emitInitReport(input: unknown, raw: boolean, reportModule: BootstrapRep
   output(dto, true, reportModule.renderInitReportV1(dto, raw));
 }
 
+// github-sync-map.cts's header (D-05/D-07) documents `SyncCompletion.issueNumber`
+// as a generic remote-number slot reused for a project number, a field's
+// declared type ordinal, a status option ordinal, or a milestone number —
+// none of those bootstrap completions represent a GitHub issue.
+// `readRemoteSnapshot`'s issueNodeIdHints feeds straight into a per-number
+// `issue(number: ...)` GraphQL lookup (github-sync-remote.cts's
+// readIssueNodeIds), so passing a bootstrap completion's number there
+// produces a GitHub NOT_FOUND that cascades into a full remote_unavailable/
+// uncertain failure on every status/sync call once a target is bootstrapped
+// (live-discovered against UAT board #9, see
+// .planning/phases/04-phase-issue-sync/deferred-items.md § "Plan 04-06").
+//
+// Only two logicalKey shapes represent a real issue number:
+//   - `issue:phase:<id>` (Phase 4 plan 04-01) — the phase issue's own
+//     reserved identity.
+//   - `phase:<id>` (Phase 2 plan 02-08, pre-Phase-4) — the legacy
+//     project-item completion; github-sync-reconcile.cts's
+//     `resolvedIssueNodeId` still resolves these against issueNodeIdHints
+//     for a not-yet-migrated map (its per-phase decision order, case 3).
+// Every bootstrap completion (`project`, `project-link`, `field:<slug>`,
+// `option:status:<slug>`, `label:<slug>`, `milestone:<version>`) falls
+// outside both prefixes, so this is an explicit allow-list of
+// issue-representing keys rather than a denylist of bootstrap prefixes — a
+// future bootstrap key added to that catalog is excluded by construction,
+// not because someone remembered to add it to a denylist.
+function isIssueBearingLogicalKey(logicalKey: string): boolean {
+  return logicalKey.startsWith('issue:') || logicalKey.startsWith('phase:');
+}
+
 function collectIssueNodeIdHints(strictMap: unknown): number[] {
   if (strictMap === null || typeof strictMap !== 'object' || (strictMap as { kind?: unknown }).kind !== 'valid') return [];
-  const completions = (strictMap as { map?: { completions?: Record<string, { issueNumber?: unknown }> } }).map?.completions;
+  const completions = (strictMap as { map?: { completions?: Record<string, { logicalKey?: unknown; issueNumber?: unknown }> } }).map?.completions;
   if (!completions || typeof completions !== 'object') return [];
-  const hints = Object.values(completions)
-    .map((completion) => completion?.issueNumber)
+  // The object key is the authoritative logical key (github-sync-map.cts's
+  // isSyncMap validates `completion.logicalKey === <object key>` as an
+  // invariant for every completion in a `kind: 'valid'` map, and the rest of
+  // this module reads completions by object key), so Object.entries reads
+  // it from there rather than trusting the completion's own copy.
+  const hints = Object.entries(completions)
+    .filter(([logicalKey]) => isIssueBearingLogicalKey(logicalKey))
+    .map(([, completion]) => completion?.issueNumber)
     .filter((issueNumber): issueNumber is number => typeof issueNumber === 'number' && Number.isSafeInteger(issueNumber) && issueNumber > 0);
   return [...new Set(hints)].sort((left, right) => left - right);
 }
