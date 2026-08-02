@@ -179,15 +179,79 @@ describe('planStatusOptionMerge', () => {
     assert.deepEqual(result.checkpoints.map((c) => c.nodeId).sort(), ['id-blocked', 'id-deferred', 'id-done', 'id-inprogress', 'id-todo'].sort());
   });
 
-  test('the negative of convergence: the remote returns the five GSD options out of D-19 order — one operation, zero checkpoints (merge always echoes verbatim per D-18, so a real value divergence at a fixed slot can only arise from order, never from a stale cosmetic)', () => {
+  test('LIVE FINDING regression (plan 03-03 -> 03-04): the remote returns the five GSD options out of D-19 declaration order — convergence, not an operation, because every option still matches by name/id and a positional read order is not a content divergence', () => {
     const remote = remoteResolved([
       opt('id-inprogress', 'In Progress', 'BLUE', ''), opt('id-todo', 'Todo', 'GRAY', ''),
       opt('id-blocked', 'Blocked', 'RED', ''), opt('id-done', 'Done', 'GREEN', ''),
       opt('id-deferred', 'Deferred', 'YELLOW', ''),
     ]);
     const result = planStatusOptionMerge(remote, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.kind, 'converged');
+    assert.equal(result.checkpoints.length, 5);
+  });
+
+  test('LIVE FINDING regression, exact reported shape (plan 03-03, board #9, 2026-08-01): a creation-order remote read — the three original defaults first, a tail custom option, then Blocked/Deferred last (the order they were actually minted in, which differs from GSD_STATUS_OPTIONS declaration order) — converges with zero operations and five checkpoints carrying the pre-existing ids verbatim, never re-minting Blocked/Deferred/the custom option', () => {
+    const remote = remoteResolved([
+      opt('f75ad846', 'Todo', 'GRAY', ''),
+      opt('47fc9ee4', 'In Progress', 'BLUE', ''),
+      opt('98236657', 'Done', 'GREEN', ''),
+      opt('3f45dd5b', 'In Review', 'PINK', ''),
+      opt('bac73137', 'Blocked', 'RED', ''),
+      opt('db539d19', 'Deferred', 'YELLOW', ''),
+    ]);
+    const result = planStatusOptionMerge(remote, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.kind, 'converged');
+    assert.equal(result.checkpoints.length, 5);
+    const byKey = Object.fromEntries(result.checkpoints.map((c) => [c.logicalKey, c.nodeId]));
+    assert.equal(byKey['option:status:blocked'], 'bac73137');
+    assert.equal(byKey['option:status:deferred'], 'db539d19');
+    assert.equal(byKey['option:status:todo'], 'f75ad846');
+    assert.equal(byKey['option:status:in-progress'], '47fc9ee4');
+    assert.equal(byKey['option:status:done'], '98236657');
+  });
+
+  test('a genuine content divergence — a remote option carrying a different color than what is stored — is not convergence: one operation, zero checkpoints', () => {
+    const converged = [
+      opt('id-todo', 'Todo', 'GRAY', ''), opt('id-inprogress', 'In Progress', 'BLUE', ''),
+      opt('id-blocked', 'Blocked', 'RED', ''), opt('id-done', 'Done', 'GREEN', ''),
+      opt('id-deferred', 'Deferred', 'YELLOW', ''),
+    ];
+    assert.equal(planStatusOptionMerge(remoteResolved(converged), { kind: 'absent' }, CONTEXT).kind, 'converged');
+    const strictMap = { kind: 'valid', map: { completions: { 'option:status:blocked': { nodeId: 'id-blocked' } } } };
+    const divergent = converged.map((o) => (o.id === 'id-blocked' ? { ...o, color: 'PURPLE' } : o));
+    const result = planStatusOptionMerge(remoteResolved(divergent), strictMap, CONTEXT);
     assert.equal(result.kind, 'operation');
     assert.equal(result.checkpoints, undefined);
+  });
+
+  test('duplicate remote ids never claim convergence, even when every other field matches', () => {
+    const remote = remoteResolved([
+      opt('dup-id', 'Todo', 'GRAY', ''), opt('dup-id', 'In Progress', 'BLUE', ''),
+      opt('id-blocked', 'Blocked', 'RED', ''), opt('id-done', 'Done', 'GREEN', ''),
+      opt('id-deferred', 'Deferred', 'YELLOW', ''),
+    ]);
+    const result = planStatusOptionMerge(remote, { kind: 'absent' }, CONTEXT);
+    assert.notEqual(result.kind, 'converged');
+  });
+
+  test('a remote id already claimed by an earlier GSD option (stale/cross-contaminated stored id) is never claimed a second time by a later GSD option', () => {
+    // "Blocked"'s stored id incorrectly points at the remote option actually
+    // named "Deferred" (a stale or corrupted map entry) — without the
+    // already-claimed guard, "Deferred"'s own byName lookup would find that
+    // same remote entry a second time, producing two merged entries sharing
+    // one id under two different names.
+    const remote = remoteResolved([
+      opt('id-todo', 'Todo'), opt('id-inprogress', 'In Progress'),
+      opt('id-deferred', 'Deferred'), opt('id-done', 'Done'),
+    ]);
+    const strictMap = { kind: 'valid', map: { completions: { 'option:status:blocked': { nodeId: 'id-deferred' } } } };
+    const result = planStatusOptionMerge(remote, strictMap, CONTEXT);
+    assert.equal(result.kind, 'operation');
+    const merged = extractMerged(result.operation);
+    const ids = merged.map((e) => e.id).filter((id) => id !== undefined);
+    assert.equal(new Set(ids).size, ids.length, 'no id may appear on two merged entries');
+    assert.equal(merged.find((e) => e.name === 'Blocked').id, undefined, 'the stale stored id must not steal the Deferred entry');
+    assert.equal(merged.find((e) => e.name === 'Deferred').id, 'id-deferred', 'the genuinely-named Deferred entry keeps its id');
   });
 
   test('a converged input missing one GSD option is not converged: one operation, zero checkpoints', () => {
