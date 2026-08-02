@@ -8,10 +8,11 @@ import type { MutationOperation, ArgvEntry, CompletionContext } from './github-s
 import bootstrapPlanMod = require('./github-sync-bootstrap-plan.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import issueBodyMod = require('./github-sync-issue-body.cjs');
+import type { FieldValues, FieldName, ParsedFieldState } from './github-sync-issue-body.cts';
 
 const { OPERATION_TRANSPORT, OPERATION_ACTION, ARGV_REF_PART } = operationMod;
 const { BOOTSTRAP_LOGICAL_KEY, GSD_LABELS } = bootstrapPlanMod;
-const { renderNewIssueBody } = issueBodyMod;
+const { renderNewIssueBody, renderPhaseRegion, contentHash, renderFieldState, parseFieldState, changedFields } = issueBodyMod;
 
 const OPERATION_KIND = Object.freeze({ CREATE: 'create', UPDATE: 'update' } as const);
 const OPERATION_REASON = Object.freeze({
@@ -29,6 +30,15 @@ const OPERATION_REASON = Object.freeze({
   // mirrored locally because this module declares no I/O and cannot import
   // that transport-adjacent module.
   UNSAFE_TARGET: 'unsafe_target',
+  // Plan 04-04 Task 1: reserved for `github-sync-issue-update.cts`'s
+  // read-splice-write stage (Task 2), which reports a damaged fence pair by
+  // name rather than guessing a rewrite (D-03/D-11's report-don't-destroy
+  // posture). This module never produces this reason itself — the
+  // preparation stage's reports are surfaced separately from
+  // `ReconciliationPlan.blocked` (see `github-sync-command-router.cts`'s
+  // `sync` handler) — but `blocked`'s reason union is widened here so a
+  // future caller that folds the two together type-checks without a cast.
+  REGION_DAMAGED: 'region_damaged',
 } as const);
 
 /** The `gsd:phase` label's own name, as declared in `GSD_LABELS` (github-sync-bootstrap-plan.cts) — never re-spelled. */
@@ -54,7 +64,15 @@ function phaseIssueRestPath(owner: string, repo: string, suffix: string): string
   return `repos/${owner}/${repo}${suffix}`;
 }
 
-interface DesiredPhase { id: string; title: string; goal: string; }
+interface DesiredPhase {
+  id: string;
+  title: string;
+  goal: string;
+  /** Plan 04-04: optional so pre-04-02-shaped fixtures still type-check; `readDesiredState` always supplies it now. */
+  requirements?: string[];
+  /** Plan 04-04: optional for the same reason as `requirements`. */
+  status?: string;
+}
 /** Mirrors `github-sync-desired.cts`'s `DesiredMilestone` shape — only the two fields this module needs. */
 interface DesiredMilestone { version: string; archived: boolean; }
 interface DesiredState { available: boolean; reason: string; phases: DesiredPhase[]; milestones?: DesiredMilestone[]; }
@@ -66,7 +84,36 @@ interface RemoteSnapshot {
   items?: RemoteItem[];
   issueNodeIds?: Record<string, string> | Record<number, string>;
 }
-interface StrictMap { kind: 'absent' | 'valid' | 'blocking'; reason?: string; map?: { completions?: Record<string, { nodeId: string; issueNumber?: number }> }; }
+interface StrictMapCompletion { nodeId: string; issueNumber?: number; contentHash?: string; fieldState?: string; }
+interface StrictMap { kind: 'absent' | 'valid' | 'blocking'; reason?: string; map?: { completions?: Record<string, StrictMapCompletion> }; }
+
+/**
+ * Plan 04-04 Task 1: the read-splice-write stage's own input shape (D-08's
+ * "the pure stage emits data, not a body string"). `milestoneKey` is not one
+ * of the fields the plan's own truths enumerate by name, but
+ * `github-sync-issue-update.cts` needs it to build the same late-bound
+ * `ArgvRef` milestone reference `buildCreateIssueOperation` already uses —
+ * carrying the literal `milestoneNumber` here would let the write drift from
+ * whatever the map holds at apply time.
+ */
+interface PendingIssueUpdate {
+  logicalKey: string;
+  issueKey: string;
+  issueNumber?: number;
+  issueNodeId: string;
+  title: string;
+  region: string;
+  milestoneNumber: number;
+  milestoneKey: string;
+  contentHash: string;
+  completionContext: CompletionContext;
+}
+
+/** Plan 04-04 Task 1 (D-11): a phase whose completions still exist but is absent from the desired state. */
+interface OrphanEntry {
+  logicalKey: string;
+  issueNumber?: number;
+}
 
 interface ReconciliationPlan {
   operations: MutationOperation[];
@@ -76,10 +123,23 @@ interface ReconciliationPlan {
       | typeof OPERATION_REASON.DESIRED_UNAVAILABLE
       | typeof OPERATION_REASON.IDENTITY_UNRESOLVABLE
       | typeof OPERATION_REASON.MILESTONE_UNRESOLVED
-      | typeof OPERATION_REASON.UNSAFE_TARGET;
+      | typeof OPERATION_REASON.UNSAFE_TARGET
+      | typeof OPERATION_REASON.REGION_DAMAGED;
     detail?: string;
   }>;
   uncertain: Array<{ reason: typeof OPERATION_REASON.REMOTE_UNAVAILABLE }>;
+  /** Plan 04-04 Task 1 (SC3/D-08/D-10): always present, empty when nothing applies — matches `noops`/`blocked`. */
+  pendingIssueUpdates: PendingIssueUpdate[];
+  /** Plan 04-04 Task 1 (D-11): always present, empty when nothing applies. */
+  orphans: OrphanEntry[];
+  /**
+   * Plan 04-04 Task 1 (D-12) seam: the changed-field decision per phase,
+   * computed here from `changedFields` but not yet built into
+   * `MutationOperation`s — plan 04-05 supplies `buildFieldValueOperations`
+   * and consumes this array rather than re-deriving the comparison. Extend,
+   * do not rewrite, this seam.
+   */
+  pendingFieldChanges: Array<{ logicalKey: string; changed: FieldName[] }>;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -91,10 +151,37 @@ function issueKeyFor(id: string): string {
   return `issue:phase:${id}`;
 }
 
+const PHASE_KEY_PREFIX = 'phase:';
+const ISSUE_PHASE_KEY_PREFIX = 'issue:phase:';
+
+/**
+ * Plan 04-04 Task 1 (D-11): the phase id a `phase:<id>` or `issue:phase:<id>`
+ * completion key names, or `null` for any other key (including every
+ * reserved bootstrap-namespace key: `project`, `project-link`, `field:*`,
+ * `option:status:*`, `label:*`, `milestone:*` — none of which start with
+ * either prefix). `issue:phase:` is checked first since it is the longer,
+ * more specific prefix.
+ */
+function orphanPhaseIdFromKey(key: string): string | null {
+  if (key.startsWith(ISSUE_PHASE_KEY_PREFIX)) return key.slice(ISSUE_PHASE_KEY_PREFIX.length);
+  if (key.startsWith(PHASE_KEY_PREFIX)) return key.slice(PHASE_KEY_PREFIX.length);
+  return null;
+}
+
 /** The single current (non-archived) milestone's version, or `null` when none is declared. */
 function currentMilestoneVersion(milestones: DesiredMilestone[] | undefined): string | null {
   const found = (milestones ?? []).find((milestone) => !milestone.archived);
   return found ? found.version : null;
+}
+
+/** Plan 04-04 Task 1 (D-15): the four item field values for a phase, derived from disk truth alone. `gsdId` is the phase's own logical key — never re-derived from the issue or the board. */
+function desiredFieldValuesFor(phase: DesiredPhase, logicalKey: string): FieldValues {
+  return {
+    gsdId: logicalKey,
+    phaseId: phase.id,
+    requirements: phase.requirements ?? [],
+    status: phase.status ?? '',
+  };
 }
 
 /**
@@ -122,12 +209,17 @@ function currentMilestoneVersion(milestones: DesiredMilestone[] | undefined): st
  * hand) or a reference to a logical key whose completion is captured
  * earlier in the same plan (plan 04-01's new create branch: the REST
  * create's own capture, late-bound within one run).
+ *
+ * `plannerFields` (plan 04-04 Task 1) is passed only from the create branch,
+ * carrying the desired field state so a create immediately followed by a
+ * re-plan is a no-op with no extra write (D-12).
  */
 function operationFor(
   logicalKey: string,
   projectNodeId: string,
   contentId: string | { from: string },
   target: NonNullable<RemoteSnapshot['target']>,
+  plannerFields?: Record<string, string>,
 ): MutationOperation {
   const query = 'mutation($projectId:ID!,$contentId:ID!) { # github-sync:addProjectV2ItemById\n' +
     'addProjectV2ItemById(input:{projectId:$projectId,contentId:$contentId}) { item { id content { ... on Issue { number } } } } }';
@@ -148,6 +240,7 @@ function operationFor(
       logicalKey,
       nodeIdPath: 'addProjectV2ItemById.item.id',
       numberPath: 'addProjectV2ItemById.item.content.number',
+      ...(plannerFields === undefined ? {} : { plannerFields }),
     }],
   };
 }
@@ -163,6 +256,11 @@ function operationFor(
  * completion. Transport REST, no points budget, content-creating, one node
  * capture under `issueKey` reading `node_id`/`number` from the bare REST
  * body root.
+ *
+ * `plannerFields` (plan 04-04 Task 1) carries the freshly computed content
+ * hash, so an immediate re-plan after this create sees the stored hash
+ * already equal to the recomputed one and contributes a no-op rather than a
+ * pending update.
  */
 function buildCreateIssueOperation(
   phase: DesiredPhase,
@@ -170,6 +268,7 @@ function buildCreateIssueOperation(
   milestoneKey: string,
   restApiPath: string,
   context: CompletionContext,
+  plannerFields?: Record<string, string>,
 ): MutationOperation {
   const phaseLabel = GSD_LABELS.find((label) => label.name === PHASE_LABEL_NAME);
   const labelName = phaseLabel ? phaseLabel.name : PHASE_LABEL_NAME;
@@ -192,7 +291,13 @@ function buildCreateIssueOperation(
     action: OPERATION_ACTION.CREATE,
     hasPointsBudget: false,
     contentCreation: true,
-    captures: [{ kind: 'node', logicalKey: issueKey, nodeIdPath: 'node_id', numberPath: 'number' }],
+    captures: [{
+      kind: 'node',
+      logicalKey: issueKey,
+      nodeIdPath: 'node_id',
+      numberPath: 'number',
+      ...(plannerFields === undefined ? {} : { plannerFields }),
+    }],
   };
 }
 
@@ -214,13 +319,20 @@ function resolvedIssueNodeId(issueNodeIds: RemoteSnapshot['issueNodeIds'], issue
 }
 
 /**
- * Per-phase decision order (plan 04-01):
+ * Per-phase decision order (plan 04-01, extended by plan 04-04 Task 1):
  *
  * 1. Already bound on the project board (`phase:<id>` completion resolves
- *    against a live item) → no-op, unchanged from Phase 2.
- * 2. An `issue:phase:<id>` completion exists — GSD created this issue on an
- *    earlier run — → bind it to the project via a literal content id, no
- *    create.
+ *    against a live item). Unlike Phase 2/plan 04-01, this no longer
+ *    `continue`s unconditionally: when an `issue:phase:<id>` completion also
+ *    exists, the issue-content unit (title/region/milestone hash) and the
+ *    item-field unit (D-12) are each independently checked for convergence,
+ *    and only a phase converged on BOTH units contributes a no-op (SC3). A
+ *    phase bound on the board with no `issue:phase:<id>` completion (a
+ *    pre-Phase-4 map) has never migrated onto the new content-hash system
+ *    and is left a plain no-op, exactly as before.
+ * 2. An `issue:phase:<id>` completion exists but the project item is not yet
+ *    bound — GSD created this issue on an earlier run — → bind it to the
+ *    project via a literal content id, no create.
  * 3. No `issue:phase:<id>` completion, but a legacy `phase:<id>` completion
  *    exists (the pre-Phase-4 map shape, carrying only an issue number) →
  *    resolve it against the remote's issue-number lookup (unchanged from
@@ -232,22 +344,28 @@ function resolvedIssueNodeId(issueNodeIds: RemoteSnapshot['issueNodeIds'], issue
  *    (`milestone_unresolved` otherwise) — an issue is never created without
  *    the milestone it belongs to. Emits the REST create paired with an
  *    add-to-project operation whose content id late-binds to the create's
- *    own capture within this same plan.
+ *    own capture within this same plan, both carrying the freshly computed
+ *    content hash / field state in their planner fields.
+ *
+ * A post-loop pass (D-11) reports every `phase:`/`issue:phase:` completion
+ * whose id is absent from the desired phase set as an orphan — reported by
+ * name, never acted on.
  */
 function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, strictMap: StrictMap): ReconciliationPlan {
-  if (!desired.available) return { operations: [], noops: [], blocked: [{ reason: OPERATION_REASON.DESIRED_UNAVAILABLE, detail: desired.reason }], uncertain: [] };
-  if (!remote.available) return { operations: [], noops: [], blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
-  if (strictMap.kind === 'blocking') return { operations: [], noops: [], blocked: [{ reason: OPERATION_REASON.MAP_BLOCKING, detail: strictMap.reason ?? 'invalid' }], uncertain: [] };
+  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [] };
+  if (!desired.available) return { ...empty, blocked: [{ reason: OPERATION_REASON.DESIRED_UNAVAILABLE, detail: desired.reason }], uncertain: [] };
+  if (!remote.available) return { ...empty, blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
+  if (strictMap.kind === 'blocking') return { ...empty, blocked: [{ reason: OPERATION_REASON.MAP_BLOCKING, detail: strictMap.reason ?? 'invalid' }], uncertain: [] };
   if (
     !remote.target
     || !Number.isSafeInteger(remote.target.repositoryNumber)
     || remote.target.repositoryNumber <= 0
     || !isNonEmptyString(remote.target.projectNodeId)
   ) {
-    return { operations: [], noops: [], blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
+    return { ...empty, blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
   }
   if (!PATH_SAFE_TARGET.test(remote.target.owner) || !PATH_SAFE_TARGET.test(remote.target.repo)) {
-    return { operations: [], noops: [], blocked: [{ reason: OPERATION_REASON.UNSAFE_TARGET }], uncertain: [] };
+    return { ...empty, blocked: [{ reason: OPERATION_REASON.UNSAFE_TARGET }], uncertain: [] };
   }
 
   const completions = strictMap.kind === 'valid' ? strictMap.map?.completions ?? {} : {};
@@ -258,16 +376,63 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
   const operations: ReconciliationPlan['operations'] = [];
   const noops: ReconciliationPlan['noops'] = [];
   const blocked: ReconciliationPlan['blocked'] = [];
+  const pendingIssueUpdates: ReconciliationPlan['pendingIssueUpdates'] = [];
+  const pendingFieldChanges: ReconciliationPlan['pendingFieldChanges'] = [];
+
   for (const phase of [...desired.phases].sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))) {
     const logicalKey = `phase:${phase.id}`;
     const completion = completions[logicalKey];
+    const issueKey = issueKeyFor(phase.id);
+    const issueCompletion = completions[issueKey];
+    const milestoneCompletion = milestoneKey ? completions[milestoneKey] : undefined;
+
     if (bindingOnBoard(completion, remote)) {
-      noops.push({ logicalKey });
+      if (!issueCompletion) {
+        // A pre-Phase-4 (or otherwise not-yet-migrated) phase: bound on the
+        // board, but never went through the new content-hash system. Left a
+        // plain no-op, exactly as Phase 2/plan 04-01 behaved.
+        noops.push({ logicalKey });
+        continue;
+      }
+      if (!milestoneCompletion || milestoneCompletion.issueNumber === undefined) {
+        // The issue exists, but its milestone can no longer be resolved to a
+        // number (e.g. the milestone completion was lost) — the freshly
+        // computed hash could not be trusted, so this phase is reported
+        // rather than silently treated as converged.
+        blocked.push({ reason: OPERATION_REASON.MILESTONE_UNRESOLVED, detail: logicalKey });
+        continue;
+      }
+
+      const region = renderPhaseRegion(phase);
+      const milestoneNumber = milestoneCompletion.issueNumber;
+      const desiredHash = contentHash({ title: phase.title, region, milestoneNumber });
+      const contentConverged = issueCompletion.contentHash !== undefined && issueCompletion.contentHash === desiredHash;
+
+      const desiredFieldValues = desiredFieldValuesFor(phase, logicalKey);
+      const previousFieldState: ParsedFieldState = completion.fieldState !== undefined
+        ? parseFieldState(completion.fieldState)
+        : { kind: 'unknown' };
+      const changed = changedFields(previousFieldState, desiredFieldValues);
+
+      if (!contentConverged) {
+        pendingIssueUpdates.push({
+          logicalKey,
+          issueKey,
+          issueNumber: issueCompletion.issueNumber,
+          issueNodeId: issueCompletion.nodeId,
+          title: phase.title,
+          region,
+          milestoneNumber,
+          milestoneKey: milestoneKey as string,
+          contentHash: desiredHash,
+          completionContext: context,
+        });
+      }
+      if (changed.length > 0) pendingFieldChanges.push({ logicalKey, changed });
+      if (contentConverged && changed.length === 0) noops.push({ logicalKey });
       continue;
     }
 
-    const issueKey = issueKeyFor(phase.id);
-    const issueCompletion = completions[issueKey];
     if (issueCompletion) {
       operations.push(operationFor(logicalKey, remote.target.projectNodeId, issueCompletion.nodeId, remote.target));
       continue;
@@ -283,8 +448,7 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
       continue;
     }
 
-    const milestoneCompletion = milestoneKey ? completions[milestoneKey] : undefined;
-    if (!milestoneCompletion) {
+    if (!milestoneCompletion || milestoneCompletion.issueNumber === undefined) {
       blocked.push({ reason: OPERATION_REASON.MILESTONE_UNRESOLVED, detail: logicalKey });
       continue;
     }
@@ -298,10 +462,35 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
       continue;
     }
 
-    operations.push(buildCreateIssueOperation(phase, issueKey, milestoneKey as string, restApiPath, context));
-    operations.push(operationFor(logicalKey, remote.target.projectNodeId, { from: issueKey }, remote.target));
+    const region = renderPhaseRegion(phase);
+    const milestoneNumber = milestoneCompletion.issueNumber;
+    const desiredHash = contentHash({ title: phase.title, region, milestoneNumber });
+    const desiredFieldValues = desiredFieldValuesFor(phase, logicalKey);
+
+    operations.push(buildCreateIssueOperation(phase, issueKey, milestoneKey as string, restApiPath, context, { contentHash: desiredHash }));
+    operations.push(operationFor(logicalKey, remote.target.projectNodeId, { from: issueKey }, remote.target, { fieldState: renderFieldState(desiredFieldValues) }));
   }
-  return { operations, noops, blocked, uncertain: [] };
+
+  // Plan 04-04 Task 1 (D-11): a post-loop pass, scoped to the two phase
+  // namespaces by prefix — a bootstrap-namespace key (`project`, `field:*`,
+  // `option:status:*`, `label:*`, `milestone:*`) never starts with either
+  // prefix and is never reported. Both completions for the same phase id
+  // collapse into one orphan entry; whichever holds a number wins.
+  const desiredIds = new Set(desired.phases.map((phase) => phase.id));
+  const orphanNumbers = new Map<string, number | undefined>();
+  for (const [key, entry] of Object.entries(completions)) {
+    const id = orphanPhaseIdFromKey(key);
+    if (id === null || desiredIds.has(id)) continue;
+    const existing = orphanNumbers.get(id);
+    if (!orphanNumbers.has(id) || (existing === undefined && entry.issueNumber !== undefined)) {
+      orphanNumbers.set(id, entry.issueNumber);
+    }
+  }
+  const orphans: ReconciliationPlan['orphans'] = [...orphanNumbers.entries()]
+    .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
+    .map(([id, issueNumber]) => (issueNumber === undefined ? { logicalKey: `phase:${id}` } : { logicalKey: `phase:${id}`, issueNumber }));
+
+  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges };
 }
 
 export = { planReconciliation, OPERATION_KIND, OPERATION_REASON, issueKeyFor, phaseIssueRestPath, PATH_SAFE_TARGET, buildCreateIssueOperation };
