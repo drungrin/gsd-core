@@ -1,7 +1,10 @@
 'use strict';
 
-const { test } = require('node:test');
+const { test, mock } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const childProcess = require('node:child_process');
 const { makeFakeClock } = require('./helpers/clock.cjs');
 const {
   applyMutationPlan,
@@ -10,6 +13,7 @@ const {
   decodeCompletions,
 } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
 const { planReconciliation } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
+const ghMod = require('../gsd-core/bin/lib/github-sync-gh.cjs');
 const {
   OPERATION_TRANSPORT,
   OPERATION_ACTION,
@@ -19,6 +23,35 @@ const {
   mutatedKeys,
 } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
 const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+
+const headerFraming = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/header-framing.json'), 'utf8'),
+);
+
+/**
+ * Drives the REAL `execGh`/`splitIncludedResponse` parser (plan 03-01 Task
+ * 2's status-line fix) against real recorded header+body bytes, via the same
+ * `mock.method(childProcess, 'spawnSync', ...)` seam
+ * `tests/github-sync-gh.test.cjs` uses, so the `GhResult` this test file
+ * feeds into `applyMutationPlan`'s injected `execGh` carries a `response`
+ * field the real parser produced — not a hand-typed `{ status: 422, ... }`
+ * object. Task 3's acceptance criteria require this for the 422 and
+ * retry-after cases specifically: using a synthetic response would hide a
+ * regression in the parser fix those criteria depend on.
+ */
+function realParsedResult(rawStdout, exitCode = 1) {
+  mock.method(childProcess, 'spawnSync', () => ({ status: exitCode, stdout: rawStdout, stderr: '', error: undefined, signal: null }));
+  const result = ghMod.execGh(['api', 'repos/octo/repo/labels', '-X', 'POST'], { includeHeaders: true });
+  mock.restoreAll();
+  return result;
+}
+
+/** Real recorded header bytes from `fixtureCase`, with `bodyOverride` substituted for its body — keeps the real status-line framing while controlling body content for a negative case. */
+function realParsedResultWithBody(fixtureCase, bodyOverride, exitCode = 1) {
+  const separatorMatch = /\r?\n\r?\n/.exec(fixtureCase.stdout);
+  const headerBlock = fixtureCase.stdout.slice(0, separatorMatch.index + separatorMatch[0].length);
+  return realParsedResult(headerBlock + bodyOverride, exitCode);
+}
 
 const CONTEXT = { owner: 'octo', repo: 'repo', repositoryNumber: 1 };
 
@@ -400,4 +433,84 @@ test('caps transient retries and treats timed-out creates as uncertain without r
   const timeoutSetup = makeAdapters([{ exitCode: 124, reason: 'gh_timed_out', stdout: '', stderr: '' }]);
   assert.equal(applyMutationPlan({ operations: [operation('one', { contentCreation: true })] }, { cwd: '/repo', map: null, ...timeoutSetup.adapters }).kind, 'uncertain');
   assert.equal(timeoutSetup.calls.filter((call) => call[0] === 'exec').length, 1);
+});
+
+// ─── plan 03-05 Task 3: REST label/milestone creates and 422 recovery ──────
+
+function restSuccess(nodeId = 'REST_NODE') {
+  return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify({ id: 1, node_id: nodeId }) };
+}
+function restOperation(key, overrides = {}) {
+  return operation(key, {
+    transport: OPERATION_TRANSPORT.REST,
+    hasPointsBudget: false,
+    action: OPERATION_ACTION.CREATE,
+    captures: [{ kind: 'node', logicalKey: key, nodeIdPath: 'node_id' }],
+    ...overrides,
+  });
+}
+
+test('two consecutive content-creating REST operations are paced by the content-creation interval, exactly as GraphQL content creates are', () => {
+  const setup = makeAdapters([restSuccess('REST_1'), restSuccess('REST_2')]);
+  const result = applyMutationPlan(
+    { operations: [restOperation('one', { contentCreation: true }), restOperation('two', { contentCreation: true })] },
+    { cwd: '/repo', map: null, ...setup.adapters },
+  );
+  assert.equal(result.kind, 'completed');
+  assert.deepEqual(setup.clock.sleepCalls, [750]);
+});
+
+test('a REST response carrying a retry-after header on a 429 drives the retry delay to that value rather than exponential backoff — the real recorded header block, not a synthetic one', () => {
+  const rateLimited = realParsedResult(headerFraming.cases['retry-after-429'].stdout, 1);
+  assert.equal(rateLimited.response.available, true);
+  assert.equal(rateLimited.response.status, 429);
+  assert.equal(rateLimited.response.retry_after_seconds, 17);
+  const setup = makeAdapters([rateLimited, restSuccess()]);
+  const result = applyMutationPlan({ operations: [restOperation('one')] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  assert.deepEqual(setup.clock.sleepCalls, [17000]);
+});
+
+test('a REST-transport operation receiving the recorded 422 already-exists body continues the run, records no completion, and produces an outcome entry whose result is the already-exists member', () => {
+  const alreadyExists = realParsedResult(headerFraming.cases['live-422'].stdout, 1);
+  assert.equal(alreadyExists.response.available, true);
+  assert.equal(alreadyExists.response.status, 422);
+  const setup = makeAdapters([alreadyExists, restSuccess('REST_NEXT')]);
+  const result = applyMutationPlan({ operations: [restOperation('conflict'), restOperation('next')] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  assert.equal(setup.calls.filter((call) => call[0] === 'record').length, 1);
+  assert.equal(setup.calls.find((call) => call[0] === 'record')[1].logicalKey, 'next');
+  const conflictOutcome = result.outcomes.find((outcome) => outcome.logicalKey === 'conflict');
+  assert.ok(conflictOutcome, 'the conflicted operation must still produce an outcome entry');
+  assert.equal(conflictOutcome.result, OPERATION_OUTCOME.ALREADY_EXISTS);
+  assert.equal(conflictOutcome.operationKey, 'conflict');
+});
+
+test('after a recovered 422, the next content-creating operation is still paced by the content-creation interval', () => {
+  const alreadyExists = realParsedResult(headerFraming.cases['live-422'].stdout, 1);
+  const setup = makeAdapters([alreadyExists, restSuccess('REST_NEXT')]);
+  const result = applyMutationPlan(
+    { operations: [restOperation('conflict', { contentCreation: true }), restOperation('next', { contentCreation: true })] },
+    { cwd: '/repo', map: null, ...setup.adapters },
+  );
+  assert.equal(result.kind, 'completed');
+  assert.deepEqual(setup.clock.sleepCalls, [750]);
+});
+
+test('a REST 422 whose body is not the already-exists shape still fails the run, exactly as today', () => {
+  const differentBody = realParsedResultWithBody(
+    headerFraming.cases['live-422'],
+    JSON.stringify({ message: 'Validation Failed', errors: [{ resource: 'Label', code: 'missing_field', field: 'name' }] }),
+  );
+  const setup = makeAdapters([differentBody]);
+  const result = applyMutationPlan({ operations: [restOperation('one')] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'failed');
+});
+
+test('a GraphQL-transport operation receiving the same recorded 422 body fails the run — the recovery is scoped to the REST transport', () => {
+  const alreadyExists = realParsedResult(headerFraming.cases['live-422'].stdout, 1);
+  const setup = makeAdapters([alreadyExists]);
+  const graphqlOp = operation('one', { transport: OPERATION_TRANSPORT.GRAPHQL, hasPointsBudget: false });
+  const result = applyMutationPlan({ operations: [graphqlOp] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'failed');
 });

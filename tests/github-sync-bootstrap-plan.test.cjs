@@ -10,6 +10,9 @@ const {
   planStatusOptionMerge,
   planFields,
   planAutonomousOptions,
+  planLabels,
+  planMilestones,
+  parseMilestoneVersionToken,
   validateFatalConditions,
   optionInputArgv,
   BOOTSTRAP_LOGICAL_KEY,
@@ -19,6 +22,7 @@ const {
   GSD_STATUS_OPTIONS,
   GSD_FIELDS,
   GSD_AUTONOMOUS_OPTIONS,
+  GSD_LABELS,
   STATUS_FIELD_NAME,
   DEFAULT_PROJECT_TITLE_SUFFIX,
   CREATE_PROJECT_DOCUMENT,
@@ -446,6 +450,10 @@ function projectRemote(overrides = {}) {
 }
 function projectTarget(projectNumber) {
   return { owner: 'octo', repo: 'gsd-core', repositoryNumber: 1, projectNumber };
+}
+/** Both GSD labels already present, matched exactly — the fixture pre-existing structure-pass-wiring tests use to isolate their own (non-label) assertions from plan 03-05 Task 3's label stage. */
+function bothGsdLabelsAdopted() {
+  return [{ nodeId: 'L_gsd_phase', name: 'gsd:phase' }, { nodeId: 'L_gsd_plan', name: 'gsd:plan' }];
 }
 function findArg(operation, prefix) {
   return operation.args.find((arg) => typeof arg === 'string' && arg.startsWith(prefix));
@@ -989,6 +997,297 @@ describe('planAutonomousOptions', () => {
   });
 });
 
+// ─── planLabels (plan 03-05 Task 3) ────────────────────────────────────────
+
+function remoteLabel(nodeId, name) {
+  return { nodeId, name };
+}
+
+describe('planLabels', () => {
+  test('an empty repo (no GSD labels) emits two create operations, gsd:phase then gsd:plan, under their own reserved label keys, and zero checkpoints', () => {
+    const result = planLabels({ available: true, labels: [] }, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.length, 2);
+    assert.deepEqual(result.operations.map((o) => o.logicalKey), GSD_LABELS.map((l) => BOOTSTRAP_LOGICAL_KEY.label(l.name)));
+    assert.equal(result.checkpoints.length, 0);
+  });
+
+  test('the repo already has gsd:phase with an exactly matching name: one create for gsd:plan only, one noop, one adoption checkpoint carrying its node id', () => {
+    const result = planLabels({ available: true, labels: [remoteLabel('L_phase', 'gsd:phase')] }, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.length, 1);
+    assert.equal(result.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.label('gsd:plan'));
+    assert.equal(result.noops.length, 1);
+    assert.equal(result.checkpoints.length, 1);
+    assert.equal(result.checkpoints[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.label('gsd:phase'));
+    assert.equal(result.checkpoints[0].nodeId, 'L_phase');
+  });
+
+  test('the repo already has both labels exactly: zero operations, two noops, two adoption checkpoints', () => {
+    const remote = { available: true, labels: [remoteLabel('L_phase', 'gsd:phase'), remoteLabel('L_plan', 'gsd:plan')] };
+    const result = planLabels(remote, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.noops.length, 2);
+    assert.equal(result.checkpoints.length, 2);
+  });
+
+  test("T-03-32 / case-variant convergence: a label spelled GSD:Phase yields zero create operations for it, one noop whose detail names the observed spelling, and one checkpoint carrying its node id under GSD's own reserved key", () => {
+    const result = planLabels({ available: true, labels: [remoteLabel('L_variant', 'GSD:Phase')] }, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.some((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.label('gsd:phase')), false);
+    const variantNoop = result.noops.find((n) => n.detail);
+    assert.ok(variantNoop, 'the case-variant branch must record a noop with a detail');
+    assert.match(variantNoop.detail, /GSD:Phase/);
+    const checkpoint = result.checkpoints.find((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.label('gsd:phase'));
+    assert.ok(checkpoint, 'the case-variant label must still be checkpointed under GSD\'s reserved key');
+    assert.equal(checkpoint.nodeId, 'L_variant');
+    // gsd:plan is still genuinely missing -> its own create operation.
+    assert.equal(result.operations.length, 1);
+    assert.equal(result.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.label('gsd:plan'));
+  });
+
+  test('a three-round test against a permanently case-variant repository (cycle-2 non-HIGH #4): rounds two and three each emit zero label operations', () => {
+    const remote = { available: true, labels: [remoteLabel('L_variant', 'GSD:Phase'), remoteLabel('L_plan', 'gsd:plan')] };
+    let strictMap = { kind: 'absent' };
+    for (let round = 1; round <= 3; round += 1) {
+      const result = planLabels(remote, strictMap, CONTEXT);
+      if (round > 1) assert.equal(result.operations.length, 0, `round ${round} must emit zero label operations`);
+      let map = strictMap.kind === 'valid' ? strictMap.map : null;
+      for (const checkpoint of result.checkpoints) {
+        map = realMap.recordCompletion(map, {
+          logicalKey: checkpoint.logicalKey, nodeId: checkpoint.nodeId, completedAt: '2026-01-01T00:00:00.000Z',
+          owner: CONTEXT.owner, repo: CONTEXT.repo, repositoryNumber: CONTEXT.repositoryNumber,
+        });
+      }
+      strictMap = { kind: 'valid', map };
+    }
+  });
+
+  test('a label differing from gsd:phase by more than case is ignored entirely: no operation, no noop, no checkpoint for it, and both GSD labels still plan a create', () => {
+    const result = planLabels({ available: true, labels: [remoteLabel('L_other', 'gsd-phase')] }, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.length, 2);
+    assert.equal(result.checkpoints.length, 0);
+    assert.equal(result.noops.length, 0);
+  });
+
+  test('planLabels never emits an operation that would edit or remove an existing label — POST is the only HTTP method value appearing in any emitted argv', () => {
+    const cases = [
+      { available: true, labels: [] },
+      { available: true, labels: [remoteLabel('L_phase', 'gsd:phase')] },
+      { available: true, labels: [remoteLabel('L_variant', 'GSD:Phase')] },
+    ];
+    for (const remote of cases) {
+      const result = planLabels(remote, { kind: 'absent' }, CONTEXT);
+      for (const operation of result.operations) {
+        assert.equal(operation.action, 'create');
+        const methods = operation.args.filter((arg, index) => operation.args[index - 1] === '-X');
+        for (const method of methods) assert.equal(method, 'POST');
+      }
+    }
+  });
+
+  test('every emitted label create declares the REST transport, the create action, no points budget, and content creation true', () => {
+    const result = planLabels({ available: true, labels: [] }, { kind: 'absent' }, CONTEXT);
+    for (const operation of result.operations) {
+      assert.equal(operation.transport, 'rest');
+      assert.equal(operation.action, 'create');
+      assert.equal(operation.hasPointsBudget, false);
+      assert.equal(operation.contentCreation, true);
+    }
+  });
+
+  test('every argv entry carrying a string value is immediately preceded by the raw-value flag', () => {
+    const result = planLabels({ available: true, labels: [] }, { kind: 'absent' }, CONTEXT);
+    for (const operation of result.operations) {
+      for (let i = 0; i < operation.args.length; i += 1) {
+        const entry = operation.args[i];
+        if (typeof entry !== 'string' || entry === 'api' || entry === operation.args[1] || entry === '-X' || entry === 'POST' || entry === '-f') continue;
+        assert.equal(operation.args[i - 1], '-f', `${entry} must be preceded by -f`);
+      }
+    }
+  });
+
+  test('every operation and checkpoint planLabels emits carries the supplied completion context verbatim, and folds through the real recordCompletion without throwing', () => {
+    const context = { owner: 'zzz', repo: 'zzz-repo', repositoryNumber: 999 };
+    const createResult = planLabels({ available: true, labels: [] }, { kind: 'absent' }, context);
+    for (const op of createResult.operations) assert.deepEqual(op.completionContext, context);
+
+    const adoptResult = planLabels({ available: true, labels: [remoteLabel('L_phase', 'gsd:phase'), remoteLabel('L_plan', 'gsd:plan')] }, { kind: 'absent' }, context);
+    for (const checkpoint of adoptResult.checkpoints) {
+      assert.deepEqual(checkpoint.completionContext, context);
+      assert.doesNotThrow(() => realMap.recordCompletion(null, {
+        logicalKey: checkpoint.logicalKey, nodeId: checkpoint.nodeId, completedAt: '2026-01-01T00:00:00.000Z',
+        owner: checkpoint.completionContext.owner, repo: checkpoint.completionContext.repo, repositoryNumber: checkpoint.completionContext.repositoryNumber,
+      }));
+    }
+  });
+});
+
+// ─── parseMilestoneVersionToken (plan 03-05 Task 3) ────────────────────────
+
+describe('parseMilestoneVersionToken', () => {
+  test('returns the whole token for a well-formed leading version', () => {
+    assert.equal(parseMilestoneVersionToken('v1.0 — name'), 'v1.0');
+  });
+
+  test('returns null when the token is not in the leading position', () => {
+    assert.equal(parseMilestoneVersionToken('prefix v1.0 — name'), null);
+  });
+
+  test('tolerates leading ASCII whitespace', () => {
+    assert.equal(parseMilestoneVersionToken('  v1.0 — name'), 'v1.0');
+  });
+
+  test('parses a double-digit minor and a three-segment version whole', () => {
+    assert.equal(parseMilestoneVersionToken('v1.10 — name'), 'v1.10');
+    assert.equal(parseMilestoneVersionToken('v1.2.3 — name'), 'v1.2.3');
+  });
+});
+
+// ─── planMilestones (plan 03-05 Task 3) ────────────────────────────────────
+
+const MILESTONE_EM_DASH = '—';
+function milestoneTitle(version, name) {
+  return `${version} ${MILESTONE_EM_DASH} ${name}`;
+}
+function desiredMilestoneFixture(version, name, archived = false) {
+  return { version, name, title: milestoneTitle(version, name), description: `desc for ${version}`, archived };
+}
+function remoteMilestone(nodeId, title, number, state) {
+  return { nodeId, name: title, number, state };
+}
+
+describe('planMilestones', () => {
+  test('one archived and one current desired milestone, repo has none: two create operations; archived carries the closed state, current carries the open state (D-25)', () => {
+    const desired = { available: true, milestones: [desiredMilestoneFixture('v0.9', 'archived', true), desiredMilestoneFixture('v1.0', 'current', false)] };
+    const result = planMilestones(desired, { available: true, milestones: [] }, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.length, 2);
+    const archivedOp = result.operations.find((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.milestone('v0.9'));
+    const currentOp = result.operations.find((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.milestone('v1.0'));
+    assert.equal(findArg(archivedOp, 'state='), 'state=closed');
+    assert.equal(findArg(currentOp, 'state='), 'state=open');
+  });
+
+  test("a remote milestone whose leading version token matches a desired version but whose name portion differs: zero operations, one noop, one checkpoint carrying its node id and its number, title never rewritten", () => {
+    const desired = { available: true, milestones: [desiredMilestoneFixture('v1.0', 'current', false)] };
+    const remote = { available: true, milestones: [remoteMilestone('M_1', 'v1.0 — a different name', 3, 'open')] };
+    const result = planMilestones(desired, remote, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.noops.length, 1);
+    assert.equal(result.checkpoints.length, 1);
+    assert.equal(result.checkpoints[0].nodeId, 'M_1');
+    assert.equal(result.checkpoints[0].remoteNumber, 3);
+  });
+
+  test('a milestone whose stored completion holds a node id is resolved by that id first, falling back to the version token (D-17/D-23)', () => {
+    const desired = { available: true, milestones: [desiredMilestoneFixture('v1.0', 'current', false)] };
+    const remote = { available: true, milestones: [remoteMilestone('M_stale', 'v1.0 — old title', 3, 'open')] };
+    const strictMap = { kind: 'valid', map: { completions: { [BOOTSTRAP_LOGICAL_KEY.milestone('v1.0')]: { nodeId: 'M_stale' } } } };
+    const result = planMilestones(desired, remote, strictMap, CONTEXT);
+    assert.equal(result.checkpoints[0].nodeId, 'M_stale');
+  });
+
+  test('no emitted milestone operation carries a due-date field of any kind (D-27)', () => {
+    // planner-discipline-allow: due
+    const desired = { available: true, milestones: [desiredMilestoneFixture('v1.0', 'current', false)] };
+    const result = planMilestones(desired, { available: true, milestones: [] }, { kind: 'absent' }, CONTEXT);
+    for (const operation of result.operations) {
+      for (const arg of operation.args) {
+        if (typeof arg === 'string') assert.doesNotMatch(arg, /due/i);
+      }
+    }
+  });
+
+  test("no emitted milestone operation updates an existing milestone's description (D-27's set-once rule) — a matched milestone produces zero operations", () => {
+    const desired = { available: true, milestones: [desiredMilestoneFixture('v1.0', 'current', false)] };
+    const remote = { available: true, milestones: [remoteMilestone('M_1', 'v1.0 — current', 3, 'open')] };
+    const result = planMilestones(desired, remote, { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.length, 0);
+  });
+
+  test('planMilestones never emits an operation carrying an HTTP method other than POST', () => {
+    const desired = { available: true, milestones: [desiredMilestoneFixture('v1.0', 'current', false)] };
+    const result = planMilestones(desired, { available: true, milestones: [] }, { kind: 'absent' }, CONTEXT);
+    for (const operation of result.operations) {
+      const methods = operation.args.filter((arg, index) => operation.args[index - 1] === '-X');
+      for (const method of methods) assert.equal(method, 'POST');
+    }
+  });
+
+  test('every label and milestone operation declares a single node capture whose node-id path addresses the response body\'s own node-id scalar — with a number path for milestones only', () => {
+    const labelResult = planLabels({ available: true, labels: [] }, { kind: 'absent' }, CONTEXT);
+    for (const operation of labelResult.operations) {
+      assert.equal(operation.captures.length, 1);
+      assert.equal(operation.captures[0].kind, 'node');
+      assert.equal(operation.captures[0].nodeIdPath, 'node_id');
+      assert.equal(operation.captures[0].numberPath, undefined);
+    }
+    const desired = { available: true, milestones: [desiredMilestoneFixture('v1.0', 'current', false)] };
+    const milestoneResult = planMilestones(desired, { available: true, milestones: [] }, { kind: 'absent' }, CONTEXT);
+    for (const operation of milestoneResult.operations) {
+      assert.equal(operation.captures[0].nodeIdPath, 'node_id');
+      assert.equal(operation.captures[0].numberPath, 'number');
+    }
+  });
+
+  test('every string value rides the raw-value flag; a milestone title containing an em-dash and a description containing arbitrary ROADMAP heading text survive verbatim', () => {
+    const desired = { available: true, milestones: [{ version: 'v1.0', name: 'x', title: 'v1.0 — name with — em dash', description: '## arbitrary ROADMAP heading text', archived: false }] };
+    const result = planMilestones(desired, { available: true, milestones: [] }, { kind: 'absent' }, CONTEXT);
+    const operation = result.operations[0];
+    const titleIndex = operation.args.findIndex((arg) => typeof arg === 'string' && arg.startsWith('title='));
+    assert.equal(operation.args[titleIndex - 1], '-f');
+    assert.equal(operation.args[titleIndex], `title=${desired.milestones[0].title}`);
+    const descriptionIndex = operation.args.findIndex((arg) => typeof arg === 'string' && arg.startsWith('description='));
+    assert.equal(operation.args[descriptionIndex - 1], '-f');
+    assert.equal(operation.args[descriptionIndex], `description=${desired.milestones[0].description}`);
+  });
+
+  test('planBootstrap translates every member of the remote-layer reason enum to a member of the operation-layer reason enum', () => {
+    for (const remoteReason of Object.values(bootstrapRemote.BOOTSTRAP_REMOTE_REASON)) {
+      const plan = planBootstrap({
+        desired: { available: true },
+        remote: { available: false, reason: remoteReason, projectOutcome: 'unavailable', statusField: null },
+        strictMap: { kind: 'absent' },
+        target: { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 },
+      }, { pass: BOOTSTRAP_PASS.OPTIONS });
+      assert.equal(plan.operations.length, 0);
+      const operationReasons = Object.values(BOOTSTRAP_OPERATION_REASON);
+      assert.ok(
+        operationReasons.includes(plan.uncertain[0].reason),
+        `reason "${plan.uncertain[0].reason}" for remote reason "${remoteReason}" is not a member of BOOTSTRAP_OPERATION_REASON`,
+      );
+    }
+  });
+
+  test('every operation and checkpoint planLabels and planMilestones emit carry the completion context planBootstrap supplied, and folding any checkpoint through the real recordCompletion does not throw', () => {
+    const target = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 9 };
+    const remote = {
+      available: true, projectOutcome: 'resolved',
+      repository: { nodeId: 'R_1', ownerNodeId: 'O_1', ownerLogin: 'octo', linkState: 'linked' },
+      projectNodeId: 'PVT_1', statusField: null,
+      fields: [
+        { id: 'F_id', name: 'GSD ID', dataType: 'TEXT', options: null },
+        { id: 'F_phase', name: 'Phase', dataType: 'TEXT', options: null },
+        { id: 'F_req', name: 'Requirements', dataType: 'TEXT', options: null },
+        { id: 'F_wave', name: 'Wave', dataType: 'NUMBER', options: null },
+        { id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [] },
+      ],
+      labels: [remoteLabel('L_phase', 'gsd:phase')],
+      milestones: [remoteMilestone('M_1', 'v1.0 — current', 3, 'open')],
+    };
+    const desired = { available: true, milestones: [desiredMilestoneFixture('v1.0', 'current', false)] };
+    const plan = planBootstrap({ desired, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.STRUCTURE });
+    for (const item of [...plan.operations, ...plan.checkpoints]) {
+      assert.deepEqual(item.completionContext, { owner: 'octo', repo: 'repo', repositoryNumber: 1 });
+    }
+    for (const checkpoint of plan.checkpoints) {
+      assert.doesNotThrow(() => realMap.recordCompletion(null, {
+        logicalKey: checkpoint.logicalKey, nodeId: checkpoint.nodeId,
+        ...(checkpoint.remoteNumber === undefined ? {} : { issueNumber: checkpoint.remoteNumber }),
+        completedAt: '2026-01-01T00:00:00.000Z',
+        owner: checkpoint.completionContext.owner, repo: checkpoint.completionContext.repo, repositoryNumber: checkpoint.completionContext.repositoryNumber,
+      }));
+    }
+  });
+});
+
 // ─── planBootstrap wiring: planProject drives the structure pass ──────────
 
 describe('planBootstrap structure pass wiring (plan 03-03)', () => {
@@ -1032,9 +1331,12 @@ describe('planBootstrap structure pass wiring (plan 03-03)', () => {
   // ── plan 03-04 Task 2: planFields runs after planProject in the structure pass ──
 
   test('the structure pass runs planFields after planProject: on an unset project with an empty field list, 2 project operations followed by 5 field operations', () => {
+    // Labels present exactly (plan 03-05 Task 3's own stage) so this test's
+    // narrow focus — field-create ordering after the project ops — stays
+    // isolated from the label stage's own behavior, covered separately below.
     const plan = planBootstrap({
       desired: { available: true },
-      remote: projectRemote({ fields: [] }),
+      remote: projectRemote({ fields: [], labels: bothGsdLabelsAdopted() }),
       strictMap: { kind: 'absent' },
       target,
     }, { pass: BOOTSTRAP_PASS.STRUCTURE });
@@ -1044,7 +1346,7 @@ describe('planBootstrap structure pass wiring (plan 03-03)', () => {
     assert.deepEqual(plan.operations.slice(2).map((o) => o.logicalKey), GSD_FIELDS.map((f) => BOOTSTRAP_LOGICAL_KEY.field(f.name)));
   });
 
-  test('an adopted, fully-fielded board produces zero structure operations and eight checkpoints (project, link, five fields, Status)', () => {
+  test('an adopted, fully-fielded, fully-labeled board produces zero structure operations and ten checkpoints (project, link, five fields, Status, two labels)', () => {
     const adoptedTarget = { ...target, projectNumber: 9 };
     const fields = [
       { id: 'F_id', name: 'GSD ID', dataType: 'TEXT', options: null },
@@ -1056,10 +1358,28 @@ describe('planBootstrap structure pass wiring (plan 03-03)', () => {
     const remote = projectRemote({
       projectOutcome: 'resolved', projectNodeId: 'PVT_adopted', repository: projectRepo({ linkState: 'linked' }),
       fields, statusField: { id: 'F_status', name: 'Status', dataType: 'SINGLE_SELECT', options: [] },
+      labels: bothGsdLabelsAdopted(),
     });
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target: adoptedTarget }, { pass: BOOTSTRAP_PASS.STRUCTURE });
     assert.equal(plan.operations.length, 0);
-    assert.equal(plan.checkpoints.length, 8);
+    assert.equal(plan.checkpoints.length, 10);
+  });
+
+  test('the structure pass runs planLabels then planMilestones after planFields: project, link, five fields, two labels, one milestone, in that order', () => {
+    const desired = { available: true, milestones: [{ version: 'v1.0', name: 'current', title: 'v1.0 — current', description: '', archived: false }] };
+    const plan = planBootstrap({
+      desired,
+      remote: projectRemote({ fields: [] }),
+      strictMap: { kind: 'absent' },
+      target,
+    }, { pass: BOOTSTRAP_PASS.STRUCTURE });
+    assert.deepEqual(plan.operations.map((o) => o.logicalKey), [
+      BOOTSTRAP_LOGICAL_KEY.project(),
+      BOOTSTRAP_LOGICAL_KEY.projectLink(),
+      ...GSD_FIELDS.map((f) => BOOTSTRAP_LOGICAL_KEY.field(f.name)),
+      ...GSD_LABELS.map((l) => BOOTSTRAP_LOGICAL_KEY.label(l.name)),
+      BOOTSTRAP_LOGICAL_KEY.milestone('v1.0'),
+    ]);
   });
 });
 
@@ -1114,6 +1434,35 @@ describe('planBootstrap run-fatal suppression', () => {
     const optionsPlan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target: fatalTarget() }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.ok(optionsPlan.operations.length > 0, 'options pass must plan the missing Status option');
     assert.equal(optionsPlan.blocked.length, 0);
+  });
+
+  // ── plan 03-05 Task 3: the run-fatal criterion plan 03-04 could not carry ──
+  // for the two stages that did not exist at wave 4. `fatalRemote` already
+  // carries no `labels`/`milestones` (both default to empty via `?? []`), so
+  // both stages would each emit a create absent the gate.
+
+  test('the run-fatal gate now also suppresses labels and milestones (the two stages that did not exist at plan 03-04\'s wave): zero label and zero milestone operations, and zero checkpoints from either stage', () => {
+    const desiredWithMilestone = {
+      available: true,
+      milestones: [{ version: 'v1.0', name: 'current', title: 'v1.0 — current', description: '', archived: false }],
+    };
+    const remote = fatalRemote({ mismatch: true });
+    const structurePlan = planBootstrap({ desired: desiredWithMilestone, remote, strictMap: { kind: 'absent' }, target: fatalTarget() }, { pass: BOOTSTRAP_PASS.STRUCTURE });
+    assert.equal(structurePlan.operations.filter((o) => o.stage === BOOTSTRAP_STAGE.LABELS).length, 0);
+    assert.equal(structurePlan.operations.filter((o) => o.stage === BOOTSTRAP_STAGE.MILESTONES).length, 0);
+    assert.equal(structurePlan.operations.length, 0);
+    assert.equal(structurePlan.checkpoints.length, 0);
+  });
+
+  test('the identical input without the wrong-typed field emits both the label and the milestone stage\'s creates', () => {
+    const desiredWithMilestone = {
+      available: true,
+      milestones: [{ version: 'v1.0', name: 'current', title: 'v1.0 — current', description: '', archived: false }],
+    };
+    const remote = fatalRemote({ mismatch: false });
+    const structurePlan = planBootstrap({ desired: desiredWithMilestone, remote, strictMap: { kind: 'absent' }, target: fatalTarget() }, { pass: BOOTSTRAP_PASS.STRUCTURE });
+    assert.ok(structurePlan.operations.some((o) => o.stage === BOOTSTRAP_STAGE.LABELS), 'the label stage must plan a create');
+    assert.ok(structurePlan.operations.some((o) => o.stage === BOOTSTRAP_STAGE.MILESTONES), 'the milestone stage must plan a create');
   });
 });
 
