@@ -27,6 +27,11 @@ const BOOTSTRAP_REMOTE_REASON = Object.freeze({
   OK: 'ok',
   UNSAFE_TARGET: 'unsafe_target',
   UNAVAILABLE: 'remote_unavailable',
+  // Task 2: a REST list read (labels, milestones) failed — a non-zero exit,
+  // a timeout, an unparseable body, or a body that is not a JSON array.
+  // Distinct from UNAVAILABLE only to give planBootstrap's reason-catalog
+  // translation (Task 3) something REST-specific to map from.
+  REST_UNAVAILABLE: 'rest_unavailable',
 } as const);
 type BootstrapRemoteReason = typeof BOOTSTRAP_REMOTE_REASON[keyof typeof BOOTSTRAP_REMOTE_REASON];
 
@@ -54,6 +59,23 @@ const PATH_SAFE_TARGET = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 function assertPathSafeTarget(owner: unknown, repo: unknown): boolean {
   return typeof owner === 'string' && typeof repo === 'string' &&
     PATH_SAFE_TARGET.test(owner) && PATH_SAFE_TARGET.test(repo);
+}
+
+/**
+ * T-03-02 / RESEARCH Pitfall 1: the REST-path sibling of the GraphQL-variable
+ * vulnerability commit `eae4c80e` fixed. `gh api`'s own help text confirms it
+ * substitutes brace-wrapped `{owner}`/`{repo}`/`{branch}` tokens in an
+ * endpoint path from the **local git checkout or the repository environment
+ * variable**, never from `github_sync.target` — so a fork, a multi-repo
+ * workspace, or a differently-checked-out CI runner would silently have
+ * labels or milestones created on the wrong repository. Returns null before
+ * any `execGh` call when the guard fails; callers must never invoke `gh` in
+ * that case (a dedicated test counts `execGh` invocations at zero for five
+ * hostile owner/repo values).
+ */
+function restPath(owner: string, repo: string, suffix: string): string | null {
+  if (!assertPathSafeTarget(owner, repo)) return null;
+  return `repos/${owner}/${repo}${suffix}`;
 }
 
 const LINK_STATE = Object.freeze({
@@ -136,7 +158,7 @@ interface BootstrapRemoteOptions {
   owner: string;
   repo: string;
   projectNumber: number | null;
-  execGh?: (args: string[], opts: { cwd?: string }) => GhResult;
+  execGh?: (args: string[], opts: { cwd?: string; includeHeaders?: boolean }) => GhResult;
 }
 
 interface RepositoryRead {
@@ -156,10 +178,17 @@ interface BootstrapRemoteState {
   projectNodeId: string | null;
   fields: RemoteField[];
   statusField: RemoteField | null;
+  /** BOOT-04: every repository label, decoded from a REST list read. */
+  labels: RestListEntry[];
+  /** BOOT-05: every repository Milestone (open and closed), decoded from a REST list read. */
+  milestones: RestListEntry[];
 }
 
 function unavailable(reason: BootstrapRemoteReason = BOOTSTRAP_REMOTE_REASON.UNAVAILABLE): BootstrapRemoteState {
-  return { available: false, reason, projectOutcome: PROJECT_OUTCOME.UNAVAILABLE, repository: null, projectNodeId: null, fields: [], statusField: null };
+  return {
+    available: false, reason, projectOutcome: PROJECT_OUTCOME.UNAVAILABLE, repository: null, projectNodeId: null,
+    fields: [], statusField: null, labels: [], milestones: [],
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -256,6 +285,133 @@ function decodeField(raw: unknown): RemoteField | null {
   return { id: raw.id, name: raw.name, dataType: raw.dataType, options };
 }
 
+// ─── REST list reads (Task 2): labels and milestones ───────────────────────
+
+/** One decoded REST label or milestone: node id, name/title, and — milestones only — number and state. */
+interface RestListEntry {
+  nodeId: string;
+  name: string;
+  number?: number;
+  state?: string;
+}
+
+function isPositiveSafeIntegerLocal(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+/**
+ * Decodes one REST list element. `name` reads GitHub's `name` field (labels)
+ * or falls back to `title` (milestones) — one decoder serves both endpoints.
+ * `number`/`state` are present only on a milestone and are optional here.
+ * The node id is what Task 3's adoption checkpoints record; decode fails
+ * closed (null) when it is absent or empty, exactly as `decodeField` does
+ * for the GraphQL field reader above.
+ */
+function decodeRestEntry(raw: unknown): RestListEntry | null {
+  if (!isRecord(raw)) return null;
+  const nodeId = raw.node_id;
+  const name = typeof raw.name === 'string' ? raw.name : (typeof raw.title === 'string' ? raw.title : undefined);
+  if (!isNonEmptyString(nodeId) || !isNonEmptyString(name)) return null;
+  const entry: RestListEntry = { nodeId, name };
+  if (isPositiveSafeIntegerLocal(raw.number)) entry.number = raw.number;
+  if (typeof raw.state === 'string') entry.state = raw.state;
+  return entry;
+}
+
+interface RestListResult {
+  available: boolean;
+  reason: BootstrapRemoteReason;
+  entries: RestListEntry[];
+}
+
+/**
+ * Issues exactly **one** `execGh` call per list, requesting `gh api`'s own
+ * paginate-and-slurp mode rather than a cursor loop GSD would have to own
+ * (RESEARCH Pitfall 3, cycle-1 HIGH-8): `gh` 2.96.0's slurp mode wraps every
+ * page of a JSON-array response into one outer array, verified live against a
+ * real 41-page label list during replanning. This function flattens exactly
+ * one level when the outer array's own elements are themselves arrays (the
+ * multi-page shape) and accepts a flat array of objects unchanged (the
+ * single-page shape some `gh` versions return un-nested) — an empty array of
+ * one empty array (`[[]]`) decodes to an available, zero-entry result, never
+ * an unavailable one: an empty list is a decodable state meaning "none
+ * exist".
+ *
+ * Always passes an explicit page size of 100 in the query — the REST default
+ * of 30 would silently under-read a developer's pre-existing labels or
+ * milestones and cause a duplicate create. `includeHeaders` is always false:
+ * this reader needs no header metadata, and combining it with paginate mode
+ * would be incompatible with the framing parser's two-block guard in any case
+ * (Task 2's own pagination-decision note — no change to that seam here).
+ *
+ * LIVE FINDING, discovered capturing this task's own fixture against
+ * `drungrin/gsd-core`: `gh api`'s documented default method is GET, but the
+ * moment ANY `-f`/`-F` value is supplied on a path with no explicit
+ * `--method`/`-X`, `gh` silently switches to POST instead (`gh api --help`:
+ * "were added. Override the method with `--method`."). A read call built as
+ * `gh api repos/OWNER/REPO/labels -f per_page=100` therefore dispatches a
+ * POST to the label-**create** endpoint, not a GET list — reproduced live: it
+ * returned a 422 for a missing `name` field. `-X`, `GET` is passed
+ * explicitly, unconditionally, on every call this function issues, so the
+ * page-size query parameter can never flip the request into a write.
+ *
+ * Never throws: a non-zero exit, a timeout, unparseable JSON, a body that is
+ * not a JSON array, or a malformed element all collapse to the fixed
+ * REST-unavailable result.
+ */
+function readRestList(
+  execGh: (args: string[], opts: { cwd?: string; includeHeaders?: boolean }) => GhResult,
+  cwd: string,
+  restApiPath: string,
+  query: Record<string, string>,
+): RestListResult {
+  const queryArgv: string[] = [];
+  for (const [key, value] of Object.entries(query)) queryArgv.push('-f', `${key}=${value}`);
+  const result = execGh(['api', restApiPath, '-X', 'GET', ...queryArgv, '--paginate', '--slurp'], { cwd, includeHeaders: false });
+  if (result.exitCode !== 0) return { available: false, reason: BOOTSTRAP_REMOTE_REASON.REST_UNAVAILABLE, entries: [] };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return { available: false, reason: BOOTSTRAP_REMOTE_REASON.REST_UNAVAILABLE, entries: [] };
+  }
+  if (!Array.isArray(parsed)) return { available: false, reason: BOOTSTRAP_REMOTE_REASON.REST_UNAVAILABLE, entries: [] };
+
+  const flattened: unknown[] = parsed.length > 0 && parsed.every((element) => Array.isArray(element)) ? parsed.flat() : parsed;
+
+  const entries: RestListEntry[] = [];
+  for (const raw of flattened) {
+    const decoded = decodeRestEntry(raw);
+    if (!decoded) return { available: false, reason: BOOTSTRAP_REMOTE_REASON.REST_UNAVAILABLE, entries: [] };
+    entries.push(decoded);
+  }
+  return { available: true, reason: BOOTSTRAP_REMOTE_REASON.OK, entries };
+}
+
+interface BootstrapRestOptions {
+  cwd: string;
+  owner: string;
+  repo: string;
+  execGh?: (args: string[], opts: { cwd?: string; includeHeaders?: boolean }) => GhResult;
+}
+
+/** BOOT-04: `init`'s repository label list read. Explicit page size 100, exhausted inside `gh`. */
+function readRepoLabels(options: BootstrapRestOptions): RestListResult {
+  const execGh = options.execGh ?? ghMod.execGh;
+  const restApiPath = restPath(options.owner, options.repo, '/labels');
+  if (restApiPath === null) return { available: false, reason: BOOTSTRAP_REMOTE_REASON.UNSAFE_TARGET, entries: [] };
+  return readRestList(execGh, options.cwd, restApiPath, { per_page: '100' });
+}
+
+/** BOOT-05: `init`'s Milestone list read. Requests all states so a closed milestone is visible and an archived-milestone create cannot duplicate one. */
+function readRepoMilestones(options: BootstrapRestOptions): RestListResult {
+  const execGh = options.execGh ?? ghMod.execGh;
+  const restApiPath = restPath(options.owner, options.repo, '/milestones');
+  if (restApiPath === null) return { available: false, reason: BOOTSTRAP_REMOTE_REASON.UNSAFE_TARGET, entries: [] };
+  return readRestList(execGh, options.cwd, restApiPath, { per_page: '100', state: 'all' });
+}
+
 /**
  * Reads every field on the project number, paging through `fields` with the
  * same cursor-exhaustion and repeat-cursor guard as
@@ -327,6 +483,16 @@ function readBootstrapRemoteState(options: BootstrapRemoteOptions): BootstrapRem
   const repository = readRepository(options);
   if (repository === undefined) return unavailable();
 
+  // Task 2: labels and milestones are read alongside the project/fields data
+  // in every call — a REST failure marks the WHOLE snapshot unavailable
+  // rather than returning an empty list that would read as "nothing exists"
+  // and trigger a duplicate create (T-03-12).
+  const restOptions = { cwd: options.cwd, owner: options.owner, repo: options.repo, execGh: options.execGh };
+  const labelsRead = readRepoLabels(restOptions);
+  if (!labelsRead.available) return unavailable(labelsRead.reason);
+  const milestonesRead = readRepoMilestones(restOptions);
+  if (!milestonesRead.available) return unavailable(milestonesRead.reason);
+
   if (options.projectNumber === null) {
     return {
       available: true,
@@ -336,6 +502,8 @@ function readBootstrapRemoteState(options: BootstrapRemoteOptions): BootstrapRem
       projectNodeId: null,
       fields: [],
       statusField: null,
+      labels: labelsRead.entries,
+      milestones: milestonesRead.entries,
     };
   }
 
@@ -351,12 +519,17 @@ function readBootstrapRemoteState(options: BootstrapRemoteOptions): BootstrapRem
     projectNodeId: projectFields.projectNodeId,
     fields: projectFields.fields,
     statusField,
+    labels: labelsRead.entries,
+    milestones: milestonesRead.entries,
   };
 }
 
 export = {
   assertPathSafeTarget,
   readBootstrapRemoteState,
+  restPath,
+  readRepoLabels,
+  readRepoMilestones,
   BOOTSTRAP_REMOTE_REASON,
   BOOTSTRAP_DOCUMENTS,
   PROJECT_OUTCOME,
