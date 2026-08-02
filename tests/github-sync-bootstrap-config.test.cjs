@@ -153,6 +153,83 @@ describe('writeProjectNumber', () => {
       assert.deepEqual(entries, ['config.json']);
     } finally { cleanup(dir); }
   });
+
+  // ── CR-02 regression: a stale repository_number must be repaired, not re-serialized ──
+
+  test('CR-02: given an existing target whose repository number is stale (0), the write persists the resolved value from the target parameter and readSyncTarget accepts the result', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, target: { owner: 'configured-owner', repo: 'configured-repo', repository_number: 0 } } });
+      const result = writeProjectNumber(dir, { owner: 'configured-owner', repo: 'configured-repo', repositoryNumber: 999 }, 42);
+      assert.equal(result.ok, true);
+      assert.equal(result.reason, CONFIG_WRITE_REASON.WRITTEN);
+      const after = JSON.parse(fs.readFileSync(path.join(dir, '.planning', 'config.json'), 'utf8'));
+      assert.equal(after.github_sync.target.repository_number, 999);
+      assert.equal(after.github_sync.target.project_number, 42);
+      const read = readSyncTarget(dir);
+      assert.equal(read.available, true);
+      assert.equal(read.target.repositoryNumber, 999);
+      assert.equal(read.target.projectNumber, 42);
+    } finally { cleanup(dir); }
+  });
+
+  test('CR-02: the router\'s own sequence end to end — resolveTarget\'s recovered target threaded into writeProjectNumber leaves a config readSyncTarget accepts', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, target: { owner: 'configured-owner', repo: 'configured-repo', repository_number: 0 } } });
+      let calls = 0;
+      const execGh = () => {
+        calls += 1;
+        return { exitCode: 0, stdout: JSON.stringify({ owner: { login: 'should-be-ignored' }, name: 'should-be-ignored', databaseId: 999 }), stderr: '', reason: 'ok' };
+      };
+      const result = resolveTarget(dir, { execGh });
+      assert.equal(result.reason, RESOLVE_TARGET_REASON.RESOLVED);
+      assert.equal(calls, 1);
+
+      const { owner, repo, repositoryNumber } = result.target;
+      const writeResult = writeProjectNumber(dir, { owner, repo, repositoryNumber }, 42);
+      assert.equal(writeResult.ok, true);
+
+      const read = readSyncTarget(dir);
+      assert.equal(read.available, true);
+      assert.equal(read.target.repositoryNumber, 999);
+    } finally { cleanup(dir); }
+  });
+
+  test('CR-02: the unrecognized-shape refusal still fires now that the written values come from the resolved target', () => {
+    const dir = tempDir();
+    try {
+      const original = { github_sync: { enabled: true, target: { owner: 'configured-owner', repo: 'configured-repo', repository_number: 0, mystery: 'unrecognized-fifth-key' } } };
+      writeConfig(dir, original);
+      const before = fs.readFileSync(path.join(dir, '.planning', 'config.json'), 'utf8');
+      const result = writeProjectNumber(dir, { owner: 'configured-owner', repo: 'configured-repo', repositoryNumber: 999 }, 42);
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, CONFIG_WRITE_REASON.UNRECOGNIZED_SHAPE);
+      const after = fs.readFileSync(path.join(dir, '.planning', 'config.json'), 'utf8');
+      assert.equal(after, before);
+    } finally { cleanup(dir); }
+  });
+
+  test('CR-02: idempotent convergence — a follow-up resolveTarget reports configured with zero gh spawns, and a repeat write is byte-identical', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, target: { owner: 'configured-owner', repo: 'configured-repo', repository_number: 0 } } });
+      const firstExecGh = () => ({ exitCode: 0, stdout: JSON.stringify({ owner: { login: 'should-be-ignored' }, name: 'should-be-ignored', databaseId: 999 }), stderr: '', reason: 'ok' });
+      const firstResolve = resolveTarget(dir, { execGh: firstExecGh });
+      const { owner, repo, repositoryNumber } = firstResolve.target;
+      writeProjectNumber(dir, { owner, repo, repositoryNumber }, 42);
+      const afterFirstWrite = fs.readFileSync(path.join(dir, '.planning', 'config.json'), 'utf8');
+
+      let secondCalls = 0;
+      const secondResolve = resolveTarget(dir, { execGh: () => { secondCalls += 1; return { exitCode: 1, stdout: '', stderr: '', reason: 'gh_exit_nonzero' }; } });
+      assert.equal(secondResolve.reason, RESOLVE_TARGET_REASON.CONFIGURED);
+      assert.equal(secondCalls, 0);
+
+      writeProjectNumber(dir, { owner, repo, repositoryNumber }, 42);
+      const afterSecondWrite = fs.readFileSync(path.join(dir, '.planning', 'config.json'), 'utf8');
+      assert.equal(afterSecondWrite, afterFirstWrite);
+    } finally { cleanup(dir); }
+  });
 });
 
 // ─── readPartialSyncTarget ──────────────────────────────────────────────────
