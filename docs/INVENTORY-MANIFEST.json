@@ -375,6 +375,7 @@
       "github-sync-command-router.cjs",
       "github-sync-desired.cjs",
       "github-sync-gh.cjs",
+      "github-sync-issue-body.cjs",
       "github-sync-map.cjs",
       "github-sync-operation.cjs",
       "github-sync-reconcile.cjs",

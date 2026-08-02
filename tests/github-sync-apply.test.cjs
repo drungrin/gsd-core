@@ -385,7 +385,18 @@ test('accepts a real pure reconciler operation at the applier boundary', () => {
     },
     { kind: 'valid', map: { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 } } } },
   );
-  const setup = makeAdapters([success({ nodeId: 'from-real-plan' })]);
+  // The real operationFor (plan 04-01) dispatches addProjectV2ItemById and
+  // reads its response back through `item`, not `projectV2Item` — this
+  // fixture's response must match that real, live-verified shape rather
+  // than the generic success() helper's synthetic addProjectV2Item shape
+  // (which the OTHER tests in this file pair with their own hand-built
+  // operation() captures, unrelated to the real reconciler).
+  const setup = makeAdapters([{
+    exitCode: 0,
+    reason: 'ok',
+    stdout: JSON.stringify({ data: { addProjectV2ItemById: { item: { id: 'from-real-plan', content: { number: 3 } } } } }),
+    stderr: '',
+  }]);
   assert.equal(applyMutationPlan(plan, { cwd: '/repo', map: null, ...setup.adapters }).kind, 'completed');
   assert.equal(setup.calls[1][1].nodeId, 'from-real-plan');
 });
