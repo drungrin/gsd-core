@@ -37,6 +37,10 @@ interface RenderablePhase {
   id: string;
   title: string;
   goal: string;
+  /** Plan 04-05: ordered, verbatim success-criteria text. Omitted or empty renders no criteria heading at all — an empty section is noise, not information. */
+  successCriteria?: string[];
+  /** Plan 04-05: ordered, verbatim requirement IDs. Omitted or empty renders no requirements heading at all, for the same reason. */
+  requirements?: string[];
 }
 
 /** The exact planning-file path every rendered provenance line names (D-04's "this is a projection" framing). */
@@ -63,25 +67,47 @@ export const FENCE_BEGIN = '<!-- gsd:begin -->';
 export const FENCE_END = '<!-- gsd:end -->';
 
 /**
- * The region interior for a phase: the goal under a heading, then a
- * provenance line naming the roadmap source and the phase's own section —
- * phrased so a reader arriving from a notification understands the issue is
- * a projection, not an authored artifact. Emits no markdown checkbox
- * anywhere, under any condition. Success criteria and requirement IDs are
- * added by a later plan in this phase once the desired-state reader
- * supplies them to this function's caller — this function's shape does not
- * change when they arrive, only its rendered contents.
+ * The region interior for a phase (D-14, plan 04-05): the goal under a
+ * heading, success criteria as a plain numbered list, requirement IDs as
+ * plain comma-separated text, and last a provenance line naming the roadmap
+ * source and the phase's own section — phrased so a reader arriving from a
+ * notification understands the issue is a projection, not an authored
+ * artifact, before they consider editing it. Composes only from the typed
+ * `phase` fields this function is given; an unrelated property on `phase`
+ * (a dependency list, a plan count) changes nothing in the output — plan
+ * count is Phase 5's data and a dependency line was deliberately excluded
+ * (D-14), not merely never added.
+ *
+ * Emits no markdown checkbox anywhere, under any condition. A criteria or
+ * requirements list of length zero omits its heading entirely — an empty
+ * section is noise, not information — rather than rendering an empty list
+ * under a heading. Does not escape, transform, or interpret any developer
+ * text: it renders exactly as written, and the only property that must hold
+ * (pinned by a `spliceRegion` round-trip test, not by this function) is that
+ * no developer string can forge a second fence pair.
  */
 export function renderPhaseRegion(phase: RenderablePhase): string {
   const goalLine = phase.goal.length > 0 ? phase.goal : '_No goal recorded on the roadmap._';
-  return [
-    '## Goal',
-    '',
-    goalLine,
+  const lines: string[] = ['## Goal', '', goalLine];
+
+  const successCriteria = phase.successCriteria ?? [];
+  if (successCriteria.length > 0) {
+    lines.push('', '## Success Criteria', '');
+    successCriteria.forEach((criterion, index) => lines.push(`${index + 1}. ${criterion}`));
+  }
+
+  const requirements = phase.requirements ?? [];
+  if (requirements.length > 0) {
+    lines.push('', '## Requirements', '', requirements.join(', '));
+  }
+
+  lines.push(
     '',
     '---',
-    `_This issue is generated from \`${ROADMAP_PATH}\`, Phase ${phase.id}'s section. It is a one-way projection — edits made here are never synced back; update the roadmap instead._`,
-  ].join('\n');
+    `_This issue is generated from \`${ROADMAP_PATH}\`, Phase ${phase.id}'s section. It is a one-way projection, regenerated on every sync — edits made here are never synced back; update the roadmap instead._`,
+  );
+
+  return lines.join('\n');
 }
 
 /**

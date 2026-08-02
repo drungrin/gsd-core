@@ -56,6 +56,116 @@ test('renderPhaseRegion falls back to a placeholder when the goal is empty, neve
   assert.doesNotMatch(region, /\n\n\n/, 'no empty goal should produce a stray blank paragraph run');
 });
 
+/* --- renderPhaseRegion: the full D-14 region (plan 04-05 Task 1) --- */
+
+const FULL_PHASE = {
+  id: '04',
+  title: 'Phase → Issue Sync',
+  goal: 'Sync roadmap phases as GitHub issues.',
+  successCriteria: ['First criterion.', 'Second criterion.', 'Third criterion.'],
+  requirements: ['PHASE-01', 'PHASE-02', 'PHASE-03'],
+};
+
+test('renderPhaseRegion: a phase with a goal, three success criteria, and three requirement IDs contains the goal, all three criteria in source order, and all three IDs', () => {
+  const region = renderPhaseRegion(FULL_PHASE);
+  assert.ok(region.includes(FULL_PHASE.goal));
+  const criteriaIndexes = FULL_PHASE.successCriteria.map((criterion) => region.indexOf(criterion));
+  assert.ok(criteriaIndexes.every((index) => index >= 0), 'every criterion must appear');
+  assert.deepEqual(criteriaIndexes, [...criteriaIndexes].sort((a, b) => a - b), 'criteria must appear in source order');
+  for (const requirementId of FULL_PHASE.requirements) {
+    assert.ok(region.includes(requirementId), `region must contain requirement id ${requirementId}`);
+  }
+});
+
+test('renderPhaseRegion: success criteria render as a plain numbered list — each ordinal prefixes its own criterion text', () => {
+  const region = renderPhaseRegion(FULL_PHASE);
+  FULL_PHASE.successCriteria.forEach((criterion, index) => {
+    assert.match(region, new RegExp(`${index + 1}\\.\\s+${criterion.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  });
+});
+
+test('renderPhaseRegion: no markdown checkbox appears anywhere, in any clickable spelling, empty or checked, even with criteria and requirements populated', () => {
+  const region = renderPhaseRegion(FULL_PHASE);
+  const body = renderNewIssueBody(FULL_PHASE);
+  for (const text of [region, body]) {
+    assert.doesNotMatch(text, /\[ \]/, 'unchecked checkbox must never appear');
+    assert.doesNotMatch(text, /\[x\]/i, 'checked checkbox must never appear (case-insensitive)');
+    assert.doesNotMatch(text, /^\s*-\s*\[/m, 'no list item may open a bracketed control');
+  }
+});
+
+test('renderPhaseRegion: requirement IDs render as plain text, not links and not checkboxes', () => {
+  const region = renderPhaseRegion(FULL_PHASE);
+  assert.doesNotMatch(region, /\[PHASE-\d+\]\(/, 'requirement IDs must not render as markdown links');
+  for (const requirementId of FULL_PHASE.requirements) {
+    assert.doesNotMatch(region, new RegExp(`\\[${requirementId}\\]`), 'a requirement ID must never be wrapped in brackets (a link or checkbox opening)');
+  }
+});
+
+test('renderPhaseRegion: the provenance line names .planning/ROADMAP.md and the phase\'s own section, and states the issue is a regenerated projection', () => {
+  const region = renderPhaseRegion(FULL_PHASE);
+  assert.ok(region.includes('.planning/ROADMAP.md'));
+  assert.ok(region.includes(FULL_PHASE.id));
+  assert.match(region, /projection/i);
+  assert.match(region, /regenerat/i);
+});
+
+test('renderPhaseRegion: the region contains no dependency line and no plan count, even when the phase object carries extra properties naming them', () => {
+  const hostilePhase = { ...FULL_PHASE, dependsOn: ['03'], planCount: 7, wave: 2 };
+  const region = renderPhaseRegion(hostilePhase);
+  assert.doesNotMatch(region, /Depends on/i);
+  assert.doesNotMatch(region, /plan count/i);
+  assert.doesNotMatch(region, /\b7\b/, 'the injected plan count value must never appear');
+});
+
+test('renderPhaseRegion: a phase with zero success criteria renders the goal and provenance with no criteria heading at all', () => {
+  const region = renderPhaseRegion({ ...FULL_PHASE, successCriteria: [] });
+  assert.doesNotMatch(region, /## Success Criteria/);
+  assert.ok(region.includes(FULL_PHASE.goal));
+  assert.ok(region.includes('.planning/ROADMAP.md'));
+});
+
+test('renderPhaseRegion: a phase with zero requirement IDs renders the same way for the requirements section', () => {
+  const region = renderPhaseRegion({ ...FULL_PHASE, requirements: [] });
+  assert.doesNotMatch(region, /## Requirements/);
+  assert.ok(region.includes(FULL_PHASE.goal));
+});
+
+test('renderPhaseRegion: a phase with neither successCriteria nor requirements supplied at all (omitted, not empty) renders with no headings for either', () => {
+  const bare = { id: '04', title: 'T', goal: 'g' };
+  const region = renderPhaseRegion(bare);
+  assert.doesNotMatch(region, /## Success Criteria/);
+  assert.doesNotMatch(region, /## Requirements/);
+});
+
+test('renderPhaseRegion: a goal, a criterion, or a requirement ID containing markdown control characters, an HTML comment, or a string resembling a fence token renders without being interpreted, and the full body still splices cleanly', () => {
+  const hostilePhase = {
+    id: '04',
+    title: 'T',
+    goal: 'Goal with <!-- not-a-gsd-fence --> and *markdown* and a near-fence <!-- gsd:beginx -->.',
+    successCriteria: ['Criterion with `code` and <script>alert(1)</script>.'],
+    requirements: ['PHASE-<!-- gsd:endx -->-01'],
+  };
+  const body = renderNewIssueBody(hostilePhase);
+  assert.ok(body.includes(hostilePhase.goal), 'hostile text renders verbatim, uninterpreted');
+
+  // Round-trips through spliceRegion: exactly one real begin/end fence pair
+  // (the near-fence and requirement-embedded strings above do not exactly
+  // match FENCE_BEGIN/FENCE_END), so the result must be spliced, not damaged.
+  const result = spliceRegion(body, 'a fresh replacement region');
+  assert.equal(result.kind, SPLICE_RESULT.SPLICED, 'hostile developer text must never make its own issue unrepairable');
+});
+
+test('renderPhaseRegion: rendering is deterministic — the same phase renders byte-identically twice', () => {
+  assert.equal(renderPhaseRegion(FULL_PHASE), renderPhaseRegion(FULL_PHASE));
+  assert.equal(renderPhaseRegion({ ...FULL_PHASE }), renderPhaseRegion({ ...FULL_PHASE }));
+});
+
+test('renderPhaseRegion: reads only properties of the phase object it is given — an unrelated property changes nothing in the output', () => {
+  const withExtra = { ...FULL_PHASE, unrelatedProp: 'anything', anotherOne: { nested: true } };
+  assert.equal(renderPhaseRegion(FULL_PHASE), renderPhaseRegion(withExtra));
+});
+
 test('phaseMarker: the marker for id "04" and id "2.1" differ and neither is a substring of the other', () => {
   const marker04 = phaseMarker('04');
   const marker21 = phaseMarker('2.1');
