@@ -371,6 +371,7 @@
       "github-sync-bootstrap-config.cjs",
       "github-sync-bootstrap-plan.cjs",
       "github-sync-bootstrap-remote.cjs",
+      "github-sync-bootstrap-report.cjs",
       "github-sync-command-router.cjs",
       "github-sync-desired.cjs",
       "github-sync-gh.cjs",

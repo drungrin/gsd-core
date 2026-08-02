@@ -846,8 +846,12 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
         _auth: { runPreflight: () => ({ ok: false, reason: PREFLIGHT_REASON.WRONG_SCOPE, message: 'missing project scope' }) },
       });
     } finally { mock.restoreAll(); }
+    // Plan 03-06: `init`'s raw output is now the report DTO — the preflight
+    // failure's own reason/message are forwarded verbatim into
+    // report.outcome, not re-derived, so the wrong-scope reason still names
+    // itself specifically (unlike sync's collapse to "preflight_unavailable").
     const parsed = JSON.parse(chunks.join(''));
-    assert.equal(parsed.reason, PREFLIGHT_REASON.WRONG_SCOPE);
+    assert.equal(parsed.outcome.reason, PREFLIGHT_REASON.WRONG_SCOPE);
   });
 
   test('an init run whose desired-state seam reports unavailable produces the desired-unavailable blocked reason at exit code 0', () => {
@@ -867,8 +871,8 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
     } finally { mock.restoreAll(); }
     assert.equal(process.exitCode, 0);
     const parsed = JSON.parse(chunks.join(''));
-    assert.equal(parsed.kind, 'blocked');
-    assert.equal(parsed.reason, 'desired_unavailable');
+    assert.equal(parsed.outcome.kind, 'blocked');
+    assert.equal(parsed.outcome.reason, 'desired_unavailable');
   });
 
   test('HIGH-1: the options pass writes into the map the structure pass returned, and the strict map is read exactly once', () => {
@@ -965,9 +969,15 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
           },
         });
       } finally { mock.restoreAll(); }
+      // Plan 03-06: `init`'s raw output is the report DTO, which carries
+      // per-stage counts rather than the raw map — the map-threading claim
+      // is proven by reading the persisted file directly, as the sibling
+      // HIGH-1 test above already does.
       const parsed = JSON.parse(chunks.join(''));
-      assert.equal(parsed.kind, 'completed');
-      assert.ok(Object.keys(parsed.map.completions).includes('project'));
+      assert.equal(parsed.outcome.kind, 'completed');
+      const mapPath = path.join(tmpDir, '.planning', '.github-sync.json');
+      const written = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
+      assert.ok(Object.keys(written.completions).includes('project'));
     } finally { cleanup(tmpDir); }
   });
 
@@ -1182,8 +1192,8 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
     } finally { mock.restoreAll(); }
     assert.equal(process.exitCode, 0);
     const parsed = JSON.parse(chunks.join(''));
-    assert.equal(parsed.kind, 'blocked');
-    assert.equal(parsed.reason, 'target_unavailable');
+    assert.equal(parsed.outcome.kind, 'blocked');
+    assert.equal(parsed.outcome.reason, 'target_unavailable');
   });
 
   // ─── plan 03-03: the projectTitle config value is threaded to planBootstrap ─
@@ -1327,7 +1337,185 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
     } finally { mock.restoreAll(); }
     assert.equal(process.exitCode, 0);
     const parsed = JSON.parse(chunks.join(''));
-    assert.equal(parsed.kind, 'completed');
-    assert.equal(parsed.configWriteNotice, 'config_unreadable');
+    assert.equal(parsed.outcome.kind, 'completed');
+    assert.equal(parsed.outcome.configWriteNotice, 'config_unreadable');
+  });
+
+  // ─── plan 03-06 Task 2: the init report — human/raw dispatch, exit-code-0 matrix, wrong-scope forwarding ──
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  test('init without the raw flag emits the human form (not JSON); with the raw flag it emits parseable JSON', () => {
+    const human = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: false,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: false, reason: 'outage', message: 'transient failure' }) },
+      });
+    } finally { human.restore(); }
+    const humanOutput = human.chunks.join('');
+    assert.throws(() => JSON.parse(humanOutput));
+    assert.match(humanOutput, /github-sync init:/);
+    assert.match(humanOutput, /outcome: blocked/);
+
+    const machine = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: false, reason: 'outage', message: 'transient failure' }) },
+      });
+    } finally { machine.restore(); }
+    const parsed = JSON.parse(machine.chunks.join(''));
+    assert.equal(parsed.outcome.kind, 'blocked');
+  });
+
+  // No second flag alias exists in this family — the raw flag already in use
+  // is the machine-readable path for init too.
+  test('no --json flag literal is parsed or routed anywhere in the router', () => {
+    const fs2 = require('node:fs');
+    const src = fs2.readFileSync(require.resolve('../src/github-sync-command-router.cts'), 'utf8');
+    const matches = (src.match(/(^|[^-])--json\b/gm) || []).filter((line) => !line.trim().startsWith('//'));
+    assert.equal(matches.length, 0);
+  });
+
+  test('a preflight failing with the wrong-scope reason produces output containing the catalogued remediation, supplied through the existing _auth seam — developer variant', () => {
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: {
+          runPreflight: () => ({
+            ok: false, reason: PREFLIGHT_REASON.WRONG_SCOPE,
+            message: 'github-sync preflight: your GitHub token is missing the `project` scope. Run `gh auth refresh -s project`, then re-run `gsd-tools github-sync preflight`.',
+          }),
+        },
+      });
+    } finally { cap.restore(); }
+    const parsed = JSON.parse(cap.chunks.join(''));
+    assert.match(parsed.outcome.remediation, /gh auth refresh -s project/);
+  });
+
+  test('a preflight failing with the wrong-scope reason produces output containing the catalogued remediation, supplied through the existing _auth seam — CI variant', () => {
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: {
+          runPreflight: () => ({
+            ok: false, reason: PREFLIGHT_REASON.WRONG_SCOPE,
+            message: 'github-sync preflight: this token cannot reach GitHub Projects v2. Export a classic personal access token with the `project` scope as `GH_TOKEN` in this CI environment.',
+          }),
+        },
+      });
+    } finally { cap.restore(); }
+    const parsed = JSON.parse(cap.chunks.join(''));
+    assert.match(parsed.outcome.remediation, /GH_TOKEN/);
+  });
+
+  test('every failure path leaves the process exit code at 0: a blocked plan, a failed mutation, an uncertain checkpoint, a transport failure, and a failed config write', () => {
+    const cases = [
+      // blocked plan
+      () => routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true, error: (m) => { throw new Error(m); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: false, reason: 'local_unavailable' }) },
+        _bootstrapConfig: bootstrapConfigStub(TARGET),
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+      }),
+      // failed mutation
+      () => routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true, error: (m) => { throw new Error(m); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _bootstrapConfig: bootstrapConfigStub(TARGET),
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: () => ({ operations: [{ logicalKey: 'project' }], noops: [], blocked: [], uncertain: [], checkpoints: [] }),
+        },
+        _apply: { applyMutationPlan: () => ({ kind: 'failed', logicalKey: 'project', remediation: 'x', outcomes: [] }) },
+      }),
+      // uncertain plan
+      () => routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true, error: (m) => { throw new Error(m); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _bootstrapConfig: bootstrapConfigStub(TARGET),
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: false, reason: 'remote_unavailable', projectOutcome: 'unavailable', statusField: null }) },
+      }),
+      // transport failure (preflight outage)
+      () => routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true, error: (m) => { throw new Error(m); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: false, reason: 'outage', message: 'transient' }) },
+      }),
+      // failed config write (already covered above, repeated for the matrix)
+      () => routeGithubSyncCommandRouter({
+        args: ['github-sync', 'init'], cwd: '/fixture', raw: true, error: (m) => { throw new Error(m); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _bootstrapConfig: bootstrapConfigStub({ owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: null }, {
+          reason: RESOLVE_TARGET_REASON.RESOLVED,
+          writeProjectNumber: () => ({ ok: false, reason: 'config_unreadable' }),
+        }),
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'unset', statusField: null }) },
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap(_input, { pass }) {
+            if (pass === 'structure') return { operations: [{ logicalKey: 'project' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+            return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+          },
+        },
+        _apply: {
+          applyMutationPlan(plan, options) {
+            if (plan.operations.length > 0) {
+              return {
+                kind: 'completed',
+                map: { version: '1', repository: { owner: 'octo', repo: 'repo', number: 1 }, completions: { project: { logicalKey: 'project', nodeId: 'PVT_X', issueNumber: 5, completedAt: 'now', owner: 'octo', repo: 'repo', repositoryNumber: 1 } } },
+                outcomes: [{ logicalKey: 'project', operationKey: 'project', action: 'create', result: 'confirmed' }],
+              };
+            }
+            return { kind: 'completed', map: options.map, outcomes: [] };
+          },
+        },
+      }),
+    ];
+    for (const runCase of cases) {
+      process.exitCode = 0;
+      const cap = captureStdout();
+      try { runCase(); } finally { cap.restore(); }
+      assert.equal(process.exitCode, 0);
+    }
+  });
+
+  test('the pre-existing sync preflight test path is unaffected: sync still collapses a preflight failure to preflight_unavailable', () => {
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: false, reason: PREFLIGHT_REASON.WRONG_SCOPE, message: 'x' }) },
+      });
+    } finally { cap.restore(); }
+    const parsed = JSON.parse(cap.chunks.join(''));
+    assert.equal(parsed.kind, 'blocked');
+    assert.equal(parsed.reason, 'preflight_unavailable');
   });
 });

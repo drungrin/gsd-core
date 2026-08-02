@@ -44,6 +44,8 @@ import bootstrapPlanMod = require('./github-sync-bootstrap-plan.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import bootstrapConfigMod = require('./github-sync-bootstrap-config.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import bootstrapReportMod = require('./github-sync-bootstrap-report.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import operationMod = require('./github-sync-operation.cjs');
 import type { OperationOutcome } from './github-sync-operation.cts';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -130,6 +132,11 @@ interface BootstrapConfigModule {
   RESOLVE_TARGET_REASON: { CONFIGURED: string; RESOLVED: string; UNRESOLVABLE: string };
 }
 
+interface BootstrapReportModule {
+  buildInitReportV1(input: unknown): unknown;
+  renderInitReportV1(report: unknown, raw: boolean): string;
+}
+
 // G-02-2: emitStatus() is a deliberate, local inversion of the family
 // convention. Every other router in src/ passes `undefined` as io.output()'s
 // third argument and lets its own `raw` flag pick JSON-vs-pretty-JSON.
@@ -146,6 +153,20 @@ interface BootstrapConfigModule {
 // reasons only, never a multi-KB machine payload.
 function emitStatus(dto: unknown, raw: boolean, statusModule: StatusModule): void {
   output(dto, true, statusModule.renderStatusV1(dto, raw));
+}
+
+/**
+ * `init`'s own instance of the same G-02-2 output inversion `emitStatus`
+ * establishes: the DTO is built here from whichever passes actually ran,
+ * then rendered through `renderInitReportV1(dto, raw)` — the single place
+ * that decides human versus JSON — and passed to `io.output()`'s
+ * pre-rendered-string path. No second flag alias: the raw flag already in
+ * use across this router family is the machine-readable surface for `init`
+ * too.
+ */
+function emitInitReport(input: unknown, raw: boolean, reportModule: BootstrapReportModule): void {
+  const dto = reportModule.buildInitReportV1(input);
+  output(dto, true, reportModule.renderInitReportV1(dto, raw));
 }
 
 function collectIssueNodeIdHints(strictMap: unknown): number[] {
@@ -180,6 +201,8 @@ interface RouteGithubSyncCommandRouterOptions {
   _bootstrapPlan?: BootstrapPlanModule;
   /** Test seam: inject a mock bootstrap config reader/writer. Defaults to the real module. */
   _bootstrapConfig?: BootstrapConfigModule;
+  /** Test seam: inject a mock bootstrap report builder/renderer. Defaults to the real module. */
+  _bootstrapReport?: BootstrapReportModule;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -201,6 +224,7 @@ function routeGithubSyncCommandRouter({
   _bootstrapRemote,
   _bootstrapPlan,
   _bootstrapConfig,
+  _bootstrapReport,
 }: RouteGithubSyncCommandRouterOptions): void {
   const activeCheck = _isCapabilityActive ?? isCapabilityActive;
 
@@ -240,6 +264,7 @@ function routeGithubSyncCommandRouter({
   const bootstrapRemote: BootstrapRemoteModule = _bootstrapRemote ?? bootstrapRemoteMod;
   const bootstrapPlan: BootstrapPlanModule = _bootstrapPlan ?? bootstrapPlanMod;
   const bootstrapConfig: BootstrapConfigModule = _bootstrapConfig ?? bootstrapConfigMod;
+  const bootstrapReport: BootstrapReportModule = _bootstrapReport ?? bootstrapReportMod;
 
   routeHubCommandFamily({
     family: 'github-sync',
@@ -339,12 +364,18 @@ function routeGithubSyncCommandRouter({
       // a generic reason (line ~251 above) — a missing `project` scope must
       // be nameable in the report, not hidden behind "preflight_unavailable".
       init: () => {
-        let result: unknown;
+        // Every exit point below builds the report DTO from whatever passes
+        // actually ran and renders it through bootstrapReport.renderInitReportV1
+        // using this router's existing raw flag — no second flag alias (D-05).
+        // The one exception is the outer catch: if reporting itself would be
+        // the thing that threw, the ad-hoc uncertain/init_unavailable object
+        // is returned unchanged rather than risking a report-building throw
+        // cascading past the D-11 exit-0 contract.
+        let unresolvedTarget: { owner: string | null; repo: string | null; projectNumber: number | null } = { owner: null, repo: null, projectNumber: null };
         try {
           const preflight = auth.runPreflight(cwd);
           if (!preflight.ok) {
-            result = { kind: 'blocked', reason: preflight.reason, message: preflight.message };
-            output(result, raw);
+            emitInitReport({ target: unresolvedTarget, preflightFailure: { reason: preflight.reason, message: preflight.message } }, raw, bootstrapReport);
             return;
           }
 
@@ -361,11 +392,11 @@ function routeGithubSyncCommandRouter({
           // apply, never this head-of-run copy again.
           const resolvedResult = bootstrapConfig.resolveTarget(cwd);
           if (!resolvedResult.target) {
-            result = { kind: 'blocked', reason: 'target_unavailable' };
-            output(result, raw);
+            emitInitReport({ target: unresolvedTarget, externalBlocked: { reason: 'target_unavailable', remediation: 'The github-sync target (owner/repo/repository number) could not be resolved from .planning/config.json or `gh repo view` — configure github_sync.target, then re-run.' } }, raw, bootstrapReport);
             return;
           }
           const resolvedTarget = resolvedResult.target;
+          unresolvedTarget = { owner: resolvedTarget.owner, repo: resolvedTarget.repo, projectNumber: resolvedTarget.projectNumber };
 
           const strictMap = (resolvedResult.strictMapRead ?? { kind: 'absent' }) as { kind: string; reason?: string; map?: unknown };
           const remoteSnapshot = bootstrapRemote.readBootstrapRemoteState({
@@ -386,23 +417,18 @@ function routeGithubSyncCommandRouter({
             { desired: desiredState, remote: remoteSnapshot, strictMap, target: { ...baseTarget, projectNumber: resolvedTarget.projectNumber }, projectTitle },
             { pass: bootstrapPlan.BOOTSTRAP_PASS.STRUCTURE },
           );
-          if (structurePlan.blocked.length > 0) {
-            result = { kind: 'blocked', reason: structurePlan.blocked[0].reason, detail: structurePlan.blocked[0].detail };
-            output(result, raw);
-            return;
-          }
-          if (structurePlan.uncertain.length > 0) {
-            result = { kind: 'uncertain', reason: structurePlan.uncertain[0].reason };
-            output(result, raw);
+          const reportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: resolvedTarget.projectNumber };
+          if (structurePlan.blocked.length > 0 || structurePlan.uncertain.length > 0) {
+            emitInitReport({ target: reportTarget, structurePlan }, raw, bootstrapReport);
             return;
           }
 
           const structureApply = apply.applyMutationPlan(structurePlan, {
             cwd,
             map: strictMap.kind === 'valid' ? strictMap.map : null,
-          }) as { kind: string; map?: { completions?: Record<string, { issueNumber?: number }> } | null; outcomes?: OperationOutcome[] };
+          }) as { kind: string; map?: { completions?: Record<string, { issueNumber?: number }> } | null; outcomes?: OperationOutcome[]; logicalKey?: string; remediation?: string };
           if (structureApply.kind !== 'completed') {
-            output(structureApply, raw);
+            emitInitReport({ target: reportTarget, structurePlan, structureApply }, raw, bootstrapReport);
             return;
           }
 
@@ -417,6 +443,7 @@ function routeGithubSyncCommandRouter({
           const effectiveProjectNumber = projectMutated
             ? structureApply.map?.completions?.project?.issueNumber ?? resolvedTarget.projectNumber
             : resolvedTarget.projectNumber;
+          const effectiveReportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: effectiveProjectNumber };
 
           // Re-read only when the structure pass MUTATED the field/option
           // surface (never on a mere checkpointed observation, which cannot
@@ -431,14 +458,8 @@ function routeGithubSyncCommandRouter({
             { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber }, projectTitle },
             { pass: bootstrapPlan.BOOTSTRAP_PASS.OPTIONS },
           );
-          if (optionsPlan.blocked.length > 0) {
-            result = { kind: 'blocked', reason: optionsPlan.blocked[0].reason, detail: optionsPlan.blocked[0].detail };
-            output(result, raw);
-            return;
-          }
-          if (optionsPlan.uncertain.length > 0) {
-            result = { kind: 'uncertain', reason: optionsPlan.uncertain[0].reason };
-            output(result, raw);
+          if (optionsPlan.blocked.length > 0 || optionsPlan.uncertain.length > 0) {
+            emitInitReport({ target: effectiveReportTarget, structurePlan, structureApply, optionsPlan }, raw, bootstrapReport);
             return;
           }
 
@@ -446,7 +467,7 @@ function routeGithubSyncCommandRouter({
           // the head-of-run strictMap read above — seeding from the stale
           // copy would make this single atomic write REPLACE every
           // completion the structure pass just persisted.
-          const optionsApply = apply.applyMutationPlan(optionsPlan, { cwd, map: structureApply.map ?? null }) as Record<string, unknown>;
+          const optionsApply = apply.applyMutationPlan(optionsPlan, { cwd, map: structureApply.map ?? null }) as { kind: string; outcomes?: OperationOutcome[]; logicalKey?: string; remediation?: string };
 
           // D-02: the config write fires whenever the run started
           // unconfigured (a partial-config, gh-fallback, or crash-recovery
@@ -454,29 +475,26 @@ function routeGithubSyncCommandRouter({
           // already correct) AND the effective target carries a positive
           // project number — covering the create path AND the
           // crash-recovery path, not only a confirmed create. A non-ok write
-          // result degrades to a notice on the typed result object; per
-          // D-11 it never changes the exit code, and it never re-throws into
-          // the outer catch (which would misreport an otherwise-successful
-          // sync as `init_unavailable`).
+          // result degrades to a notice on the report, never the exit code,
+          // and never re-throws into the outer catch (which would
+          // misreport an otherwise-successful run as `init_unavailable`).
+          let configWriteNotice: string | null = null;
           if (
             resolvedResult.reason !== bootstrapConfig.RESOLVE_TARGET_REASON.CONFIGURED &&
             typeof effectiveProjectNumber === 'number' && Number.isSafeInteger(effectiveProjectNumber) && effectiveProjectNumber > 0
           ) {
             try {
               const writeResult = bootstrapConfig.writeProjectNumber(cwd, baseTarget, effectiveProjectNumber);
-              if (!writeResult.ok) {
-                optionsApply.configWriteNotice = writeResult.reason;
-              }
+              if (!writeResult.ok) configWriteNotice = writeResult.reason;
             } catch {
-              optionsApply.configWriteNotice = 'config_write_threw';
+              configWriteNotice = 'config_write_threw';
             }
           }
 
-          result = optionsApply;
+          emitInitReport({ target: effectiveReportTarget, structurePlan, structureApply, optionsPlan, optionsApply, configWriteNotice }, raw, bootstrapReport);
         } catch {
-          result = { kind: 'uncertain', reason: 'init_unavailable' };
+          output({ kind: 'uncertain', reason: 'init_unavailable' }, raw);
         }
-        output(result, raw);
       },
     },
     unknownMessage: (subcommand: string, available: string[]) =>
