@@ -1028,6 +1028,137 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
     assert.deepEqual(remoteCalls, [7]);
   });
 
+  // ─── plan 03-04 Task 3: the re-read boundary, pinned in all four directions ──
+  // The "converged run issues exactly one remote read" direction is already
+  // covered by the test immediately above (zero operations, zero
+  // checkpoints); these four cover the remaining directions the mutated-key
+  // selector must get right.
+
+  test('the re-read fires when the structure pass MUTATES a field key: the remote seam is called twice, and the options pass plan reflects the second snapshot\'s contents', () => {
+    let callCount = 0;
+    const remoteCalls = [];
+    const optionsPassSawMaybe = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET),
+      _bootstrapRemote: {
+        readBootstrapRemoteState() {
+          callCount += 1;
+          remoteCalls.push(callCount);
+          const options = callCount === 1 ? [] : [{ id: 'id-maybe', name: 'Maybe', color: 'PURPLE', description: '' }];
+          return { available: true, projectOutcome: 'resolved', statusField: null, fields: [{ id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options }] };
+        },
+      },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap(input, { pass }) {
+          if (pass === 'structure') {
+            return { operations: [{ logicalKey: 'field:autonomous' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+          }
+          const autoField = (input.remote.fields || []).find((f) => f.name === 'Autonomous');
+          const hasMaybe = !!autoField && (autoField.options || []).some((o) => o.name === 'Maybe');
+          optionsPassSawMaybe.push(hasMaybe);
+          return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+        },
+      },
+      _apply: {
+        applyMutationPlan(plan) {
+          if (plan.operations.some((o) => o.logicalKey === 'field:autonomous')) {
+            return {
+              kind: 'completed',
+              map: { version: '1', repository: { owner: 'octo', repo: 'repo', number: 1 }, completions: {} },
+              outcomes: [{ logicalKey: 'field:autonomous', operationKey: 'field:autonomous', action: 'create', result: 'confirmed' }],
+            };
+          }
+          return { kind: 'completed', map: { version: '1', repository: { owner: 'octo', repo: 'repo', number: 1 }, completions: {} }, outcomes: [] };
+        },
+      },
+    });
+    assert.deepEqual(remoteCalls, [1, 2]);
+    assert.deepEqual(optionsPassSawMaybe, [true], 'the options pass must have been planned from the SECOND (re-read) snapshot, which carries Maybe');
+  });
+
+  test('the re-read does NOT fire on an adopt-only structure pass — six field checkpoints and a project checkpoint, zero mutations: the remote seam is called exactly once (the selector gate: checkpointedKeys would get this wrong, mutatedKeys gets it right)', () => {
+    const remoteCalls = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET),
+      _bootstrapRemote: { readBootstrapRemoteState: (options) => { remoteCalls.push(options.projectNumber); return { available: true, projectOutcome: 'resolved', statusField: null }; } },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap(_input, { pass }) {
+          if (pass !== 'structure') return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+          const context = { owner: 'octo', repo: 'repo', repositoryNumber: 1 };
+          const fieldKeys = ['field:gsd-id', 'field:phase', 'field:requirements', 'field:wave', 'field:autonomous', 'field:status'];
+          return {
+            operations: [], noops: [], blocked: [], uncertain: [],
+            checkpoints: [
+              { logicalKey: 'project', nodeId: 'PVT_1', completionContext: context },
+              ...fieldKeys.map((key) => ({ logicalKey: key, nodeId: `NODE_${key}`, completionContext: context })),
+            ],
+          };
+        },
+      },
+      _apply: {
+        applyMutationPlan(plan, options) {
+          if (plan.checkpoints.length > 0) {
+            return {
+              kind: 'completed',
+              map: { version: '1', repository: { owner: 'octo', repo: 'repo', number: 1 }, completions: {} },
+              // Every checkpoint folds to an observe/confirmed outcome, matching
+              // the real applier's own behavior (github-sync-apply.cts) — never
+              // action: 'create' or 'update', because nothing was mutated.
+              outcomes: plan.checkpoints.map((c) => ({ logicalKey: c.logicalKey, operationKey: null, action: 'observe', result: 'confirmed' })),
+            };
+          }
+          return { kind: 'completed', map: options.map, outcomes: [] };
+        },
+      },
+    });
+    assert.deepEqual(remoteCalls, [7]);
+  });
+
+  test('a structure pass that mutates only a label key also calls the remote seam exactly once — labels do not change the field/option surface', () => {
+    const remoteCalls = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET),
+      _bootstrapRemote: { readBootstrapRemoteState: (options) => { remoteCalls.push(options.projectNumber); return { available: true, projectOutcome: 'resolved', statusField: null }; } },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap(_input, { pass }) {
+          if (pass !== 'structure') return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+          return { operations: [{ logicalKey: 'label:gsd-phase' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+        },
+      },
+      _apply: {
+        applyMutationPlan(plan, options) {
+          if (plan.operations.some((o) => o.logicalKey === 'label:gsd-phase')) {
+            return {
+              kind: 'completed',
+              map: { version: '1', repository: { owner: 'octo', repo: 'repo', number: 1 }, completions: {} },
+              outcomes: [{ logicalKey: 'label:gsd-phase', operationKey: 'label:gsd-phase', action: 'create', result: 'confirmed' }],
+            };
+          }
+          return { kind: 'completed', map: options.map, outcomes: [] };
+        },
+      },
+    });
+    assert.deepEqual(remoteCalls, [7]);
+  });
+
   // ─── plan 03-03: target_unavailable when resolveTarget cannot resolve ─────
 
   test('an unresolvable target (resolveTarget returns null) produces the target_unavailable blocked reason', () => {

@@ -1,0 +1,36 @@
+{
+  "provenance": "Live capture against board #10 'GSD Sync UAT 02' (PVT_kwHOAMcbHs4BfFaJ), drungrin/gsd-core, 2026-08-02, gh 2.96.0, per plan 03-04 Task 1's option-a decision. mismatchResponse is a real, unmodified createProjectV2Field response: a disposable GSD-named field ('Wave') was created with the WRONG dataType (TEXT instead of the D-20-required NUMBER) so it lands in planFields' diagnosed field-type-mismatch branch, captured verbatim, then deleted via deleteProjectV2Field (manual test-harness teardown only — GSD's own production code never calls that mutation, per D-21). A post-teardown read confirmed board #10 was restored to exactly its 13 built-in fields with zero GSD custom fields (see 03-04-SUMMARY.md for the full read). createResponse and renameResponse are DERIVED, not independently live-captured: createProjectV2Field and updateProjectV2Field both select through the identical ProjectV2FieldCommon fragment shape { id name dataType } (see CREATE_FIELD_TEXT_DOCUMENT/RENAME_FIELD_DOCUMENT in src/github-sync-bootstrap-plan.cts), so the envelope structure live-verified by mismatchResponse already proves both response shapes; only the outer mutation field name, and the id/name/dataType values, are substituted for a correctly-typed create and a rename respectively — no shape is hand-authored from imagination.",
+  "mismatchResponse": {
+    "data": {
+      "createProjectV2Field": {
+        "projectV2Field": {
+          "id": "PVTF_lAHOAMcbHs4BfFaJzhZdBkA",
+          "name": "Wave",
+          "dataType": "TEXT"
+        }
+      }
+    }
+  },
+  "createResponse": {
+    "data": {
+      "createProjectV2Field": {
+        "projectV2Field": {
+          "id": "PVTF_derived_create_gsd_id",
+          "name": "GSD ID",
+          "dataType": "TEXT"
+        }
+      }
+    }
+  },
+  "renameResponse": {
+    "data": {
+      "updateProjectV2Field": {
+        "projectV2Field": {
+          "id": "PVTF_derived_rename_gsd_id",
+          "name": "GSD ID",
+          "dataType": "TEXT"
+        }
+      }
+    }
+  }
+}

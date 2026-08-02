@@ -12,7 +12,7 @@ const {
   PROJECT_OUTCOME,
   STATUS_FIELD_NAME,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
-const { planStatusOptionMerge, planProject } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
+const { planStatusOptionMerge, planProject, planFields, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 
 function envelope(data) {
   return { data };
@@ -254,6 +254,28 @@ function captureDispatchedBootstrapDocuments() {
   for (const operation of createPathPlan.operations) {
     const query = operation.args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
     const name = ['createProject', 'linkProjectToRepository'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
+    if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
+  }
+
+  // plan 03-04 Task 2: createFieldText/createFieldNumber/createFieldSingleSelect
+  // are captured from planFields' create-path plan (an empty field list, so
+  // all five GSD fields — including the SINGLE_SELECT Autonomous — create);
+  // renameField is captured from a rename-path plan (a field matched by
+  // stored id whose remote name differs from its canonical GSD name).
+  const fieldsCreatePathPlan = planFields(
+    { available: true, projectOutcome: 'resolved', statusField: null, fields: [] },
+    { kind: 'absent' },
+    { owner: 'octo', repo: 'example', repositoryNumber: 1 },
+  );
+  const fieldsRenamePathPlan = planFields(
+    { available: true, projectOutcome: 'resolved', statusField: null, fields: [{ id: 'F_old', name: 'Old Name', dataType: 'TEXT', options: null }] },
+    { kind: 'valid', map: { completions: { [BOOTSTRAP_LOGICAL_KEY.field('GSD ID')]: { nodeId: 'F_old' } } } },
+    { owner: 'octo', repo: 'example', repositoryNumber: 1 },
+  );
+  for (const operation of [...fieldsCreatePathPlan.operations, ...fieldsRenamePathPlan.operations]) {
+    const query = operation.args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
+    const name = ['createFieldText', 'createFieldNumber', 'createFieldSingleSelect', 'renameField']
+      .find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
     if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
   }
 
