@@ -26,6 +26,11 @@
  * logical-key selectors over that journal (see each function's doc comment
  * for the aggregation rule each one answers).
  *
+ * Plan 04-03 Task 3: `NodeCapture.plannerFields` is a value the planner
+ * computed that the response does not carry — persisted with the same
+ * write-through durability as everything the response does carry, by riding
+ * the same `recordCompletion` call the response-derived node id uses.
+ *
  * SECURITY — the raw-versus-typed argv flag rule, stated once here because
  * this is the one place every later operation builder will read it from:
  * every GraphQL string variable whose value originates outside GitHub —
@@ -114,12 +119,19 @@ export type ArgvEntry = string | ArgvRef;
  * scalar relative to the decoded response root: the node-id path must
  * resolve to a non-empty string, and the number path — when declared and
  * present — to a positive safe integer.
+ *
+ * `plannerFields` (plan 04-03 Task 3) is deliberately node-capture-only: a
+ * fan-out (`EachCapture`) has no principled way to decide which element a
+ * planner constant belongs to, and inventing one would be a contract nobody
+ * needs yet. When present, every value must be a string — the sync map's
+ * schema is flat scalars, and that constraint belongs in the validator.
  */
 export interface NodeCapture {
   kind: 'node';
   logicalKey: string;
   nodeIdPath: string;
   numberPath?: string;
+  plannerFields?: Record<string, string>;
 }
 
 /**
@@ -197,6 +209,7 @@ export interface DecodedCompletion {
   nodeId: string;
   remoteNumber?: number;
   completedAt: string;
+  plannerFields?: Record<string, string>;
 }
 
 /** A minimal lookup shape for `resolveArgv` — deliberately not `SyncCompletion` itself. */
@@ -234,11 +247,17 @@ export function isArgvRef(value: unknown): value is ArgvRef {
     typeof value.prefix === 'string';
 }
 
+/** Present implies a plain record whose every value is a string — arrays and nested objects are rejected explicitly. */
+function isPlannerFieldsRecord(value: unknown): value is Record<string, string> {
+  return isRecord(value) && Object.values(value).every((entry) => typeof entry === 'string');
+}
+
 function isValidCapture(capture: unknown): capture is ResponseCapture {
   if (!isRecord(capture)) return false;
   const numberPathOk = capture.numberPath === undefined || isNonEmptyString(capture.numberPath);
   if (capture.kind === 'node') {
-    return isNonEmptyString(capture.logicalKey) && isNonEmptyString(capture.nodeIdPath) && numberPathOk;
+    const plannerFieldsOk = capture.plannerFields === undefined || isPlannerFieldsRecord(capture.plannerFields);
+    return isNonEmptyString(capture.logicalKey) && isNonEmptyString(capture.nodeIdPath) && numberPathOk && plannerFieldsOk;
   }
   if (capture.kind === 'each') {
     return isNonEmptyString(capture.listPath) && isNonEmptyString(capture.matchPath) &&
@@ -391,6 +410,7 @@ export function decodeCompletions(operation: MutationOperation, root: Record<str
         nodeId,
         completedAt,
         ...(number.value === undefined ? {} : { remoteNumber: number.value }),
+        ...(capture.plannerFields === undefined ? {} : { plannerFields: capture.plannerFields }),
       });
       continue;
     }

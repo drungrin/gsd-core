@@ -173,6 +173,88 @@ for (const fault of ['writeFileSync', 'fsyncSync', 'closeSync', 'renameSync']) {
   });
 }
 
+// ─── plan 04-03 Task 3: contentHash / fieldState widened schema ───────────
+
+test('a completion carrying contentHash and fieldState validates and round-trips through an atomic write and a strict read', (t) => {
+  const repoDir = createTempDir('github-sync-map-contenthash-');
+  t.after(() => cleanup(repoDir));
+  const completion = makeCompletion({ contentHash: 'abc123', fieldState: '{"status":"Todo"}' });
+  writeSyncMapAtomically(repoDir, recordCompletion(null, completion));
+
+  const result = readSyncMapStrict(repoDir, REPOSITORY);
+
+  assert.equal(result.kind, 'valid');
+  assert.equal(result.map.completions['phase:02'].contentHash, 'abc123');
+  assert.equal(result.map.completions['phase:02'].fieldState, '{"status":"Todo"}');
+});
+
+test('a completion carrying an unknown key is still rejected as invalid schema — the allow-list is widened, not removed', (t) => {
+  const repoDir = createTempDir('github-sync-map-unknown-key-');
+  t.after(() => cleanup(repoDir));
+  writeMap(repoDir, {
+    version: '1',
+    repository: REPOSITORY,
+    completions: { 'phase:02': makeCompletion({ bogusKey: 'nope' }) },
+  });
+
+  const result = readSyncMapStrict(repoDir, REPOSITORY);
+
+  assert.deepEqual(result, { kind: 'blocking', reason: 'invalid_schema' });
+});
+
+test('a map file written before this change, carrying neither contentHash nor fieldState, still reads as valid with the version constant unchanged', (t) => {
+  const repoDir = createTempDir('github-sync-map-pre-change-');
+  t.after(() => cleanup(repoDir));
+  writeMap(repoDir, makeMap({ 'phase:02': makeCompletion() }));
+
+  const result = readSyncMapStrict(repoDir, REPOSITORY);
+
+  assert.equal(result.kind, 'valid');
+  assert.equal(result.map.version, '1');
+});
+
+test('a completion whose contentHash is present but not a string is rejected', (t) => {
+  const repoDir = createTempDir('github-sync-map-bad-contenthash-');
+  t.after(() => cleanup(repoDir));
+  writeMap(repoDir, {
+    version: '1',
+    repository: REPOSITORY,
+    completions: { 'phase:02': makeCompletion({ contentHash: 42 }) },
+  });
+
+  const result = readSyncMapStrict(repoDir, REPOSITORY);
+
+  assert.deepEqual(result, { kind: 'blocking', reason: 'invalid_schema' });
+});
+
+test('a completion whose fieldState is present but not a string is rejected', (t) => {
+  const repoDir = createTempDir('github-sync-map-bad-fieldstate-');
+  t.after(() => cleanup(repoDir));
+  writeMap(repoDir, {
+    version: '1',
+    repository: REPOSITORY,
+    completions: { 'phase:02': makeCompletion({ fieldState: {} }) },
+  });
+
+  const result = readSyncMapStrict(repoDir, REPOSITORY);
+
+  assert.deepEqual(result, { kind: 'blocking', reason: 'invalid_schema' });
+});
+
+test('a completion whose contentHash is present but an empty string is rejected — present implies non-empty', (t) => {
+  const repoDir = createTempDir('github-sync-map-empty-contenthash-');
+  t.after(() => cleanup(repoDir));
+  writeMap(repoDir, {
+    version: '1',
+    repository: REPOSITORY,
+    completions: { 'phase:02': makeCompletion({ contentHash: '' }) },
+  });
+
+  const result = readSyncMapStrict(repoDir, REPOSITORY);
+
+  assert.deepEqual(result, { kind: 'blocking', reason: 'invalid_schema' });
+});
+
 test('writeSyncMapAtomically reports directory fsync uncertainty after installing a complete map', (t) => {
   const repoDir = createTempDir('github-sync-map-dir-fsync-');
   t.after(() => cleanup(repoDir));

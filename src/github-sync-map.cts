@@ -12,6 +12,14 @@
  * issue-specific, and bootstrap reuses it for a project number, a field's
  * declared type ordinal, or a milestone number, whichever the completion
  * represents. No schema field, validator, or `SYNC_MAP_VERSION` changes.
+ *
+ * Plan 04-03 Task 3 (D-09): `contentHash` and `fieldState` are added as
+ * optional flat-string members, widening the allow-list without loosening
+ * it — an unknown key is still rejected. `SYNC_MAP_VERSION` deliberately
+ * does not bump: both keys are optional, every map already on disk remains
+ * valid under the widened allow-list, and no map has shipped to a developer
+ * yet (D-09 records no installed map exists to protect), so a version bump
+ * would only force a needless re-`init` for zero migration benefit.
  */
 
 import fs from 'node:fs';
@@ -35,6 +43,10 @@ export interface SyncCompletion {
   owner: string;
   repo: string;
   repositoryNumber: number;
+  /** D-08/D-13: the issue-content projection's hash (title, region, milestone number together). */
+  contentHash?: string;
+  /** D-09/D-12: the serialized per-field convergence state (`renderFieldState`). */
+  fieldState?: string;
 }
 
 export interface SyncMap {
@@ -69,6 +81,7 @@ function isRepositoryIdentity(value: unknown): value is RepositoryIdentity {
 function isCompletion(value: unknown): value is SyncCompletion {
   if (!isRecord(value) || !hasOnlyKeys(value, [
     'logicalKey', 'nodeId', 'issueNumber', 'completedAt', 'owner', 'repo', 'repositoryNumber',
+    'contentHash', 'fieldState',
   ])) return false;
   if (!isNonEmptyString(value.logicalKey) || !isNonEmptyString(value.nodeId) ||
     !isNonEmptyString(value.completedAt) || !isNonEmptyString(value.owner) || !isNonEmptyString(value.repo)) return false;
@@ -76,6 +89,8 @@ function isCompletion(value: unknown): value is SyncCompletion {
   const issueNumber = value.issueNumber;
   const repositoryNumber = value.repositoryNumber;
   if (issueNumber !== undefined && (typeof issueNumber !== 'number' || !Number.isSafeInteger(issueNumber) || issueNumber <= 0)) return false;
+  if (value.contentHash !== undefined && !isNonEmptyString(value.contentHash)) return false;
+  if (value.fieldState !== undefined && !isNonEmptyString(value.fieldState)) return false;
   return typeof repositoryNumber === 'number' && Number.isSafeInteger(repositoryNumber) && repositoryNumber > 0;
 }
 
@@ -148,6 +163,44 @@ export function recordCompletion(current: SyncMap | null, completion: SyncComple
   };
 }
 
+/**
+ * DEFECT.WINDOWS-FS-OPS: on Windows a concurrent reader or antivirus scanner
+ * can transiently hold the rename target open, throwing EPERM/EBUSY/EACCES.
+ * Bounded exponential-ish retry on those three errnos only (mirrors
+ * `src/github-sync-bootstrap-config.cts`'s `renameWithRetry`); any other
+ * error, or the final attempt, rethrows immediately. Pre-existing lint
+ * findings (`@typescript-eslint/only-throw-error`, `local/require-fs-op-
+ * fallback`) fixed alongside this plan's own edits to this file, matching
+ * plan 04-02's established precedent of satisfying a whole-file
+ * `eslint ... 0 warnings` acceptance criterion.
+ */
+const RENAME_RETRY_ERRNOS = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const RENAME_MAX_ATTEMPTS = 5;
+const RENAME_BACKOFF_MS = 25;
+
+function renameWithRetry(tmpPath: string, targetPath: string): void {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < RENAME_MAX_ATTEMPTS; attempt++) {
+    try {
+      fs.renameSync(tmpPath, targetPath);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code && RENAME_RETRY_ERRNOS.has(code) && attempt < RENAME_MAX_ATTEMPTS - 1) {
+        const delay = RENAME_BACKOFF_MS * Math.pow(2, attempt);
+        const start = Date.now();
+        while (Date.now() - start < delay) {
+          // Busy-wait a very short time — Windows transient locks usually clear in <100ms.
+        }
+        continue;
+      }
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
 function fsyncContainingDir(filePath: string): void {
   let dirFd: number | null = null;
   try {
@@ -187,11 +240,11 @@ export function writeSyncMapAtomically(repoDir: string, map: SyncMap): void {
     try { fs.closeSync(fd); } catch (err) { closeError = err instanceof Error ? err : new Error(String(err)); }
     if (writeError !== null || closeError !== null) {
       try { fs.unlinkSync(tmpPath); } catch { /* best effort temp cleanup */ }
-      throw writeError ?? closeError;
+      throw writeError ?? closeError ?? new Error('Unknown failure writing the sync map temp file.');
     }
   }
   try {
-    fs.renameSync(tmpPath, filePath);
+    renameWithRetry(tmpPath, filePath);
   } catch (err) {
     try { fs.unlinkSync(tmpPath); } catch { /* best effort temp cleanup */ }
     throw err;

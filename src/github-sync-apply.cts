@@ -263,7 +263,12 @@ function applyMutationPlan(plan: MutationPlan, adapters: ApplyAdapters): ApplyRe
         const pendingOutcomes: OperationOutcome[] = [];
         try {
           for (const item of decoded) {
+            // Plan 04-03 Task 3: planner-supplied fields are spread first, so
+            // the applier's own authoritative fields (written after) can
+            // never be shadowed by a planner constant — asserted directly by
+            // test rather than relied upon from spread order alone.
             pendingMap = recordCompletion(pendingMap, {
+              ...(item.plannerFields ?? {}),
               logicalKey: item.logicalKey,
               nodeId: item.nodeId,
               ...(item.remoteNumber === undefined ? {} : { issueNumber: item.remoteNumber }),

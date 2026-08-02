@@ -272,6 +272,100 @@ describe('decodeCompletions', () => {
   });
 });
 
+// ─── plan 04-03 Task 3: plannerFields on a node capture ────────────────────
+
+describe('decodeCompletions: plannerFields (node captures only)', () => {
+  test('a node capture carrying plannerFields decodes to a completion carrying those fields verbatim, alongside the response-derived node id and number', () => {
+    const operation = baseOperation({
+      captures: [{
+        kind: 'node',
+        logicalKey: 'issue:phase:04',
+        nodeIdPath: 'createIssue.issue.node_id',
+        numberPath: 'createIssue.issue.number',
+        plannerFields: { contentHash: 'hash-abc', fieldState: '{"status":"Todo"}' },
+      }],
+    });
+    const root = { createIssue: { issue: { node_id: 'ISSUE_NODE_1', number: 5 } } };
+    const result = decodeCompletions(operation, root, '2026-08-02T00:00:00Z');
+    assert.deepStrictEqual(result, [{
+      logicalKey: 'issue:phase:04',
+      nodeId: 'ISSUE_NODE_1',
+      remoteNumber: 5,
+      completedAt: '2026-08-02T00:00:00Z',
+      plannerFields: { contentHash: 'hash-abc', fieldState: '{"status":"Todo"}' },
+    }]);
+  });
+
+  test('a node capture with no plannerFields decodes byte-identically to today (back-compat pin)', () => {
+    const operation = baseOperation({
+      captures: [{
+        kind: 'node',
+        logicalKey: 'field:gsd-id',
+        nodeIdPath: 'createProjectV2Field.projectV2Field.id',
+        numberPath: 'createProjectV2Field.projectV2Field.number',
+      }],
+    });
+    const root = { createProjectV2Field: { projectV2Field: { id: 'PVTF_field_1', number: 3 } } };
+    const result = decodeCompletions(operation, root, '2026-08-01T00:00:00Z');
+    assert.deepStrictEqual(result, [{ logicalKey: 'field:gsd-id', nodeId: 'PVTF_field_1', remoteNumber: 3, completedAt: '2026-08-01T00:00:00Z' }]);
+  });
+
+  test('an each-capture is unaffected — plannerFields is a node-capture concept only and is never copied from an each capture', () => {
+    const operation = baseOperation({
+      captures: [{
+        kind: 'each',
+        listPath: 'updateProjectV2Field.projectV2Field.options',
+        matchPath: 'name',
+        nodeIdPath: 'id',
+        keyMap: { Todo: 'option:status:todo' },
+        plannerFields: { contentHash: 'should-be-ignored' },
+      }],
+    });
+    const root = { updateProjectV2Field: { projectV2Field: { options: [{ name: 'Todo', id: 'opt-1' }] } } };
+    const result = decodeCompletions(operation, root, '2026-08-01T00:00:00Z');
+    assert.equal(result.length, 1);
+    assert.equal(Object.prototype.hasOwnProperty.call(result[0], 'plannerFields'), false);
+  });
+
+  test('a missing node id still fails closed to null even when plannerFields are present on the capture', () => {
+    const operation = baseOperation({
+      captures: [{ kind: 'node', logicalKey: 'x', nodeIdPath: 'a.b', plannerFields: { contentHash: 'abc' } }],
+    });
+    const root = { a: {} };
+    assert.strictEqual(decodeCompletions(operation, root, '2026-08-01T00:00:00Z'), null);
+  });
+});
+
+describe('isOperation: node capture plannerFields validation', () => {
+  test('accepts a node capture with plannerFields absent', () => {
+    assert.equal(isOperation(baseOperation({ captures: [{ kind: 'node', logicalKey: 'x', nodeIdPath: 'a.b' }] })), true);
+  });
+
+  test('accepts a node capture whose plannerFields is an object of string values', () => {
+    assert.equal(isOperation(baseOperation({
+      captures: [{ kind: 'node', logicalKey: 'x', nodeIdPath: 'a.b', plannerFields: { contentHash: 'abc', fieldState: 'x' } }],
+    })), true);
+  });
+
+  test('rejects a node capture whose plannerFields carries a non-string value', () => {
+    assert.equal(isOperation(baseOperation({
+      captures: [{ kind: 'node', logicalKey: 'x', nodeIdPath: 'a.b', plannerFields: { contentHash: 42 } }],
+    })), false);
+  });
+
+  test('rejects a node capture whose plannerFields carries a nested object', () => {
+    assert.equal(isOperation(baseOperation({
+      captures: [{ kind: 'node', logicalKey: 'x', nodeIdPath: 'a.b', plannerFields: { nested: { a: 1 } } }],
+    })), false);
+  });
+
+  test('rejects a node capture whose plannerFields is an array', () => {
+    assert.equal(isOperation(baseOperation({
+      captures: [{ kind: 'node', logicalKey: 'x', nodeIdPath: 'a.b', plannerFields: ['a'] }],
+    })), false);
+  });
+});
+
 describe('isOperation', () => {
   test('accepts a well-formed operation', () => {
     assert.equal(isOperation(baseOperation()), true);

@@ -320,6 +320,70 @@ test('a plan carrying no checkpoint list behaves exactly as it does today', () =
   assert.equal(result.kind, 'completed');
 });
 
+// ─── plan 04-03 Task 3: plannerFields ride the same write-through checkpoint ──
+
+function operationWithPlannerFields(key, plannerFields, overrides = {}) {
+  return operation(key, {
+    captures: [{
+      kind: 'node',
+      logicalKey: key,
+      nodeIdPath: 'addProjectV2Item.projectV2Item.id',
+      numberPath: 'addProjectV2Item.projectV2Item.content.number',
+      plannerFields,
+    }],
+    ...overrides,
+  });
+}
+
+test('dispatching an operation whose capture carries plannerFields writes those fields into the persisted sync map in the same atomic write as the node id', () => {
+  const setup = makeAdapters([success({ nodeId: 'issue-node-1', issueNumber: 42 })]);
+  const op = operationWithPlannerFields('issue:phase:04', { contentHash: 'hash-abc', fieldState: '{"status":"Todo"}' });
+  const result = applyMutationPlan({ operations: [op] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  const recordCall = setup.calls.find((call) => call[0] === 'record');
+  assert.equal(recordCall[1].contentHash, 'hash-abc');
+  assert.equal(recordCall[1].fieldState, '{"status":"Todo"}');
+  assert.equal(recordCall[1].nodeId, 'issue-node-1');
+  assert.equal(setup.calls.filter((call) => call[0] === 'write').length, 1);
+  // Proves the same atomic write, not a second pass: read the persisted map back.
+  const stored = JSON.parse(setup.getStored());
+  assert.equal(stored.completions['issue:phase:04'].contentHash, 'hash-abc');
+  assert.equal(stored.completions['issue:phase:04'].nodeId, 'issue-node-1');
+});
+
+test('dispatching an operation with no plannerFields writes a completion byte-identical to today\'s shape', () => {
+  const setup = makeAdapters([success({ nodeId: 'plain-node', issueNumber: 7 })]);
+  const result = applyMutationPlan({ operations: [operation('one')] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  const recordCall = setup.calls.find((call) => call[0] === 'record');
+  assert.deepEqual(Object.keys(recordCall[1]).sort(), ['completedAt', 'issueNumber', 'logicalKey', 'nodeId', 'owner', 'repo', 'repositoryNumber']);
+});
+
+test('planner fields colliding with an applier-owned schema key never overwrite it — the applier\'s own values win', () => {
+  const setup = makeAdapters([success({ nodeId: 'real-node-id', issueNumber: 42 })]);
+  // A completedAt value the fake clock (started at epoch 0) could never itself
+  // produce, so a passing "notEqual" assertion below cannot be a coincidence.
+  const attackerCompletedAt = '2099-01-01T00:00:00.000Z';
+  const op = operationWithPlannerFields('collide', {
+    logicalKey: 'HIJACKED',
+    nodeId: 'HIJACKED_NODE',
+    completedAt: attackerCompletedAt,
+    owner: 'attacker',
+    repo: 'attacker-repo',
+    repositoryNumber: '999',
+  });
+  const result = applyMutationPlan({ operations: [op] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  const recordCall = setup.calls.find((call) => call[0] === 'record');
+  assert.equal(recordCall[1].logicalKey, 'collide');
+  assert.equal(recordCall[1].nodeId, 'real-node-id');
+  assert.equal(recordCall[1].owner, 'octo');
+  assert.equal(recordCall[1].repo, 'repo');
+  assert.equal(recordCall[1].repositoryNumber, 1);
+  assert.equal(recordCall[1].completedAt, setup.clock.nowIso());
+  assert.notEqual(recordCall[1].completedAt, attackerCompletedAt);
+});
+
 // ─── outcome journal ────────────────────────────────────────────────────────
 
 test('a completed result lists every checkpointed logical key in fold-then-dispatch order with producing operation key and result', () => {
