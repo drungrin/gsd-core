@@ -1231,7 +1231,11 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
       _desired: { readDesiredState: () => ({ available: true }) },
       _bootstrapConfig: bootstrapConfigStub({ owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: null }, {
         reason: RESOLVE_TARGET_REASON.RESOLVED,
-        writeProjectNumber: (_cwd, _target, projectNumber) => { writeCalls.push(projectNumber); return { ok: true, reason: 'written' }; },
+        // IN-02: capture the full `target` argument, not just projectNumber,
+        // so this test also pins the router's own baseTarget construction
+        // (owner/repo/repositoryNumber from the resolved identity, no stray
+        // projectNumber key) — not only the bootstrap-config unit behavior.
+        writeProjectNumber: (_cwd, target, projectNumber) => { writeCalls.push({ target, projectNumber }); return { ok: true, reason: 'written' }; },
       }),
       _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'unset', statusField: null }) },
       _bootstrapPlan: {
@@ -1254,7 +1258,9 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
         },
       },
     });
-    assert.deepEqual(writeCalls, [88]);
+    assert.deepEqual(writeCalls, [
+      { target: { owner: 'octo', repo: 'repo', repositoryNumber: 1 }, projectNumber: 88 },
+    ]);
   });
 
   test('an already-configured (CONFIGURED) run records zero config writes', () => {
