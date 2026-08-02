@@ -352,6 +352,14 @@ function fsyncContainingDir(filePath: string): void {
  * and `init` just resolved the number that completes them). Any other key
  * set refuses with the unrecognized-shape reason and writes nothing.
  *
+ * All four written values (`owner`, `repo`, `repository_number`,
+ * `project_number`) come from the caller's resolved `target` argument, in
+ * both the create-fresh and the existing-target branch (CR-02 fix,
+ * D-01/D-02) — the present-block gate (`classifyTargetKeys`) decides
+ * whether to refuse the existing block, it is never a source of the values
+ * written. Do not re-source `owner`/`repo`/`repository_number` from the
+ * on-disk `existingTarget` here.
+ *
  * Atomic: a temp file in the same directory is renamed over the original,
  * and the containing directory is fsynced — the same durability shape
  * `github-sync-map.cts`'s `writeSyncMapAtomically` uses (duplicated rather
@@ -378,24 +386,17 @@ function writeProjectNumber(cwd: string, target: { owner: string; repo: string; 
   const githubSync = isRecord(parsed.github_sync) ? parsed.github_sync : null;
   const existingTarget = githubSync !== null && isRecord(githubSync.target) ? githubSync.target : null;
 
-  let newTarget: Record<string, unknown>;
-  if (existingTarget === null) {
-    newTarget = {
-      owner: target.owner,
-      repo: target.repo,
-      repository_number: target.repositoryNumber,
-      project_number: projectNumber,
-    };
-  } else {
+  if (existingTarget !== null) {
     const kind = classifyTargetKeys(existingTarget);
     if (kind === 'unrecognized') return { ok: false, reason: CONFIG_WRITE_REASON.UNRECOGNIZED_SHAPE };
-    newTarget = {
-      owner: existingTarget.owner,
-      repo: existingTarget.repo,
-      repository_number: existingTarget.repository_number,
-      project_number: projectNumber,
-    };
   }
+
+  const newTarget: Record<string, unknown> = {
+    owner: target.owner,
+    repo: target.repo,
+    repository_number: target.repositoryNumber,
+    project_number: projectNumber,
+  };
 
   const newGithubSync = { ...(githubSync ?? {}), target: newTarget };
   const newParsed = { ...parsed, github_sync: newGithubSync };
