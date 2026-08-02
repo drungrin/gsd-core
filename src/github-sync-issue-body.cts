@@ -84,3 +84,79 @@ export function renderPhaseRegion(phase: RenderablePhase): string {
 export function renderNewIssueBody(phase: RenderablePhase): string {
   return `${phaseMarker(phase.id)}\n${FENCE_BEGIN}\n${renderPhaseRegion(phase)}\n${FENCE_END}\n`;
 }
+
+/**
+ * D-03's three-way severity catalog for splicing a fresh region into an
+ * existing body. Mirrors the frozen-catalog style of
+ * `github-sync-reconcile.cts`'s `OPERATION_REASON`.
+ *
+ * - `SPLICED` — exactly one fence pair, in correct order: interior replaced,
+ *   everything outside the fences unchanged and in its original position.
+ * - `SELF_HEAL` — no fence pair at all: the original body is preserved
+ *   verbatim and a fresh fenced region is appended.
+ * - `DAMAGED` — anything else (unbalanced, duplicated, or inverted fences):
+ *   no replacement body is produced at all. GSD refuses to guess when a
+ *   rewrite could destroy hand-written text (D-03's report-don't-destroy
+ *   posture, mirroring `03-CONTEXT.md` D-21).
+ */
+export const SPLICE_RESULT = Object.freeze({
+  SPLICED: 'spliced',
+  SELF_HEAL: 'self-heal',
+  DAMAGED: 'damaged',
+} as const);
+export type SpliceResultKind = typeof SPLICE_RESULT[keyof typeof SPLICE_RESULT];
+
+/**
+ * The two repairing members carry the new body string; the damaged member
+ * carries a detail string and, deliberately, no `body` field at all — so no
+ * caller can accidentally read a partial replacement out of a damaged
+ * result.
+ */
+export type SpliceOutcome =
+  | { kind: typeof SPLICE_RESULT.SPLICED; body: string }
+  | { kind: typeof SPLICE_RESULT.SELF_HEAL; body: string }
+  | { kind: typeof SPLICE_RESULT.DAMAGED; detail: string };
+
+/** Counts non-overlapping occurrences of a literal token via split-length minus one. */
+function countFenceOccurrences(body: string, token: string): number {
+  return body.split(token).length - 1;
+}
+
+/**
+ * Splices `region` into `currentBody` by severity (D-03/D-04). Literal
+ * string scanning only — no markdown parser: the fence tokens are GSD's own
+ * fixed literals, not general markdown structure (04-RESEARCH.md "Don't
+ * Hand-Roll"). Never throws, for any input including the empty string. Does
+ * not normalize, trim, or reflow any part of the body outside the region,
+ * and never moves the region's position within the body.
+ */
+export function spliceRegion(currentBody: string, region: string): SpliceOutcome {
+  const beginCount = countFenceOccurrences(currentBody, FENCE_BEGIN);
+  const endCount = countFenceOccurrences(currentBody, FENCE_END);
+
+  if (beginCount === 0 && endCount === 0) {
+    return {
+      kind: SPLICE_RESULT.SELF_HEAL,
+      body: `${currentBody}\n${FENCE_BEGIN}\n${region}\n${FENCE_END}\n`,
+    };
+  }
+
+  if (beginCount === 1 && endCount === 1) {
+    const beginIndex = currentBody.indexOf(FENCE_BEGIN);
+    const endIndex = currentBody.indexOf(FENCE_END);
+    if (endIndex < beginIndex) {
+      return {
+        kind: SPLICE_RESULT.DAMAGED,
+        detail: 'the end fence appears before the begin fence — the pair is inverted, not merely miscounted',
+      };
+    }
+    const before = currentBody.slice(0, beginIndex + FENCE_BEGIN.length);
+    const after = currentBody.slice(endIndex);
+    return { kind: SPLICE_RESULT.SPLICED, body: `${before}\n${region}\n${after}` };
+  }
+
+  return {
+    kind: SPLICE_RESULT.DAMAGED,
+    detail: `expected exactly one begin fence and one end fence; found ${beginCount} begin fence(s) and ${endCount} end fence(s)`,
+  };
+}

@@ -9,6 +9,8 @@ const {
   FENCE_END,
   renderPhaseRegion,
   renderNewIssueBody,
+  spliceRegion,
+  SPLICE_RESULT,
 } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
 const PHASE = { id: '04', title: 'Phase → Issue Sync', goal: 'Sync roadmap phases as GitHub issues.' };
@@ -69,4 +71,110 @@ test('FENCE_BEGIN and FENCE_END are frozen, distinct literal tokens, neither a s
   assert.equal(marker.includes(FENCE_END), false);
   assert.equal(FENCE_BEGIN.includes('gsd:phase'), false);
   assert.equal(FENCE_END.includes('gsd:phase'), false);
+});
+
+/* --- spliceRegion (plan 04-03 Task 1): splice a region by severity --- */
+
+test('spliceRegion: a body with exactly one fence pair replaces only the interior; text before begin and after end survives byte-for-byte', () => {
+  const before = 'Some developer prose before the fence.';
+  const after = 'Some developer prose after the fence.';
+  const oldRegion = 'old region content';
+  const newRegion = 'new region content';
+  const body = `${before}\n${FENCE_BEGIN}\n${oldRegion}\n${FENCE_END}\n${after}`;
+  const result = spliceRegion(body, newRegion);
+  assert.equal(result.kind, SPLICE_RESULT.SPLICED);
+  assert.ok(result.body.startsWith(`${before}\n${FENCE_BEGIN}`));
+  assert.ok(result.body.endsWith(`${FENCE_END}\n${after}`));
+  assert.ok(result.body.includes(newRegion));
+  assert.ok(!result.body.includes(oldRegion));
+});
+
+test('spliceRegion: fence pair in the middle of the body — prose above and below both survive and keep their order', () => {
+  const above = '# Above heading\n\nSome prose above.';
+  const below = 'Some prose below.\n\n## Below heading';
+  const body = `${above}\n${FENCE_BEGIN}\nold\n${FENCE_END}\n${below}`;
+  const result = spliceRegion(body, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.SPLICED);
+  const aboveIndex = result.body.indexOf(above);
+  const belowIndex = result.body.indexOf(below);
+  assert.ok(aboveIndex >= 0 && belowIndex >= 0, 'both blocks must survive verbatim');
+  assert.ok(aboveIndex < belowIndex, 'the region must not be normalized to the top — above stays above below');
+});
+
+test('spliceRegion: surrounding markdown headings, code fences, and a non-GSD HTML comment are undisturbed', () => {
+  const above = '# Title\n\n```js\nconst x = 1;\n```\n\n<!-- not-a-gsd-token -->';
+  const below = '<!-- another comment -->\n\n```bash\necho hi\n```';
+  const body = `${above}\n${FENCE_BEGIN}\nold\n${FENCE_END}\n${below}`;
+  const result = spliceRegion(body, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.SPLICED);
+  assert.ok(result.body.includes(above));
+  assert.ok(result.body.includes(below));
+});
+
+test('spliceRegion: a body with the identity marker and no fence token at all self-heals — original text preserved byte-for-byte, new region appended', () => {
+  const body = `${phaseMarker('04')}\nSome developer prose, no fences here.`;
+  const result = spliceRegion(body, 'fresh region');
+  assert.equal(result.kind, SPLICE_RESULT.SELF_HEAL);
+  assert.ok(result.body.startsWith(body));
+  assert.ok(result.body.endsWith(`${FENCE_BEGIN}\nfresh region\n${FENCE_END}\n`));
+});
+
+test('spliceRegion: two begin fences and one end fence is damaged, with a detail naming the observed counts', () => {
+  const body = `${FENCE_BEGIN}\nx\n${FENCE_BEGIN}\ny\n${FENCE_END}`;
+  const result = spliceRegion(body, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.DAMAGED);
+  assert.match(result.detail, /2/);
+  assert.match(result.detail, /1/);
+});
+
+test('spliceRegion: one begin fence and two end fences is damaged', () => {
+  const body = `${FENCE_BEGIN}\nx\n${FENCE_END}\ny\n${FENCE_END}`;
+  const result = spliceRegion(body, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.DAMAGED);
+});
+
+test('spliceRegion: a begin fence with no end fence is damaged', () => {
+  const body = `${FENCE_BEGIN}\nx`;
+  const result = spliceRegion(body, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.DAMAGED);
+});
+
+test('spliceRegion: an end fence with no begin fence is damaged', () => {
+  const body = `x\n${FENCE_END}`;
+  const result = spliceRegion(body, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.DAMAGED);
+});
+
+test('spliceRegion: end fence preceding begin fence is damaged, with a detail naming the inversion rather than the counts', () => {
+  const body = `x\n${FENCE_END}\ny\n${FENCE_BEGIN}\nz`;
+  const result = spliceRegion(body, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.DAMAGED);
+  assert.doesNotMatch(result.detail, /\b1 begin\b|\b1 end\b/);
+  assert.match(result.detail, /precede|before|invert/i);
+});
+
+test('spliceRegion: a damaged result has no body property at all (presence check, not merely a falsy check)', () => {
+  const result = spliceRegion(`${FENCE_BEGIN}\nx`, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.DAMAGED);
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'body'), false);
+});
+
+test('spliceRegion: an empty-string body returns self-heal, not damaged, and the result is a bare fenced region', () => {
+  const result = spliceRegion('', 'region content');
+  assert.equal(result.kind, SPLICE_RESULT.SELF_HEAL);
+  assert.equal(result.body, `\n${FENCE_BEGIN}\nregion content\n${FENCE_END}\n`);
+});
+
+test('spliceRegion: a region resembling a fence token by one character does not affect counting', () => {
+  const almostBegin = FENCE_BEGIN.replace('begin', 'beginx');
+  const body = `prose\n${FENCE_BEGIN}\nold\n${FENCE_END}\nmore prose containing ${almostBegin}`;
+  const result = spliceRegion(body, 'new');
+  assert.equal(result.kind, SPLICE_RESULT.SPLICED);
+});
+
+test('spliceRegion: never throws for any adversarial fence arrangement, including empty and fence-only bodies', () => {
+  const inputs = ['', 'plain text', FENCE_BEGIN, FENCE_END, `${FENCE_BEGIN}${FENCE_END}`, `${FENCE_END}${FENCE_BEGIN}`];
+  for (const input of inputs) {
+    assert.doesNotThrow(() => spliceRegion(input, 'region'));
+  }
 });
