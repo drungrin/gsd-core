@@ -184,7 +184,7 @@ export interface RenderablePlan {
  * anti-forgery pair: a slot-count disagreement is reported, never guessed
  * past (T-5-06).
  */
-export const DEPENDENCY_REF_SENTINEL = ' gsd:dep-ref ';
+export const DEPENDENCY_REF_SENTINEL = '\u0000gsd:dep-ref\u0000';
 
 /**
  * Counts non-overlapping occurrences of `DEPENDENCY_REF_SENTINEL` in `region`
