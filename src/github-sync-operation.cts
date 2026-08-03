@@ -111,8 +111,21 @@ export interface ArgvRef {
   prefix: string;
 }
 
-/** A plain literal or a late-bound reference. */
-export type ArgvEntry = string | ArgvRef;
+/**
+ * A late-bound value composed from ordered literal segments and references,
+ * joined into one argv string. `ArgvRef` fills a whole argv value; this
+ * exists for the one case that contract cannot express — a reference that
+ * must be late-bound *inside* a larger string (plan 05-06: a dependency's
+ * real issue number embedded inside an issue body). Parts are always
+ * planner-supplied, never derived from developer text, so nothing here ever
+ * scans a string for a token — forgery is impossible by construction.
+ */
+export interface ArgvConcat {
+  parts: (string | ArgvRef)[];
+}
+
+/** A plain literal, a late-bound reference, or a concatenation of both. */
+export type ArgvEntry = string | ArgvRef | ArgvConcat;
 
 /**
  * A single-value capture. Both `nodeIdPath` and `numberPath` address a
@@ -247,6 +260,18 @@ export function isArgvRef(value: unknown): value is ArgvRef {
     typeof value.prefix === 'string';
 }
 
+/**
+ * Accepts a record carrying a `parts` array whose every element is a string
+ * or a well-formed `ArgvRef`. Rejects a plain string, a plain `ArgvRef`
+ * (which has no `parts` property), `null`, a bare array, and an object
+ * whose `parts` array contains anything else.
+ */
+export function isArgvConcat(value: unknown): value is ArgvConcat {
+  if (!isRecord(value)) return false;
+  return Array.isArray(value.parts) &&
+    value.parts.every((part) => typeof part === 'string' || isArgvRef(part));
+}
+
 /** Present implies a plain record whose every value is a string — arrays and nested objects are rejected explicitly. */
 function isPlannerFieldsRecord(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((entry) => typeof entry === 'string');
@@ -276,7 +301,7 @@ function isValidCapture(capture: unknown): capture is ResponseCapture {
 export function isOperation(operation: MutationOperation): boolean {
   const context = operation.completionContext;
   return isNonEmptyString(operation.logicalKey) &&
-    Array.isArray(operation.args) && operation.args.every((arg) => typeof arg === 'string' || isArgvRef(arg)) &&
+    Array.isArray(operation.args) && operation.args.every((arg) => typeof arg === 'string' || isArgvRef(arg) || isArgvConcat(arg)) &&
     (operation.transport === OPERATION_TRANSPORT.GRAPHQL || operation.transport === OPERATION_TRANSPORT.REST) &&
     (operation.action === OPERATION_ACTION.CREATE || operation.action === OPERATION_ACTION.UPDATE || operation.action === OPERATION_ACTION.LINK) &&
     typeof operation.hasPointsBudget === 'boolean' &&
@@ -298,14 +323,40 @@ export function isAdoptionCheckpoint(value: AdoptionCheckpoint): boolean {
     isCompletionContext(value.completionContext);
 }
 
+type ResolveRefResult = { ok: true; value: string } | { ok: false; missingLogicalKey: string };
+
+/**
+ * Resolves one reference to its prefix concatenated with the referenced
+ * completion's node id, or — for a number reference — its remote-number
+ * slot rendered as a decimal string. Every unresolved condition `resolveArgv`
+ * documents applies here unchanged; shared so a reference resolves
+ * identically whether it stands alone or sits inside an `ArgvConcat`'s parts.
+ */
+function resolveRef(entry: ArgvRef, map: CompletionLookupMap | null): ResolveRefResult {
+  const completion = map ? map[entry.from] : undefined;
+  if (!completion) return { ok: false, missingLogicalKey: entry.from };
+  if (entry.part === ARGV_REF_PART.NODE_ID) {
+    if (!isNonEmptyString(completion.nodeId)) return { ok: false, missingLogicalKey: entry.from };
+    return { ok: true, value: `${entry.prefix}${completion.nodeId}` };
+  }
+  if (completion.remoteNumber === undefined) return { ok: false, missingLogicalKey: entry.from };
+  return { ok: true, value: `${entry.prefix}${completion.remoteNumber}` };
+}
+
 /**
  * Resolves late-bound argv against a completions lookup. Plain strings pass
  * through untouched. A reference resolves to its prefix concatenated with
  * the referenced completion's node id (or, for a number reference, its
- * remote-number slot rendered as a decimal string). Returns an unresolved
- * result naming the missing logical key when the map is null, the key is
- * absent, the referenced node id is the empty string, or a number
- * reference points at a completion with no number slot.
+ * remote-number slot rendered as a decimal string). An `ArgvConcat` resolves
+ * every part — in declared order, literals concatenated verbatim and
+ * references resolved exactly as a standalone reference would be — and
+ * pushes the joined result as one argv string; a zero-part concat resolves
+ * to the empty string. Returns an unresolved result naming the missing
+ * logical key when the map is null, a referenced key is absent, a
+ * referenced node id is the empty string, or a number reference points at a
+ * completion with no number slot — the first failing part, whether it is
+ * the whole entry or one part of a concat, returns immediately with no
+ * partial string ever pushed.
  */
 export function resolveArgv(argv: ArgvEntry[], map: CompletionLookupMap | null): ResolveArgvResult {
   const resolved: string[] = [];
@@ -314,15 +365,23 @@ export function resolveArgv(argv: ArgvEntry[], map: CompletionLookupMap | null):
       resolved.push(entry);
       continue;
     }
-    const completion = map ? map[entry.from] : undefined;
-    if (!completion) return { ok: false, missingLogicalKey: entry.from };
-    if (entry.part === ARGV_REF_PART.NODE_ID) {
-      if (!isNonEmptyString(completion.nodeId)) return { ok: false, missingLogicalKey: entry.from };
-      resolved.push(`${entry.prefix}${completion.nodeId}`);
-    } else {
-      if (completion.remoteNumber === undefined) return { ok: false, missingLogicalKey: entry.from };
-      resolved.push(`${entry.prefix}${completion.remoteNumber}`);
+    if (isArgvConcat(entry)) {
+      let joined = '';
+      for (const part of entry.parts) {
+        if (typeof part === 'string') {
+          joined += part;
+          continue;
+        }
+        const partResult = resolveRef(part, map);
+        if (!partResult.ok) return partResult;
+        joined += partResult.value;
+      }
+      resolved.push(joined);
+      continue;
     }
+    const refResult = resolveRef(entry, map);
+    if (!refResult.ok) return refResult;
+    resolved.push(refResult.value);
   }
   return { ok: true, argv: resolved };
 }

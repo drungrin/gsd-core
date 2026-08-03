@@ -16,6 +16,7 @@ const {
   OPERATION_OUTCOME,
   isOperation,
   isArgvRef,
+  isArgvConcat,
   isAdoptionCheckpoint,
   resolveArgv,
   decodeResponseRoot,
@@ -105,6 +106,111 @@ describe('resolveArgv', () => {
     const result = resolveArgv(argv, { project: { nodeId: 'PVT_project_1' } });
     assert.equal(result.ok, false);
     assert.equal(result.missingLogicalKey, 'project');
+  });
+});
+
+describe('resolveArgv: ArgvConcat', () => {
+  test('three literal segments and two references resolve to one argv string equal to the segments and resolved values joined in declared order, preserving flag adjacency', () => {
+    const argv = [
+      '-f',
+      {
+        parts: [
+          'body=See #',
+          { from: 'issue:plan:05-01', part: ARGV_REF_PART.NUMBER, prefix: '' },
+          ' and #',
+          { from: 'issue:plan:05-02', part: ARGV_REF_PART.NUMBER, prefix: '' },
+          ' for context.',
+        ],
+      },
+    ];
+    const map = {
+      'issue:plan:05-01': { nodeId: 'ISSUE_1', remoteNumber: 42 },
+      'issue:plan:05-02': { nodeId: 'ISSUE_2', remoteNumber: 99 },
+    };
+    const result = resolveArgv(argv, map);
+    assert.equal(result.ok, true);
+    assert.deepStrictEqual(result.argv, ['-f', 'body=See #42 and #99 for context.']);
+    assert.equal(result.argv.length, 2, 'a concatenating entry resolves to a single argv element, not several');
+  });
+
+  test('a concatenating entry whose parts are all literals resolves to their concatenation with no map lookup', () => {
+    const argv = [{ parts: ['foo', 'bar', 'baz'] }];
+    const result = resolveArgv(argv, null);
+    assert.equal(result.ok, true);
+    assert.deepStrictEqual(result.argv, ['foobarbaz']);
+  });
+
+  test('a concatenating entry with zero parts resolves to the empty string', () => {
+    const argv = [{ parts: [] }];
+    const result = resolveArgv(argv, null);
+    assert.equal(result.ok, true);
+    assert.deepStrictEqual(result.argv, ['']);
+  });
+
+  test('a concatenating entry whose reference names a key absent from the map returns the unresolved result naming that key, and no partial string', () => {
+    const argv = [{ parts: ['body=see #', { from: 'issue:plan:05-01', part: ARGV_REF_PART.NUMBER, prefix: '' }] }];
+    const result = resolveArgv(argv, { unrelated: { nodeId: 'X' } });
+    assert.equal(result.ok, false);
+    assert.equal(result.missingLogicalKey, 'issue:plan:05-01');
+    assert.equal(Object.prototype.hasOwnProperty.call(result, 'argv'), false);
+  });
+
+  test('a concatenating entry whose number reference points at a completion with no number slot returns the unresolved result naming that key', () => {
+    const argv = [{ parts: ['body=see #', { from: 'issue:plan:05-01', part: ARGV_REF_PART.NUMBER, prefix: '' }] }];
+    const result = resolveArgv(argv, { 'issue:plan:05-01': { nodeId: 'ISSUE_1' } });
+    assert.equal(result.ok, false);
+    assert.equal(result.missingLogicalKey, 'issue:plan:05-01');
+  });
+
+  test('a plain string entry and a plain ArgvRef entry resolve exactly as before, byte-for-byte, alongside a concat entry in the same argv', () => {
+    const argv = [
+      'api',
+      { from: 'project', part: ARGV_REF_PART.NODE_ID, prefix: 'projectId=' },
+      { parts: ['body=x'] },
+    ];
+    const map = { project: { nodeId: 'PVT_1' } };
+    const result = resolveArgv(argv, map);
+    assert.equal(result.ok, true);
+    assert.deepStrictEqual(result.argv, ['api', 'projectId=PVT_1', 'body=x']);
+  });
+});
+
+describe('isArgvConcat', () => {
+  test('accepts a well-formed concat entry with literal and reference parts, including zero parts', () => {
+    assert.equal(isArgvConcat({ parts: ['a', { from: 'x', part: ARGV_REF_PART.NODE_ID, prefix: '' }] }), true);
+    assert.equal(isArgvConcat({ parts: [] }), true);
+  });
+
+  test('rejects a plain string', () => {
+    assert.equal(isArgvConcat('projectId=abc'), false);
+  });
+
+  test('rejects a plain ArgvRef', () => {
+    assert.equal(isArgvConcat({ from: 'project', part: ARGV_REF_PART.NODE_ID, prefix: 'x=' }), false);
+  });
+
+  test('rejects null', () => {
+    assert.equal(isArgvConcat(null), false);
+  });
+
+  test('rejects an array', () => {
+    assert.equal(isArgvConcat(['a', 'b']), false);
+  });
+
+  test('rejects an object whose parts array contains a non-string non-reference element', () => {
+    assert.equal(isArgvConcat({ parts: ['a', 42] }), false);
+    assert.equal(isArgvConcat({ parts: ['a', { from: 'x' }] }), false);
+  });
+});
+
+describe('isOperation: ArgvConcat args', () => {
+  test('accepts an operation whose args include a concatenating entry', () => {
+    assert.equal(isOperation(baseOperation({ args: ['api', { parts: ['body=x', { from: 'y', part: ARGV_REF_PART.NUMBER, prefix: '' }] }] })), true);
+  });
+
+  test('rejects an operation whose args include a malformed concat entry', () => {
+    assert.equal(isOperation(baseOperation({ args: ['api', { parts: ['a', 42] }] })), false);
+    assert.equal(isOperation(baseOperation({ args: ['api', { parts: 'not-an-array' }] })), false);
   });
 });
 
