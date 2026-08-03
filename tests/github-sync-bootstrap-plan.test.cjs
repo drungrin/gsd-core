@@ -406,6 +406,23 @@ test('BOOTSTRAP_LOGICAL_KEY reproduces the reserved catalog locked at plan 03-01
   assert.equal(BOOTSTRAP_LOGICAL_KEY.milestone('v1.0'), 'milestone:v1-0');
 });
 
+// ─── BOOTSTRAP_LOGICAL_KEY.autonomousOption (plan 05-04 Task 1) ────────────
+
+describe('BOOTSTRAP_LOGICAL_KEY.autonomousOption', () => {
+  test('Yes and No slug to the two reserved autonomous option keys', () => {
+    assert.equal(BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'), 'option:autonomous:yes');
+    assert.equal(BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'), 'option:autonomous:no');
+  });
+
+  test('uses the same slug helper as statusOption: a mixed-case, punctuated input slugs identically for both generators', () => {
+    const input = ' Some Custom, Option! ';
+    const statusSlug = BOOTSTRAP_LOGICAL_KEY.statusOption(input).slice('option:status:'.length);
+    const autonomousSlug = BOOTSTRAP_LOGICAL_KEY.autonomousOption(input).slice('option:autonomous:'.length);
+    assert.equal(autonomousSlug, statusSlug);
+    assert.equal(autonomousSlug, 'some-custom-option');
+  });
+});
+
 // ─── end-to-end through the real applier ───────────────────────────────────
 
 test('a converged plan folds through the real applyMutationPlan and writes zero times on the second run', () => {
@@ -904,10 +921,20 @@ function autonomousField(id, options) {
 }
 
 describe('planAutonomousOptions', () => {
-  test('Autonomous exists with exactly Yes and No: zero operations', () => {
+  test('Autonomous exists with exactly Yes and No: zero operations, two checkpoints — one per declared option (Phase 5 Pitfall 1)', () => {
     const remote = remoteWithFields([autonomousField('F_auto', [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', '')])]);
     const result = planAutonomousOptions(remote, { kind: 'absent' }, CONTEXT);
     assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 2);
+  });
+
+  test('each converged checkpoint carries the matched remote option\'s own node id, the reserved autonomousOption key, and the supplied completion context', () => {
+    const remote = remoteWithFields([autonomousField('F_auto', [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', '')])]);
+    const result = planAutonomousOptions(remote, { kind: 'absent' }, CONTEXT);
+    const byKey = Object.fromEntries(result.checkpoints.map((c) => [c.logicalKey, c]));
+    assert.equal(byKey[BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')].nodeId, 'id-yes');
+    assert.equal(byKey[BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')].nodeId, 'id-no');
+    for (const checkpoint of result.checkpoints) assert.deepEqual(checkpoint.completionContext, CONTEXT);
   });
 
   test('Autonomous exists with Yes, No, and an extra Maybe option: one operation, outgoing array has exactly Yes and No, Maybe pruned (D-22)', () => {
@@ -940,19 +967,21 @@ describe('planAutonomousOptions', () => {
     assert.equal(merged[1].id, undefined);
   });
 
-  test('Autonomous does not exist in the snapshot: zero operations', () => {
+  test('Autonomous does not exist in the snapshot: zero operations, zero checkpoints', () => {
     const remote = remoteWithFields([field('F_id', 'GSD ID', 'TEXT')]);
     const result = planAutonomousOptions(remote, { kind: 'absent' }, CONTEXT);
     assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 0);
   });
 
-  test("the emitted operation's logical key is the Autonomous field's reserved key, and it declares a single NODE capture, not an each-capture", () => {
+  test("the emitted operation's logical key is the Autonomous field's reserved key, it declares a single NODE capture, and the mutation branch itself emits zero checkpoints (checkpoints are the converged branch's own shape)", () => {
     const remote = remoteWithFields([autonomousField('F_auto', [opt('id-yes', 'Yes', 'GREEN', '')])]);
     const result = planAutonomousOptions(remote, { kind: 'absent' }, CONTEXT);
     const operation = result.operations[0];
     assert.equal(operation.logicalKey, BOOTSTRAP_LOGICAL_KEY.field('Autonomous'));
     assert.equal(operation.captures.length, 1);
     assert.equal(operation.captures[0].kind, 'node');
+    assert.equal(result.checkpoints.length, 0);
   });
 
   test('the operation declares its producing stage explicitly (the autonomous/options stage), even though its logical key carries the field prefix', () => {
@@ -1488,6 +1517,51 @@ describe('planBootstrap options pass wiring', () => {
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.equal(plan.operations.length, 1);
     assert.equal(plan.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.field(STATUS_FIELD_NAME));
+  });
+});
+
+// ─── planBootstrap options pass: autonomous checkpoints on every merge.kind ──
+// branch (plan 05-04 Task 1, closing 05-RESEARCH.md Pitfall 1) ──────────────
+
+describe('planBootstrap options pass: autonomous checkpoints thread through every merge.kind branch', () => {
+  const target = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+
+  test('merge.kind noop (unset project): the options pass still surfaces the two autonomous checkpoints (converged Autonomous field, independent of Status)', () => {
+    const remote = {
+      available: true, projectOutcome: 'unset', statusField: null,
+      fields: [{ id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', '')] }],
+    };
+    const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
+    assert.equal(plan.noops[0].reason, BOOTSTRAP_OPERATION_REASON.PROJECT_UNSET);
+    assert.equal(plan.checkpoints.length, 2);
+    assert.deepEqual(plan.checkpoints.map((c) => c.logicalKey).sort(), [BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'), BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')].sort());
+  });
+
+  test('merge.kind converged (Status also fully converged): the Status checkpoints and the autonomous checkpoints both surface, seven total', () => {
+    const remote = {
+      available: true, projectOutcome: 'resolved',
+      statusField: statusField([opt('id-todo', 'Todo', 'GRAY', ''), opt('id-inprogress', 'In Progress', 'BLUE', ''), opt('id-blocked', 'Blocked', 'RED', ''), opt('id-done', 'Done', 'GREEN', ''), opt('id-deferred', 'Deferred', 'YELLOW', '')]),
+      fields: [{ id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', '')] }],
+    };
+    const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
+    assert.equal(plan.operations.length, 0);
+    assert.equal(plan.checkpoints.length, 7);
+    assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')));
+    assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')));
+    assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.statusOption('Todo')));
+  });
+
+  test('merge.kind operation (Status divergent, Autonomous independently converged): the Status write dispatches and the two autonomous checkpoints still surface — checkpoints are not exclusively a converged-branch concept', () => {
+    const remote = {
+      available: true, projectOutcome: 'resolved',
+      statusField: statusField([opt('id-todo', 'Todo', 'GRAY', '')]), // missing four GSD options -> divergent -> operation branch
+      fields: [{ id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', '')] }], // exactly Yes/No -> converged
+    };
+    const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
+    assert.equal(plan.operations.length, 1);
+    assert.equal(plan.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.field(STATUS_FIELD_NAME));
+    assert.equal(plan.checkpoints.length, 2);
+    assert.ok(plan.checkpoints.every((c) => c.logicalKey.startsWith('option:autonomous:')));
   });
 });
 

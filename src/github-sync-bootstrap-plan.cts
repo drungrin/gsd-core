@@ -62,6 +62,7 @@ const BOOTSTRAP_LOGICAL_KEY = Object.freeze({
   projectLink: (): string => 'project-link',
   field: (name: string): string => `field:${slug(name)}`,
   statusOption: (name: string): string => `option:status:${slug(name)}`,
+  autonomousOption: (name: string): string => `option:autonomous:${slug(name)}`,
   label: (name: string): string => `label:${slug(name)}`,
   milestone: (version: string): string => `milestone:${slug(version)}`,
 });
@@ -578,6 +579,7 @@ function planFields(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, c
 
 interface AutonomousPlanResult {
   operations: StageTaggedOperation[];
+  checkpoints: StageTaggedCheckpoint[];
 }
 
 /**
@@ -593,17 +595,23 @@ interface AutonomousPlanResult {
  * Resolves the field by its own reserved completion first, then by exact
  * name (the same identity rule `planFields` uses for the field itself — this
  * builder never re-derives it independently). Absent from the snapshot ->
- * zero operations, both because the field genuinely does not exist yet (its
- * own create call already supplies both options in the same request) and
- * because a field created THIS run may not yet be visible in a stale
- * snapshot — the caller re-reads before calling this builder in that case
- * (the router's mutated-key re-read boundary).
+ * zero operations and zero checkpoints, both because the field genuinely
+ * does not exist yet (its own create call already supplies both options in
+ * the same request) and because a field created THIS run may not yet be
+ * visible in a stale snapshot — the caller re-reads before calling this
+ * builder in that case (the router's mutated-key re-read boundary).
+ *
+ * Phase 5 Pitfall 1: writing an `Autonomous` field value requires the
+ * target option's own node id, not merely the field's — so both branches
+ * below now emit per-option completions, mirroring
+ * `planStatusOptionMerge`'s exact shape (checkpoints on the converged
+ * branch, an each-capture keyMap on the mutation branch).
  */
 function planAutonomousOptions(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, context: CompletionContext): AutonomousPlanResult {
   const remoteFields = remote.fields ?? [];
   const claimedRemoteIds = new Set<string>();
   const match = resolveFieldIdentity({ name: AUTONOMOUS_FIELD_NAME, dataType: FIELD_DATA_TYPE.SINGLE_SELECT }, remoteFields, strictMap, claimedRemoteIds);
-  if (!match) return { operations: [] };
+  if (!match) return { operations: [], checkpoints: [] };
 
   const remoteOptions = match.field.options ?? [];
   const merged: OptionInput[] = [];
@@ -627,10 +635,25 @@ function planAutonomousOptions(remote: BootstrapRemoteForMerge, strictMap: Stric
     const remoteOption = remoteOptions.find((option) => option.id === entry.id);
     return !!remoteOption && entry.name === remoteOption.name && entry.color === remoteOption.color && entry.description === remoteOption.description;
   });
-  if (alreadyConverged) return { operations: [] };
+  if (alreadyConverged) {
+    return {
+      operations: [],
+      checkpoints: GSD_AUTONOMOUS_OPTIONS.map((gsdOption) => {
+        const matched = merged.find((entry) => entry.name === gsdOption.name);
+        return {
+          logicalKey: BOOTSTRAP_LOGICAL_KEY.autonomousOption(gsdOption.name),
+          nodeId: matched?.id as string,
+          completionContext: context,
+          stage: BOOTSTRAP_STAGE.AUTONOMOUS,
+        };
+      }),
+    };
+  }
 
   const mintsNewOption = merged.some((entry) => entry.id === undefined);
   const fieldKey = BOOTSTRAP_LOGICAL_KEY.field(AUTONOMOUS_FIELD_NAME);
+  const keyMap: Record<string, string> = {};
+  for (const gsdOption of GSD_AUTONOMOUS_OPTIONS) keyMap[gsdOption.name] = BOOTSTRAP_LOGICAL_KEY.autonomousOption(gsdOption.name);
   const operation: StageTaggedOperation = {
     kind: 'update',
     logicalKey: fieldKey,
@@ -645,16 +668,17 @@ function planAutonomousOptions(remote: BootstrapRemoteForMerge, strictMap: Stric
     action: OPERATION_ACTION.UPDATE,
     hasPointsBudget: false,
     contentCreation: mintsNewOption,
-    // A single node capture under the field's own key — not an each-capture:
-    // only Status options get per-option completions (D-08), because only
-    // Status options are individually referenced by later phases.
+    // A single node capture under the field's own key — not yet an
+    // each-capture; Task 2 widens this to also fan the response's options
+    // list out to the two option-level completions above (plan 05-04
+    // Task 1 scope stops at the converged branch).
     captures: [{ kind: 'node', logicalKey: fieldKey, nodeIdPath: 'updateProjectV2Field.projectV2Field.id' }],
     // Produced by the AUTONOMOUS stage even though its logical key carries
     // the field: prefix — the case that breaks prefix-inferred reporting
     // (plan 03-04 Task 3 / plan 03-06's per-stage counts).
     stage: BOOTSTRAP_STAGE.AUTONOMOUS,
   };
-  return { operations: [operation] };
+  return { operations: [operation], checkpoints: [] };
 }
 
 // ─── REST endpoint path (duplicated from github-sync-bootstrap-remote.cts) ──
@@ -1153,12 +1177,21 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
   // non-null, non-blocked merge outcome — its own identity resolution
   // naturally contributes zero operations when the Autonomous field does not
   // yet exist in this snapshot (an unset/fresh-create project, or a project
-  // whose structure pass has not created it yet).
+  // whose structure pass has not created it yet). Its checkpoints are
+  // independent of merge.kind — an already-converged Autonomous field
+  // records its two option completions whether Status itself is a noop, a
+  // converged adoption, or a live mutation — so every branch below folds
+  // autonomousPlan.checkpoints in; only the converged branch has Status's
+  // own checkpoints to add alongside them.
   const autonomousPlan = planAutonomousOptions(input.remote, input.strictMap, context);
 
-  if (merge.kind === 'noop') return { ...emptyPlan(), noops: [{ reason: merge.reason }], operations: autonomousPlan.operations };
-  if (merge.kind === 'converged') return { ...emptyPlan(), checkpoints: merge.checkpoints, operations: autonomousPlan.operations };
-  return { ...emptyPlan(), operations: [merge.operation, ...autonomousPlan.operations] };
+  if (merge.kind === 'noop') {
+    return { ...emptyPlan(), noops: [{ reason: merge.reason }], operations: autonomousPlan.operations, checkpoints: autonomousPlan.checkpoints };
+  }
+  if (merge.kind === 'converged') {
+    return { ...emptyPlan(), checkpoints: [...merge.checkpoints, ...autonomousPlan.checkpoints], operations: autonomousPlan.operations };
+  }
+  return { ...emptyPlan(), operations: [merge.operation, ...autonomousPlan.operations], checkpoints: autonomousPlan.checkpoints };
 }
 
 export = {
