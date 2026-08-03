@@ -54,6 +54,57 @@ On a target with no Project v2 board yet, `init` creates, in order:
 5. **The two repository labels** `gsd:phase` and `gsd:plan`.
 6. **One GitHub Milestone per GSD milestone** — the current milestone open, each archived
    milestone created already closed.
+7. **The five GSD-owned views** — Roadmap, Board, Table-by-Phase, By-Wave, Backlog — created on
+   an empty board and repaired on every subsequent run. See [The five views](#the-five-views)
+   below.
+8. **A layout retype on the project's pre-existing leftmost view** — the tab the board opens on
+   by default. See [The five views](#the-five-views) below.
+
+### The five views
+
+Every run of `init` creates or repairs five views, read from the shipped `GSD_VIEWS` table:
+
+| View | Layout | Filter | Visible fields beyond Title |
+|---|---|---|---|
+| Roadmap | Roadmap | *(none)* | *(none)* |
+| Board | Board | *(none)* | *(none)* |
+| Table-by-Phase | Table | `label:gsd:phase` | Phase, Status |
+| By-Wave | Table | `label:gsd:plan` | Wave, Phase, Status |
+| Backlog | Table | `-status:Done` | Status |
+
+GSD owns `name`, `layout`, and `filter` on these five absolutely. A developer who re-filters or
+re-types one by hand sees it converged back on the next `init` — these views are derived state,
+not authored content. The consequence: **grouping is the one view property GSD cannot set** (see
+[API ceiling](#api-ceiling) below), so it is the only one a developer's customization survives on.
+
+The Roadmap view exists and is a real view, but a developer should not expect a populated
+timeline: the Roadmap layout is a date-bound visualization, and none of GSD's fields is a date
+field — GSD has no deadline concept to mirror.
+
+Separately, `init` retypes the layout of whichever view happens to sit **leftmost** on the
+board — the tab a developer sees first, since the API has no other way to express "default view"
+(see [API ceiling](#api-ceiling)). This is governed by
+[`github_sync.view.layout`](#configuration) (default `board`) and is the only one of the eight
+behaviors above that touches a view GSD did not itself create.
+
+### Manual setup in the GitHub UI
+
+GSD does not and cannot know whether any of the following were done — nothing on disk and
+nothing on the board records it. What follows describes a finished setup, not a checklist GSD
+tracks or ever will.
+
+- **Group the Table-by-Phase view by Milestone.** `groupByFields` is a read-only connection on
+  `ProjectV2View`; no input on `createProjectV2View` or `updateProjectV2View` reaches it, so this
+  grouping has to be set once, by hand, and it is the one view property that survives every
+  future `init`.
+- **Milestone swimlanes on the Board view.** `verticalGroupByFields` is read-only for the same
+  reason as `groupByFields` above — no mutation input on either view mutation writes to it.
+- **Any Insights chart.** Project v2 Insights has no mutation surface on `Mutation` at all; there
+  is nothing an API client, including `init`, could ever call to create one.
+- **Making a chosen view the one the board opens on.** There is no view-reordering mutation and
+  no `isDefault` field on `ProjectV2View`, so "default view" means whichever view sits leftmost.
+  `init` retypes that view's layout (governed by [`github_sync.view.layout`](#configuration)) but
+  can never move a view into that position.
 
 ### What `init` records without creating
 
@@ -83,15 +134,40 @@ absent map dispatches **zero** mutations and still leaves every reserved key rec
   see [Configuration](#configuration) below. `github-sync` is one-way, disk to GitHub; this is
   the one narrowly-scoped exception, and it exists only so a developer's next `status`/`sync`
   needs no manual step after a fresh `init` create.
+- **Never deletes a view.** `deleteProjectV2View` appears nowhere in the codebase; a view whose
+  recorded id no longer resolves is recreated, not reconciled against an absence record, because
+  a view carries no body, no comments, no history, and no sub-issue relations.
+- **Never renames the adopted leftmost view, and never writes anything on it but `layout`.**
+- **Never attempts a grouping or sort write.** Those connections are read-only, so a best-effort
+  attempt would fail on every run for every view.
 
 ### API ceiling
 
-`createProjectV2View`/`updateProjectV2View` accept only `(projectId, name, layout, filter)` —
-**view grouping, sort order, and visible-fields configuration are not settable through the
-GitHub API at all**, and Project v2 **Insights** charts have no mutation surface whatsoever.
-`init` does not attempt either. See
+`createProjectV2View` and `updateProjectV2View` do not share one input shape.
+`CreateProjectV2ViewInput` carries `projectId`, `name`, and `layout` (all required), plus an
+optional `configuration` — **no `filter` field exists on it at all**. `filter` exists only on
+`UpdateProjectV2ViewInput`, alongside `viewId` (required) and optional `name`/`layout`/
+`configuration`. `init` never sends a filter at create time; a view that needs one gets it from a
+following `updateProjectV2View` call carrying the view's own id.
+
+`configuration` is `ProjectV2ViewConfigurationInput`, which carries exactly one field:
+`visibleFieldIds: [ID!]`. This *is* settable — `init` sets it on the three views
+(Table-by-Phase, By-Wave, Backlog; see [The five views](#the-five-views) above) that declare
+visible fields beyond the implicit `Title` column.
+
+What remains genuinely outside the API's reach: `groupByFields` and `verticalGroupByFields` are
+read-only connections on `ProjectV2View` with no write path anywhere in the schema — no input on
+either `createProjectV2View` or `updateProjectV2View` reaches them. Neither mutation carries a
+sort input either. Project v2 **Insights** charts have no mutation surface on `Mutation` at all.
+And there is no view-reordering mutation and no `isDefault` field on `ProjectV2View` — a board's
+"default view" is simply whichever view sits leftmost, and the API can retype that view (see
+[The five views](#the-five-views) above) but never move it. See
+[Manual setup in the GitHub UI](#manual-setup-in-the-github-ui) above for the finished end-state
+this ceiling leaves to a developer, and
 [`.planning/phases/03-project-bootstrap/COVERAGE.md`](../../.planning/phases/03-project-bootstrap/COVERAGE.md)
-for the full, enumerated record of every GraphQL/REST capability this phase integrated or
+and
+[`.planning/phases/06-views-capability-documentation/COVERAGE.md`](../../.planning/phases/06-views-capability-documentation/COVERAGE.md)
+for the full, enumerated record of every GraphQL/REST capability this project integrated or
 deliberately opted out of, with a reason for each opt-out.
 
 ### Output
