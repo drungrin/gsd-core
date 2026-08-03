@@ -7,10 +7,14 @@ const {
   planReconciliation, OPERATION_KIND, OPERATION_REASON, issueKeyFor,
   buildFieldValueOperations, buildPlanFieldValueOperations, PLAN_FIELD_VALUE_SPEC,
   planKeyFor, planIssueKeyFor, buildCreatePlanIssueOperation, buildAddSubIssueOperation, ADD_SUB_ISSUE_DOCUMENT,
-  UPDATE_FIELD_VALUE_NUMBER_DOCUMENT,
+  UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, bodyArgvEntry,
 } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
 const { GSD_LABELS, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
-const { renderPhaseRegion, renderPlanRegion, contentHash, renderFieldState, PLAN_FIELD_NAMES } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const {
+  renderPhaseRegion, renderPlanRegion, renderNewPlanIssueBody, contentHash, renderFieldState, PLAN_FIELD_NAMES,
+  DEPENDENCY_REF_SENTINEL,
+} = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const { resolveArgv } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
 
 /** Recursively asserts no object among `inputs` carries a `body` key anywhere — proves SYNC-05/D-08's "no remote body read at all" structurally, not by convention. */
 function assertNoRemoteBodyInInputs(...inputs) {
@@ -977,7 +981,10 @@ test('ADD_SUB_ISSUE_DOCUMENT: pins the mutation name and its selected payload fi
 
 test('buildCreatePlanIssueOperation: REST create carrying the rendered plan body, the gsd:plan label, and a late-bound milestone reference — never the typed flag for a plan-sourced string', () => {
   const plan = { id: '04-03', phaseId: '04', title: '04-03 — Splice a region', tasks: ['Task 1: First'], status: 'Todo' };
-  const op = buildCreatePlanIssueOperation(plan, planIssueKeyFor(plan.id), MILESTONE_KEY, 'repos/octo/repo/issues', CONTEXT);
+  const fullBody = renderNewPlanIssueBody({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const bodyResult = bodyArgvEntry(fullBody, []);
+  assert.equal(bodyResult.kind, 'ok');
+  const op = buildCreatePlanIssueOperation(plan, planIssueKeyFor(plan.id), MILESTONE_KEY, 'repos/octo/repo/issues', CONTEXT, bodyResult.entry);
 
   assert.equal(op.transport, 'rest');
   assert.equal(op.action, 'create');
@@ -1274,6 +1281,7 @@ test('planReconciliation: a stored content hash that differs from the freshly co
     milestoneKey: MILESTONE_KEY,
     contentHash: hash,
     completionContext: { owner: 'octo', repo: 'repo', repositoryNumber: 42 },
+    dependsOn: [],
   });
 });
 
@@ -1409,4 +1417,137 @@ test('planReconciliation: orphan entries (phase and plan namespaces together) ar
   const second = planReconciliation(desiredWithPlans([]), remoteForPlans(), map);
   assert.deepEqual(first.orphans, [{ logicalKey: 'plan:02-01', issueNumber: 20 }, { logicalKey: 'plan:10-02', issueNumber: 100 }]);
   assert.deepEqual(first.orphans, second.orphans);
+});
+
+// ─── Plan 05-06 Task 2: dependency references in a plan's create body ──────
+
+/** Recursively asserts no argv string anywhere in `operations` contains the raw dependency-reference sentinel — a body must never dispatch carrying an unsubstituted slot. */
+function assertNoSentinelInOperations(operations) {
+  for (const op of operations) {
+    for (const arg of op.args) {
+      if (typeof arg === 'string') {
+        assert.equal(arg.includes(DEPENDENCY_REF_SENTINEL), false, `argv string carries an unsubstituted dependency-reference sentinel: ${arg}`);
+      } else if (arg && Array.isArray(arg.parts)) {
+        for (const part of arg.parts) {
+          if (typeof part === 'string') {
+            assert.equal(part.includes(DEPENDENCY_REF_SENTINEL), false, `ArgvConcat literal part carries an unsubstituted sentinel: ${part}`);
+          }
+        }
+      }
+    }
+  }
+}
+
+test('planReconciliation: a plan with two resolvable dependencies produces a create operation whose body argv entry is a concatenating entry with three literal segments and two issue:plan:<depId> NUMBER references, resolving to the real issue numbers with no sentinel surviving', () => {
+  const plan = { id: '04-05', phaseId: '04', title: 'Depends on two', tasks: ['Task 1: First'], status: 'Todo', dependsOn: ['04-01', '04-02'] };
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    'issue:plan:04-01': { nodeId: 'ISSUE_NODE_0401', issueNumber: 201 },
+    'issue:plan:04-02': { nodeId: 'ISSUE_NODE_0402', issueNumber: 202 },
+    ...planFieldBootstrapCompletions(),
+  });
+  const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), map);
+  assert.deepEqual(result.blocked, []);
+  assertNoSentinelInOperations(result.operations);
+
+  const createOp = result.operations.find((op) => op.kind === 'create-plan-issue');
+  const bodyEntry = createOp.args.find((arg) => arg && typeof arg === 'object' && Array.isArray(arg.parts));
+  assert.ok(bodyEntry, 'the body argv entry must be a concatenating entry, not a plain string');
+  const literalParts = bodyEntry.parts.filter((part) => typeof part === 'string');
+  const refParts = bodyEntry.parts.filter((part) => typeof part === 'object');
+  assert.equal(literalParts.length, 3, 'three literal segments surround/separate two references');
+  assert.equal(refParts.length, 2);
+  assert.deepEqual(refParts.map((ref) => ref.from), ['issue:plan:04-01', 'issue:plan:04-02']);
+  assert.ok(refParts.every((ref) => ref.part === 'number' && ref.prefix === '#'), 'each reference resolves the NUMBER slot with a # prefix so GitHub renders a linked issue reference');
+  assert.equal(literalParts[0].startsWith('body='), true);
+
+  // Resolved through a map holding both dependencies plus the milestone
+  // reference the create op also carries, exactly as applyMutationPlan
+  // would at dispatch time.
+  const lookup = {
+    'issue:plan:04-01': { nodeId: 'ISSUE_NODE_0401', remoteNumber: 201 },
+    'issue:plan:04-02': { nodeId: 'ISSUE_NODE_0402', remoteNumber: 202 },
+    [MILESTONE_KEY]: { nodeId: 'MI_node_1', remoteNumber: 3 },
+  };
+  const resolved = resolveArgv(createOp.args, lookup);
+  assert.equal(resolved.ok, true);
+  const resolvedBodyArg = resolved.argv.find((arg) => arg.startsWith('body='));
+  assert.ok(resolvedBodyArg.includes('#201'));
+  assert.ok(resolvedBodyArg.includes('#202'));
+  assert.equal(resolvedBodyArg.includes(DEPENDENCY_REF_SENTINEL), false, 'no sentinel survives a resolved body');
+});
+
+test('planReconciliation: a plan with zero dependencies produces a plain string body argv entry, not a concatenating one with a single part', () => {
+  const plan = planFixture();
+  const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions()));
+  const createOp = result.operations.find((op) => op.kind === 'create-plan-issue');
+  const bodyArg = createOp.args.find((arg) => typeof arg === 'string' && arg.startsWith('body='));
+  assert.ok(bodyArg, 'zero dependencies must produce a plain string body entry');
+  assert.equal(createOp.args.some((arg) => arg && typeof arg === 'object' && Array.isArray(arg.parts)), false);
+});
+
+test('planReconciliation: a plan whose dependency has no issue:plan:<depId> completion and is not created earlier in the same run produces a typed blocked entry naming the missing key and zero operations for that plan, while a sibling plan still emits its own', () => {
+  const blockedPlan = { id: '04-05', phaseId: '04', title: 'Depends on missing', tasks: ['Task 1'], status: 'Todo', dependsOn: ['04-99'] };
+  const siblingPlan = planFixture({ id: '04-06', title: 'Sibling, no deps' });
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions());
+  const result = planReconciliation(desiredWithPlans([blockedPlan, siblingPlan]), remoteForPlans(), map);
+
+  assert.ok(result.blocked.some((entry) => entry.reason === OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH && entry.detail === 'issue:plan:04-99'));
+  assert.equal(result.operations.some((op) => op.logicalKey === 'issue:plan:04-05' || op.logicalKey === 'plan:04-05'), false, 'the blocked plan emits no operation at all — no body operation, no field writes, no board bind');
+  assert.ok(result.operations.some((op) => op.logicalKey === 'issue:plan:04-06'), 'the sibling plan still emits its own operations');
+});
+
+test('planReconciliation: a dependency created earlier in this same run (no prior-run completion) resolves too — the second of two plans in one run carries the first\'s late-bound reference', () => {
+  const first = { id: '04-01', phaseId: '04', title: 'First plan', tasks: ['Task 1'], status: 'Todo' };
+  const second = { id: '04-02', phaseId: '04', title: 'Second plan', tasks: ['Task 1'], status: 'Todo', dependsOn: ['04-01'] };
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions());
+  const result = planReconciliation(desiredWithPlans([first, second]), remoteForPlans(), map);
+
+  assert.deepEqual(result.blocked, []);
+  const secondCreate = result.operations.find((op) => op.kind === 'create-plan-issue' && op.logicalKey === 'issue:plan:04-02');
+  const bodyEntry = secondCreate.args.find((arg) => arg && typeof arg === 'object' && Array.isArray(arg.parts));
+  assert.ok(bodyEntry, 'the second plan\'s body carries a concatenating entry referencing the first');
+  const refPart = bodyEntry.parts.find((part) => typeof part === 'object');
+  assert.deepEqual(refPart, { from: 'issue:plan:04-01', part: 'number', prefix: '#' });
+});
+
+test('planReconciliation: the content hash for a plan is unchanged by which issue numbers its dependencies resolve to', () => {
+  const plan = { id: '04-05', phaseId: '04', title: 'Depends on two', tasks: ['Task 1: First'], status: 'Todo', dependsOn: ['04-01', '04-02'] };
+  const mapA = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    'issue:plan:04-01': { nodeId: 'ISSUE_NODE_0401', issueNumber: 201 },
+    'issue:plan:04-02': { nodeId: 'ISSUE_NODE_0402', issueNumber: 202 },
+    ...planFieldBootstrapCompletions(),
+  });
+  const mapB = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    'issue:plan:04-01': { nodeId: 'ISSUE_NODE_DIFFERENT_1', issueNumber: 555 },
+    'issue:plan:04-02': { nodeId: 'ISSUE_NODE_DIFFERENT_2', issueNumber: 777 },
+    ...planFieldBootstrapCompletions(),
+  });
+  const resultA = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), mapA);
+  const resultB = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), mapB);
+
+  const hashA = resultA.operations.find((op) => op.kind === 'add-sub-issue').captures[0].plannerFields.contentHash;
+  const hashB = resultB.operations.find((op) => op.kind === 'add-sub-issue').captures[0].plannerFields.contentHash;
+  assert.equal(hashA, hashB, 'two otherwise-identical plans whose dependencies resolve to different issue numbers must produce equal content hashes');
+
+  // And the plan-id substitution the hash is computed over really did differ
+  // in dependency identity from an empty-dependency plan, proving the hash
+  // is sensitive to WHICH plans are depended on, just not to their numbers.
+  const noDepsPlan = { ...plan, dependsOn: [] };
+  const resultNoDeps = planReconciliation(desiredWithPlans([noDepsPlan]), remoteForPlans(), mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions()));
+  const hashNoDeps = resultNoDeps.operations.find((op) => op.kind === 'add-sub-issue').captures[0].plannerFields.contentHash;
+  assert.notEqual(hashA, hashNoDeps);
+});
+
+test('bodyArgvEntry: a body carrying no sentinel returns a plain string entry equal to "body=" concatenated with the body, with no map lookup implied', () => {
+  const result = bodyArgvEntry('a plain body with no dependency slots', []);
+  assert.deepEqual(result, { kind: 'ok', entry: 'body=a plain body with no dependency slots' });
+});
+
+test('bodyArgvEntry: a slot/dependency count disagreement returns a typed mismatch, never a body', () => {
+  const bodyWithOneSlot = `before${DEPENDENCY_REF_SENTINEL}after`;
+  const result = bodyArgvEntry(bodyWithOneSlot, ['04-01', '04-02']);
+  assert.equal(result.kind, 'mismatch');
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'entry'), false);
+  assert.match(result.detail, /1/);
+  assert.match(result.detail, /2/);
 });

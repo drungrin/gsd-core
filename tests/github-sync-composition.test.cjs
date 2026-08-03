@@ -48,7 +48,10 @@ const ID_ALLOWLIST = new Set([
   'FIELD_WAVE', 'FIELD_AUTONOMOUS', 'OPTION_AUTONOMOUS_YES', 'OPTION_AUTONOMOUS_NO',
 ]);
 const { BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
-const { phaseMarker, planMarker, FENCE_BEGIN, FENCE_END, renderPhaseRegion, contentHash, renderFieldState, PLAN_FIELD_NAMES } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const {
+  phaseMarker, planMarker, FENCE_BEGIN, FENCE_END, renderPhaseRegion, renderPlanRegion, contentHash, renderFieldState,
+  PLAN_FIELD_NAMES, DEPENDENCY_REF_SENTINEL, substituteDependencyRefs,
+} = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 const { prepareIssueUpdates } = require('../gsd-core/bin/lib/github-sync-issue-update.cjs');
 
 const FIELD_KEY = {
@@ -1089,4 +1092,90 @@ test('four-run offline convergence: a phase issue already in the map plus two pl
   assert.equal(fourthDispatched, 0);
 
   assert.deepEqual([firstDispatched.length, secondDispatched, thirdDispatched, fourthDispatched], [18, 0, 0, 0]);
+});
+
+// ─── Plan 05-06 Task 2: a dependency reference resolves to a real issue ───
+// ─── number, dispatched in the same run the depended-on plan is created ──
+
+test('two plans where the second depends on the first, both created in one run: the second\'s dispatched body carries the first\'s real issue number as a GitHub issue reference, and never the raw sentinel', (t) => {
+  const cwd = createTempProject('github-sync-composition-plan-deps-');
+  t.after(() => cleanup(cwd));
+
+  const planA = { id: '08-01', phaseId: '08', title: '08-01 — Plan A', tasks: ['Task 1: A1'], status: 'Todo' };
+  const planB = { id: '08-02', phaseId: '08', title: '08-02 — Plan B', tasks: ['Task 1: B1'], status: 'Todo', dependsOn: ['08-01'] };
+  const desiredPlans = fourRunPlansDesired(planA, planB);
+  const seeded = seedPlanFourRunMap(cwd);
+  const clock = fixedClock();
+
+  const reconPlan = planReconciliation(desiredPlans, remote([]), seeded);
+  assert.deepEqual(reconPlan.blocked, []);
+  assert.equal(reconPlan.operations.length, 16, 'two plans x (3 create ops + 5 field writes, Wave omitted since unset)');
+
+  // Plan B's create body argv entry must be a concatenating entry (not a
+  // plain string), referencing plan A's own issue:plan key.
+  const planBCreate = reconPlan.operations.find((op) => op.kind === 'create-plan-issue' && op.logicalKey === 'issue:plan:08-02');
+  const planBBodyConcat = planBCreate.args.find((arg) => arg && typeof arg === 'object' && Array.isArray(arg.parts));
+  assert.ok(planBBodyConcat, 'plan B declares dependsOn, so its body argv entry must be a concatenating entry');
+  const planBRefPart = planBBodyConcat.parts.find((part) => typeof part === 'object');
+  assert.deepEqual(planBRefPart, { from: 'issue:plan:08-01', part: 'number', prefix: '#' });
+
+  const PLAN_A_NUMBER = 501;
+  const PLAN_A_NODE_ID = 'I_node_plan_08_01';
+  const PLAN_B_NUMBER = 502;
+  const PLAN_B_NODE_ID = 'I_node_plan_08_02';
+  const dispatched = [];
+  let planACreateSeen = false;
+
+  const run = applyMutationPlan(reconPlan, {
+    cwd,
+    map: seeded.map,
+    clock,
+    execGh(args) {
+      dispatched.push(args);
+      if (args[0] === 'api' && args[2] === '-X' && args[3] === 'POST') {
+        if (!planACreateSeen) {
+          planACreateSeen = true;
+          return restIssueCreateResponse(PLAN_A_NODE_ID, PLAN_A_NUMBER);
+        }
+        // Plan B's create — dispatched only after plan A's create AND
+        // addSubIssue completions are already durably recorded in this same
+        // run, per the ascending-id decision order.
+        const bodyArg = args.find((a) => typeof a === 'string' && a.startsWith('body='));
+        assert.ok(bodyArg, 'plan B\'s body must have resolved to a plain string argv element, not an unresolved object');
+        assert.ok(bodyArg.includes(`#${PLAN_A_NUMBER}`), 'plan B\'s dispatched body must carry plan A\'s real issue number');
+        assert.equal(bodyArg.includes(DEPENDENCY_REF_SENTINEL), false, 'no sentinel ever survives to a dispatched body');
+        return restIssueCreateResponse(PLAN_B_NODE_ID, PLAN_B_NUMBER);
+      }
+      const queryArg = args.find((a) => typeof a === 'string' && a.startsWith('query='));
+      if (queryArg && queryArg.includes('addSubIssue')) {
+        if (args.includes(`subIssueId=${PLAN_A_NODE_ID}`)) return addSubIssueResponse('I_node_phase_four_run_parent', PLAN_A_NODE_ID, PLAN_A_NUMBER);
+        return addSubIssueResponse('I_node_phase_four_run_parent', PLAN_B_NODE_ID, PLAN_B_NUMBER);
+      }
+      if (queryArg && queryArg.includes('addProjectV2ItemById')) {
+        if (args.includes(`contentId=${PLAN_A_NODE_ID}`)) return response('PVTI_item_08_01', PLAN_A_NUMBER);
+        return response('PVTI_item_08_02', PLAN_B_NUMBER);
+      }
+      // Field writes: distinguish by itemId.
+      if (args.includes('itemId=PVTI_item_08_01')) return fieldValueResponse('PVTI_item_08_01', PLAN_A_NUMBER);
+      return fieldValueResponse('PVTI_item_08_02', PLAN_B_NUMBER);
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(run.kind, 'completed');
+  assert.equal(dispatched.length, 16);
+
+  const reopened = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(reopened.kind, 'valid');
+  assert.equal(reopened.map.completions['issue:plan:08-01'].issueNumber, PLAN_A_NUMBER);
+  assert.equal(reopened.map.completions['issue:plan:08-02'].issueNumber, PLAN_B_NUMBER);
+
+  // The content hash recorded for plan B is computed over the plan-id
+  // substitution (D-03), never over plan A's resolved issue number.
+  const planBRegion = renderPlanRegion({
+    id: planB.id, title: planB.title, status: planB.status, tasks: planB.tasks, dependsOn: planB.dependsOn,
+  });
+  const planBPlanIdSubstitution = substituteDependencyRefs(planBRegion, planB.dependsOn);
+  const expectedPlanBHash = contentHash({ title: planB.title, region: planBPlanIdSubstitution.text, milestoneNumber: PLAN_FOUR_RUN_MILESTONE_NUMBER });
+  assert.equal(reopened.map.completions['issue:plan:08-02'].contentHash, expectedPlanBHash);
 });

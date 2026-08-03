@@ -3,7 +3,7 @@
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import operationMod = require('./github-sync-operation.cjs');
-import type { MutationOperation, ArgvEntry, CompletionContext } from './github-sync-operation.cts';
+import type { MutationOperation, ArgvEntry, ArgvRef, CompletionContext } from './github-sync-operation.cts';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import bootstrapPlanMod = require('./github-sync-bootstrap-plan.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -15,6 +15,7 @@ const { BOOTSTRAP_LOGICAL_KEY, GSD_LABELS, STATUS_FIELD_NAME } = bootstrapPlanMo
 const {
   renderNewIssueBody, renderPhaseRegion, contentHash, renderFieldState, parseFieldState, changedFields,
   renderNewPlanIssueBody, renderPlanRegion, PLAN_FIELD_NAMES,
+  countDependencyRefSlots, DEPENDENCY_REF_SENTINEL, substituteDependencyRefs,
 } = issueBodyMod;
 
 const OPERATION_KIND = Object.freeze({ CREATE: 'create', UPDATE: 'update' } as const);
@@ -57,6 +58,15 @@ const OPERATION_REASON = Object.freeze({
   // the one plan whose parent is unresolved; every other plan in the same
   // run is unaffected.
   PARENT_UNRESOLVED: 'parent_unresolved',
+  // Plan 05-06 Task 2 (D-03/T-5-06): one reason serving two related refusals,
+  // both of which withhold a body rather than dispatch one carrying an
+  // unsubstituted or wrongly-bound slot — a structural disagreement between
+  // a rendered region's observed sentinel count and the plan's own
+  // `dependsOn` length (the anti-forgery guarantee plan 05-03 established),
+  // and a dependency plan whose `issue:plan:<depId>` completion resolves
+  // from neither a prior run nor a plan-create this run already pushed
+  // earlier in the same ascending-id pass.
+  DEPENDENCY_SLOT_MISMATCH: 'dependency_slot_mismatch',
 } as const);
 
 /** The `gsd:phase` label's own name, as declared in `GSD_LABELS` (github-sync-bootstrap-plan.cts) — never re-spelled. */
@@ -154,6 +164,8 @@ interface PendingIssueUpdate {
   milestoneKey: string;
   contentHash: string;
   completionContext: CompletionContext;
+  /** Plan 05-06: ordered dependency plan ids for the region's sentinel slots. Omitted (or empty) for a phase, which has no dependencies at all. */
+  dependsOn?: string[];
 }
 
 /** Plan 04-04 Task 1 (D-11): a phase whose completions still exist but is absent from the desired state. */
@@ -173,7 +185,8 @@ interface ReconciliationPlan {
       | typeof OPERATION_REASON.UNSAFE_TARGET
       | typeof OPERATION_REASON.REGION_DAMAGED
       | typeof OPERATION_REASON.FIELD_UNRESOLVED
-      | typeof OPERATION_REASON.PARENT_UNRESOLVED;
+      | typeof OPERATION_REASON.PARENT_UNRESOLVED
+      | typeof OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH;
     detail?: string;
   }>;
   uncertain: Array<{ reason: typeof OPERATION_REASON.REMOTE_UNAVAILABLE }>;
@@ -208,6 +221,54 @@ function planKeyFor(id: string): string {
 /** Phase 5: `issue:plan:<id>` — the plan sub-issue's own identity, mirroring `issue:phase:<id>`. */
 function planIssueKeyFor(id: string): string {
   return `issue:plan:${id}`;
+}
+
+/** Either a plain string argv entry or a typed refusal — never a body carrying an unsubstituted or wrongly-bound slot. */
+type BodyArgvResult =
+  | { kind: 'ok'; entry: ArgvEntry }
+  | { kind: 'mismatch'; detail: string };
+
+/**
+ * Plan 05-06 Task 2: the shared read-splice(-write) body composer — exported
+ * because `github-sync-issue-update.cts`'s PATCH path needs the identical
+ * composition for a spliced body, not merely this module's create path.
+ *
+ * Takes a body string carrying zero or more `DEPENDENCY_REF_SENTINEL` slots
+ * (plan 05-03) plus the ordered dependency plan ids those slots stand for,
+ * in document order, and returns either a plain string argv entry — the
+ * common, zero-dependency case, so the shape of every existing body write is
+ * unchanged — or an `ArgvConcat` whose parts alternate literal segments and
+ * `issue:plan:<depId>` NUMBER references prefixed with `#`, so GitHub
+ * renders each as a linked issue reference resolved at dispatch time
+ * (`resolveArgv`, plan 05-06 Task 1).
+ *
+ * Splits strictly positionally on the sentinel, deriving the observed slot
+ * count from the body itself rather than trusting the caller's declared
+ * dependency count (T-5-06's anti-forgery discipline, the same one
+ * `substituteDependencyRefs` established at the region layer): a
+ * disagreement against `dependsOn.length` returns a typed `mismatch` rather
+ * than a body, so a forged sentinel in developer text (a task name, a title)
+ * can never bind a reference to the wrong issue. No developer text is ever
+ * scanned for a token — `dependsOn` is GSD's own parsed data, never derived
+ * from the body string.
+ */
+function bodyArgvEntry(body: string, dependsOn: string[]): BodyArgvResult {
+  const slotCount = countDependencyRefSlots(body);
+  if (slotCount !== dependsOn.length) {
+    return {
+      kind: 'mismatch',
+      detail: `expected ${slotCount} dependency reference slot(s) in the body, received ${dependsOn.length} dependency id(s)`,
+    };
+  }
+  if (slotCount === 0) return { kind: 'ok', entry: `body=${body}` };
+
+  const segments: string[] = body.split(DEPENDENCY_REF_SENTINEL);
+  const parts: (string | ArgvRef)[] = [`body=${segments[0]}`];
+  dependsOn.forEach((depId: string, index: number) => {
+    parts.push({ from: planIssueKeyFor(depId), part: ARGV_REF_PART.NUMBER, prefix: '#' });
+    parts.push(segments[index + 1]);
+  });
+  return { kind: 'ok', entry: { parts } };
 }
 
 const PHASE_KEY_PREFIX = 'phase:';
@@ -758,6 +819,12 @@ const ADD_SUB_ISSUE_DOCUMENT =
  * hash therefore rides the LAST operation to write this logical key, exactly
  * the same "only the last write wins" discipline `buildFieldValueOperations`
  * already applies to `plannerFields.fieldState`.
+ *
+ * Plan 05-06 Task 2: `bodyEntry` is the caller's already-composed argv entry
+ * for `-f body=` — a plain string (no dependencies) or an `ArgvConcat`
+ * (`bodyArgvEntry`'s two shapes) — never rebuilt here, so the caller's own
+ * dependency-resolvability and slot-count checks (`planReconciliation`)
+ * cannot disagree with what this operation actually dispatches.
  */
 function buildCreatePlanIssueOperation(
   plan: DesiredPlan,
@@ -765,6 +832,7 @@ function buildCreatePlanIssueOperation(
   milestoneKey: string,
   restApiPath: string,
   context: CompletionContext,
+  bodyEntry: ArgvEntry,
 ): MutationOperation {
   const planLabel = GSD_LABELS.find((label) => label.name === PLAN_LABEL_NAME);
   const labelName = planLabel ? planLabel.name : PLAN_LABEL_NAME;
@@ -774,7 +842,7 @@ function buildCreatePlanIssueOperation(
     // raw -f flag — never the typed -F flag, which performs @-file and
     // {owner}/{repo} substitution on the value.
     '-f', `title=${plan.title}`,
-    '-f', `body=${renderNewPlanIssueBody({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks })}`,
+    '-f', bodyEntry,
     '-f', `labels[]=${labelName}`,
     '-F', { from: milestoneKey, part: ARGV_REF_PART.NUMBER, prefix: 'milestone=' },
   ];
@@ -855,6 +923,28 @@ function resolvedIssueNodeId(issueNodeIds: RemoteSnapshot['issueNodeIds'], issue
   if (issueNumber === undefined || issueNodeIds === null || typeof issueNodeIds !== 'object') return null;
   const value = (issueNodeIds as Record<string, unknown>)[String(issueNumber)];
   return isNonEmptyString(value) ? value : null;
+}
+
+/**
+ * Plan 05-06 Task 2: whether `depId`'s plan-issue completion will be
+ * resolvable by the time an `ArgvRef` naming it dispatches — either from a
+ * prior run's own `issue:plan:<depId>` completion (a non-empty node id), or
+ * from a plan-create/link operation THIS run already pushed earlier in the
+ * ascending-id plan pass (`operationsSoFar` is a live reference to the same
+ * array `planReconciliation` keeps appending to, so this check sees every
+ * operation pushed for a lower-sorting dependency). Mirrors the D-13
+ * parent-phase check's `parentResolvedFromMap || parentCreatedThisRun`
+ * shape, generalized from one fixed key to an arbitrary dependency id.
+ */
+function planDependencyResolvable(
+  depId: string,
+  completions: Record<string, StrictMapCompletion>,
+  operationsSoFar: MutationOperation[],
+): boolean {
+  const depIssueKey = planIssueKeyFor(depId);
+  const fromMap = Boolean(completions[depIssueKey]) && isNonEmptyString(completions[depIssueKey].nodeId);
+  const fromThisRun = operationsSoFar.some((op) => op.logicalKey === depIssueKey);
+  return fromMap || fromThisRun;
 }
 
 /**
@@ -1058,9 +1148,19 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
         continue;
       }
 
-      const planRegion = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+      const dependsOnForBound = plan.dependsOn ?? [];
+      const planRegion = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks, dependsOn: dependsOnForBound });
       const milestoneNumberForPlan = milestoneCompletionForPlans.issueNumber;
-      const desiredPlanHash = contentHash({ title: plan.title, region: planRegion, milestoneNumber: milestoneNumberForPlan });
+      // D-03 (plan 05-03): the hash is computed over the plan-id form — the
+      // dependency slots substituted with the depended-on plans' OWN ids, never
+      // the real issue numbers a dispatch later resolves — so a board rebuild
+      // that reassigns issue numbers can never move this plan's hash.
+      const planIdSubstitutionForBound = substituteDependencyRefs(planRegion, dependsOnForBound);
+      if (planIdSubstitutionForBound.kind === 'mismatch') {
+        blocked.push({ reason: OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH, detail: planIdSubstitutionForBound.detail });
+        continue;
+      }
+      const desiredPlanHash = contentHash({ title: plan.title, region: planIdSubstitutionForBound.text, milestoneNumber: milestoneNumberForPlan });
       const planContentConverged = planIssueCompletion.contentHash !== undefined && planIssueCompletion.contentHash === desiredPlanHash;
 
       const desiredPlanFieldValues = desiredPlanFieldValuesFor(plan, planLogicalKey);
@@ -1081,6 +1181,7 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
           milestoneKey: milestoneKey as string,
           contentHash: desiredPlanHash,
           completionContext: context,
+          dependsOn: dependsOnForBound,
         });
       }
       if (planChanged.length > 0) {
@@ -1126,11 +1227,43 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
       continue;
     }
 
-    const planRegion = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
-    const milestoneNumberForPlan = milestoneCompletionForPlans.issueNumber;
-    const desiredPlanHash = contentHash({ title: plan.title, region: planRegion, milestoneNumber: milestoneNumberForPlan });
+    // Phase 5 Task 2 (D-03/T-5-06): every dependency this plan declares must
+    // be resolvable by the time this create would dispatch — from a prior
+    // run's own issue:plan:<depId> completion, or from a plan-issue create
+    // this very run already pushed earlier in this same ascending-id pass.
+    // Mirrors the parent-phase check above, generalized to a plan's own
+    // dependency list: an unresolvable dependency refuses the WHOLE create
+    // (never a body carrying an unsubstituted slot), naming the missing key,
+    // and never suppresses a sibling plan.
+    const dependsOn = plan.dependsOn ?? [];
+    const unresolvedDependency = dependsOn.find((depId) => !planDependencyResolvable(depId, completions, operations));
+    if (unresolvedDependency !== undefined) {
+      blocked.push({ reason: OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH, detail: planIssueKeyFor(unresolvedDependency) });
+      continue;
+    }
 
-    operations.push(buildCreatePlanIssueOperation(plan, planIssueKey, milestoneKey as string, restApiPath, context));
+    const planRegion = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks, dependsOn });
+    const milestoneNumberForPlan = milestoneCompletionForPlans.issueNumber;
+    // D-03: contentHash rides the plan-id substitution — see the identical
+    // comment on the already-bound branch above.
+    const planIdSubstitution = substituteDependencyRefs(planRegion, dependsOn);
+    if (planIdSubstitution.kind === 'mismatch') {
+      blocked.push({ reason: OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH, detail: planIdSubstitution.detail });
+      continue;
+    }
+    const desiredPlanHash = contentHash({ title: plan.title, region: planIdSubstitution.text, milestoneNumber: milestoneNumberForPlan });
+
+    // The dispatched body, by contrast, carries the real (late-bound) issue
+    // numbers — bodyArgvEntry composes it from the SAME region, wrapped in
+    // the marker/fence pair, as an ArgvConcat resolved at apply time.
+    const fullPlanBody = renderNewPlanIssueBody({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks, dependsOn });
+    const bodyResult = bodyArgvEntry(fullPlanBody, dependsOn);
+    if (bodyResult.kind === 'mismatch') {
+      blocked.push({ reason: OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH, detail: bodyResult.detail });
+      continue;
+    }
+
+    operations.push(buildCreatePlanIssueOperation(plan, planIssueKey, milestoneKey as string, restApiPath, context, bodyResult.entry));
     operations.push(buildAddSubIssueOperation(plan.id, plan.phaseId, context, { contentHash: desiredPlanHash }));
     operations.push(operationFor(planLogicalKey, remote.target.projectNodeId, { from: planIssueKey }, remote.target));
 
@@ -1190,6 +1323,7 @@ export = {
   buildCreateIssueOperation,
   buildCreatePlanIssueOperation,
   buildAddSubIssueOperation,
+  bodyArgvEntry,
   ADD_SUB_ISSUE_DOCUMENT,
   buildFieldValueOperations,
   buildPlanFieldValueOperations,

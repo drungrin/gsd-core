@@ -5,7 +5,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { prepareIssueUpdates, ISSUE_UPDATE_REASON } = require('../gsd-core/bin/lib/github-sync-issue-update.cjs');
-const { FENCE_BEGIN, FENCE_END } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const { FENCE_BEGIN, FENCE_END, DEPENDENCY_REF_SENTINEL } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
 function fakeExecGh(responses) {
   const calls = [];
@@ -233,4 +233,59 @@ test("every read issues an explicit method flag (never gh's default), matching t
   const execGh = fakeExecGh([issueResponse(body)]);
   prepareIssueUpdates([pendingUpdate()], { cwd: '/f', execGh });
   assert.deepEqual(execGh.calls[0].args.slice(2, 4), ['-X', 'GET']);
+});
+
+// ─── Plan 05-06 Task 2: dependency-reference slots in the update path ──────
+
+test('a pending update whose region carries a dependency-reference sentinel splices into the fetched body and produces the same concatenating shape for its PATCH, with no labels entry anywhere', () => {
+  const region = `## Depends On\n\n${DEPENDENCY_REF_SENTINEL}`;
+  const body = `${FENCE_BEGIN}\nold\n${FENCE_END}`;
+  const execGh = fakeExecGh([issueResponse(body)]);
+  const update = pendingUpdate({ region, dependsOn: ['04-01'] });
+
+  const result = prepareIssueUpdates([update], { cwd: '/f', execGh });
+  assert.deepEqual(result.reports, []);
+  assert.equal(result.operations.length, 1);
+  const op = result.operations[0];
+
+  const bodyConcat = op.args.find((a) => a && typeof a === 'object' && Array.isArray(a.parts));
+  assert.ok(bodyConcat, 'the PATCH body argv entry must be a concatenating entry, not a plain string, when dependsOn is non-empty');
+  const refParts = bodyConcat.parts.filter((part) => typeof part === 'object');
+  assert.equal(refParts.length, 1);
+  assert.deepEqual(refParts[0], { from: 'issue:plan:04-01', part: 'number', prefix: '#' });
+  const literalParts = bodyConcat.parts.filter((part) => typeof part === 'string');
+  assert.ok(literalParts.every((part) => !part.includes(DEPENDENCY_REF_SENTINEL)), 'no literal segment carries the raw sentinel');
+  assert.ok(literalParts[0].startsWith('body='));
+
+  // Still no labels entry of any kind, exactly as the plain-body PATCH proves above.
+  for (const arg of op.args) {
+    if (typeof arg === 'string') assert.doesNotMatch(arg, /labels/i);
+    else if (arg && typeof arg === 'object' && !Array.isArray(arg.parts)) assert.notEqual(arg.prefix, 'labels[]=');
+  }
+});
+
+test('a pending update with zero dependencies produces a plain string body entry, exactly as before this plan', () => {
+  const body = `${FENCE_BEGIN}\nold\n${FENCE_END}`;
+  const execGh = fakeExecGh([issueResponse(body)]);
+  const update = pendingUpdate({ dependsOn: [] });
+
+  const result = prepareIssueUpdates([update], { cwd: '/f', execGh });
+  const op = result.operations[0];
+  assert.ok(op.args.some((a) => typeof a === 'string' && a.startsWith('body=')));
+  assert.equal(op.args.some((a) => a && typeof a === 'object' && Array.isArray(a.parts)), false);
+});
+
+test('a splice whose result carries a slot count different from the dependency count produces a typed refusal, not a dispatched body', () => {
+  const region = `## Depends On\n\n${DEPENDENCY_REF_SENTINEL}, ${DEPENDENCY_REF_SENTINEL}`; // two slots
+  const body = `${FENCE_BEGIN}\nold\n${FENCE_END}`;
+  const execGh = fakeExecGh([issueResponse(body)]);
+  const update = pendingUpdate({ region, dependsOn: ['04-01'] }); // only one dependency id
+
+  const result = prepareIssueUpdates([update], { cwd: '/f', execGh });
+  assert.deepEqual(result.operations, []);
+  assert.equal(result.reports.length, 1);
+  assert.equal(result.reports[0].reason, ISSUE_UPDATE_REASON.DEPENDENCY_SLOT_MISMATCH);
+  assert.equal(result.reports[0].logicalKey, update.logicalKey);
+  assert.match(result.reports[0].detail, /2/);
+  assert.match(result.reports[0].detail, /1/);
 });

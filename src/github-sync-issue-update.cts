@@ -36,7 +36,7 @@ import type { MutationOperation, ArgvRef, CompletionContext } from './github-syn
 
 const { OPERATION_TRANSPORT, OPERATION_ACTION, ARGV_REF_PART, decodeResponseRoot } = operationMod;
 const { spliceRegion, SPLICE_RESULT } = issueBodyMod;
-const { PATH_SAFE_TARGET, phaseIssueRestPath } = reconcileMod;
+const { PATH_SAFE_TARGET, phaseIssueRestPath, bodyArgvEntry } = reconcileMod;
 
 interface GhResult { exitCode: number; stdout: string; stderr: string; }
 
@@ -57,12 +57,23 @@ interface PendingIssueUpdate {
   milestoneKey: string;
   contentHash: string;
   completionContext: CompletionContext;
+  /** Plan 05-06: ordered dependency plan ids for the region's sentinel slots. Omitted (or empty) for a phase, which has no dependencies at all. */
+  dependsOn?: string[];
 }
 
-/** The two typed failure members (D-03/D-11's report-don't-destroy posture), spelled the same as `OPERATION_REASON.REGION_DAMAGED`. */
+/**
+ * The three typed failure members (D-03/D-11's report-don't-destroy
+ * posture). `REGION_DAMAGED` and `ISSUE_UNREADABLE` are spelled the same as
+ * `OPERATION_REASON.REGION_DAMAGED` in `github-sync-reconcile.cts`;
+ * `DEPENDENCY_SLOT_MISMATCH` (plan 05-06) is spelled the same as that
+ * module's `OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH` for the identical
+ * reason — a splice whose result carries a slot count that disagrees with
+ * the dependency count is a typed refusal, never a dispatched body.
+ */
 const ISSUE_UPDATE_REASON = Object.freeze({
   REGION_DAMAGED: 'region_damaged',
   ISSUE_UNREADABLE: 'issue_unreadable',
+  DEPENDENCY_SLOT_MISMATCH: 'dependency_slot_mismatch',
 } as const);
 type IssueUpdateReasonValue = typeof ISSUE_UPDATE_REASON[keyof typeof ISSUE_UPDATE_REASON];
 
@@ -165,6 +176,21 @@ function prepareIssueUpdates(pending: PendingIssueUpdate[], adapters: PrepareIss
       continue;
     }
 
+    // Plan 05-06 Task 2: the spliced body may carry dependency-reference
+    // sentinel slots (05-03) — route it through the same composer the
+    // create path uses, so a splice whose result carries a slot count that
+    // disagrees with `item.dependsOn` is reported, never dispatched.
+    const bodyResult = bodyArgvEntry(spliced.body, item.dependsOn ?? []);
+    if (bodyResult.kind === 'mismatch') {
+      reports.push({
+        logicalKey: item.logicalKey,
+        issueNumber: item.issueNumber,
+        reason: ISSUE_UPDATE_REASON.DEPENDENCY_SLOT_MISMATCH,
+        detail: bodyResult.detail,
+      });
+      continue;
+    }
+
     const milestoneRef: ArgvRef = { from: item.milestoneKey, part: ARGV_REF_PART.NUMBER, prefix: 'milestone=' };
     operations.push({
       kind: 'update-issue',
@@ -174,7 +200,7 @@ function prepareIssueUpdates(pending: PendingIssueUpdate[], adapters: PrepareIss
         // SECURITY: title/body ride the raw -f flag — never the typed -F
         // flag, which performs @-file and {owner}/{repo} substitution.
         '-f', `title=${item.title}`,
-        '-f', `body=${spliced.body}`,
+        '-f', bodyResult.entry,
         '-F', milestoneRef,
         // Deliberately no `labels[]=` entry of any kind (RESEARCH Pitfall 2).
       ],
