@@ -37,6 +37,8 @@ const {
   RENAME_FIELD_DOCUMENT,
   CREATE_VIEW_WITH_FIELDS_DOCUMENT,
   UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT,
+  CREATE_VIEW_DOCUMENT,
+  UPDATE_VIEW_SHAPE_DOCUMENT,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const { applyMutationPlan } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
 const { resolveArgv, decodeCompletions, ARGV_REF_PART: TOP_ARGV_REF_PART } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
@@ -55,6 +57,23 @@ function statusField(options) {
 
 function remoteResolved(options) {
   return { available: true, projectOutcome: 'resolved', statusField: statusField(options) };
+}
+
+/**
+ * Plan 06-02: Roadmap and Board declare no filter and no visible field, so
+ * `planViews` plans a create for either the moment `remote.projectOutcome`
+ * is `resolved` and no matching remote view is present — independent of
+ * `remote.fields`. Tests in this describe block predate the views stage and
+ * assert on `plan.operations`/`plan.checkpoints` counts that are meant to
+ * isolate Status/Autonomous behavior; seeding both as already-converged
+ * observed views keeps those counts exactly what they were before Phase 6,
+ * without disabling the views stage or special-casing it.
+ */
+function seedBareViewsConverged() {
+  return [
+    { id: 'PVTV_roadmap_seed', name: 'Roadmap', layout: 'ROADMAP_LAYOUT', filter: null },
+    { id: 'PVTV_board_seed', name: 'Board', layout: 'BOARD_LAYOUT', filter: null },
+  ];
 }
 
 function field(id, name, dataType, options = null) {
@@ -379,7 +398,7 @@ describe('planBootstrap', () => {
   });
 
   test('the structure pass emits zero option operations; the options pass emits zero structure operations (disjoint passes)', () => {
-    const remote = remoteResolved([]);
+    const remote = { ...remoteResolved([]), views: seedBareViewsConverged() };
     const structurePlan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.STRUCTURE });
     assert.deepEqual(structurePlan.operations, []);
     const optionsPlan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
@@ -432,7 +451,7 @@ describe('BOOTSTRAP_LOGICAL_KEY.autonomousOption', () => {
 // ─── end-to-end through the real applier ───────────────────────────────────
 
 test('a converged plan folds through the real applyMutationPlan and writes zero times on the second run', () => {
-  const remote = remoteResolved([opt('id-todo', 'Todo'), opt('id-inprogress', 'In Progress'), opt('id-blocked', 'Blocked'), opt('id-done', 'Done'), opt('id-deferred', 'Deferred')]);
+  const remote = { ...remoteResolved([opt('id-todo', 'Todo'), opt('id-inprogress', 'In Progress'), opt('id-blocked', 'Blocked'), opt('id-done', 'Done'), opt('id-deferred', 'Deferred')]), views: seedBareViewsConverged() };
   const plan = planBootstrap({
     desired: { available: true }, remote, strictMap: { kind: 'absent' },
     target: { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 },
@@ -448,7 +467,11 @@ test('a converged plan folds through the real applyMutationPlan and writes zero 
   });
   assert.equal(first.kind, 'completed');
   assert.equal(writes.length, 1);
-  assert.equal(Object.keys(first.map.completions).length, 5);
+  // 5 Status option checkpoints plus Roadmap/Board's own converged
+  // checkpoints (seedBareViewsConverged) — Table-by-Phase/By-Wave/Backlog
+  // each declare a visible field this remote's empty `fields` list cannot
+  // resolve, so they contribute a blocked entry each, never a completion.
+  assert.equal(Object.keys(first.map.completions).length, 7);
 
   const second = applyMutationPlan(plan, {
     cwd: '/repo', map: first.map,
@@ -899,14 +922,28 @@ function remoteView(id, name, layout, filter = null) {
   return { id, name, layout, filter };
 }
 
-/** A resolved remote carrying an arbitrary views list plus a fields list (Status by default so the one D-08 spec this plan ships, Backlog, always resolves). */
-function remoteWithViews(views, fields = [field('PVTSSF_status', 'Status', 'SINGLE_SELECT', [])]) {
+/** Phase, Wave, and Status field nodes — resolves every D-08 visible-field declaration. */
+function fieldsForViews() {
+  return [
+    field('PVTF_phase', 'Phase', 'TEXT'),
+    field('PVTF_wave', 'Wave', 'NUMBER'),
+    field('PVTSSF_status', 'Status', 'SINGLE_SELECT', []),
+  ];
+}
+
+/** A resolved remote carrying an arbitrary views list plus a fields list (Phase/Wave/Status by default, so every D-08 view resolves). */
+function remoteWithViews(views, fields = fieldsForViews()) {
   return { available: true, projectOutcome: 'resolved', statusField: null, fields, views };
 }
 
 describe('BOOTSTRAP_LOGICAL_KEY.view', () => {
   test('slugs a view name into the reserved view: namespace', () => {
     assert.equal(BOOTSTRAP_LOGICAL_KEY.view('Backlog'), 'view:backlog');
+  });
+
+  test('slugs multi-word, hyphenated view names the same way', () => {
+    assert.equal(BOOTSTRAP_LOGICAL_KEY.view('Table-by-Phase'), 'view:table-by-phase');
+    assert.equal(BOOTSTRAP_LOGICAL_KEY.view('By-Wave'), 'view:by-wave');
   });
 });
 
@@ -922,110 +959,143 @@ describe('viewFieldIdsArgv', () => {
 });
 
 describe('GSD_VIEWS', () => {
-  test('this plan declares exactly one view: Backlog, TABLE layout, the -status:Done filter, Status visible', () => {
-    assert.equal(GSD_VIEWS.length, 1);
-    assert.deepEqual(GSD_VIEWS[0], { name: 'Backlog', layout: VIEW_LAYOUT.TABLE, filter: '-status:Done', visibleFieldNames: ['Status'] });
+  test('declares all five D-08 views, in order: Roadmap, Board, Table-by-Phase, By-Wave, Backlog', () => {
+    assert.deepEqual(GSD_VIEWS.map((v) => v.name), ['Roadmap', 'Board', 'Table-by-Phase', 'By-Wave', 'Backlog']);
+  });
+
+  test('layouts match D-08: ROADMAP, BOARD, TABLE, TABLE, TABLE', () => {
+    assert.deepEqual(GSD_VIEWS.map((v) => v.layout), [VIEW_LAYOUT.ROADMAP, VIEW_LAYOUT.BOARD, VIEW_LAYOUT.TABLE, VIEW_LAYOUT.TABLE, VIEW_LAYOUT.TABLE]);
+  });
+
+  test('Roadmap and Board carry no filter and no visible fields', () => {
+    assert.deepEqual(GSD_VIEWS[0], { name: 'Roadmap', layout: VIEW_LAYOUT.ROADMAP, filter: null, visibleFieldNames: [] });
+    assert.deepEqual(GSD_VIEWS[1], { name: 'Board', layout: VIEW_LAYOUT.BOARD, filter: null, visibleFieldNames: [] });
+  });
+
+  test('Table-by-Phase, By-Wave, and Backlog carry their D-08 filters and visible fields', () => {
+    assert.deepEqual(GSD_VIEWS[2], { name: 'Table-by-Phase', layout: VIEW_LAYOUT.TABLE, filter: 'label:gsd:phase', visibleFieldNames: ['Phase', 'Status'] });
+    assert.deepEqual(GSD_VIEWS[3], { name: 'By-Wave', layout: VIEW_LAYOUT.TABLE, filter: 'label:gsd:plan', visibleFieldNames: ['Wave', 'Phase', 'Status'] });
+    assert.deepEqual(GSD_VIEWS[4], { name: 'Backlog', layout: VIEW_LAYOUT.TABLE, filter: '-status:Done', visibleFieldNames: ['Status'] });
   });
 });
 
-describe('planViews', () => {
-  test('an empty views list with a resolvable Status field emits exactly two operations: create-view then update-view, both keyed view:backlog', () => {
+describe('planViews: fresh-board sequence (plan 06-02 Task 1)', () => {
+  test('a fresh board (no views, every visible field present) emits exactly 8 operations: 5 create-view and 3 update-view, each filtered view\'s create immediately preceding its own update', () => {
     const result = planViews(remoteWithViews([]), { kind: 'absent' }, CONTEXT);
-    assert.equal(result.operations.length, 2);
-    assert.equal(result.operations[0].kind, 'create-view');
-    assert.equal(result.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
-    assert.equal(result.operations[1].kind, 'update-view');
-    assert.equal(result.operations[1].logicalKey, BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
-    assert.equal(result.checkpoints.length, 0);
     assert.equal(result.blocked.length, 0);
+    assert.deepEqual(result.operations.map((o) => o.logicalKey), [
+      BOOTSTRAP_LOGICAL_KEY.view('Roadmap'),
+      BOOTSTRAP_LOGICAL_KEY.view('Board'),
+      BOOTSTRAP_LOGICAL_KEY.view('Table-by-Phase'),
+      BOOTSTRAP_LOGICAL_KEY.view('Table-by-Phase'),
+      BOOTSTRAP_LOGICAL_KEY.view('By-Wave'),
+      BOOTSTRAP_LOGICAL_KEY.view('By-Wave'),
+      BOOTSTRAP_LOGICAL_KEY.view('Backlog'),
+      BOOTSTRAP_LOGICAL_KEY.view('Backlog'),
+    ]);
+    assert.deepEqual(result.operations.map((o) => o.kind), [
+      'create-view', 'create-view', 'create-view', 'update-view', 'create-view', 'update-view', 'create-view', 'update-view',
+    ]);
+    assert.equal(result.operations.filter((o) => o.kind === 'create-view').length, 5);
+    assert.equal(result.operations.filter((o) => o.kind === 'update-view').length, 3);
   });
 
-  test('the create-view argv carries name=Backlog, layout=TABLE_LAYOUT, an ArgvRef to the project key, and the Status field id through the visibleFieldIds encoding', () => {
+  test('the Roadmap create carries layout=ROADMAP_LAYOUT and no fieldIds entry of any form; the Board create carries layout=BOARD_LAYOUT and no fieldIds entry', () => {
     const result = planViews(remoteWithViews([]), { kind: 'absent' }, CONTEXT);
-    const createOp = result.operations[0];
-    assert.ok(createOp.args.includes('name=Backlog'));
-    assert.ok(createOp.args.includes('layout=TABLE_LAYOUT'));
-    const projectRef = createOp.args.find((a) => typeof a === 'object' && a !== null && a.from === BOOTSTRAP_LOGICAL_KEY.project());
+    const roadmapCreate = result.operations[0];
+    assert.ok(roadmapCreate.args.includes('name=Roadmap'));
+    assert.ok(roadmapCreate.args.includes('layout=ROADMAP_LAYOUT'));
+    assert.equal(roadmapCreate.args.some((a) => typeof a === 'string' && a.startsWith('fieldIds[]=')), false);
+    const boardCreate = result.operations[1];
+    assert.ok(boardCreate.args.includes('name=Board'));
+    assert.ok(boardCreate.args.includes('layout=BOARD_LAYOUT'));
+    assert.equal(boardCreate.args.some((a) => typeof a === 'string' && a.startsWith('fieldIds[]=')), false);
+  });
+
+  test('Roadmap and Board each emit exactly one operation (a bare create, no follow-up update) carrying one node capture', () => {
+    const result = planViews(remoteWithViews([]), { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Roadmap')).length, 1);
+    assert.equal(result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Board')).length, 1);
+    const roadmapCreate = result.operations[0];
+    assert.equal(roadmapCreate.kind, 'create-view');
+    assert.equal(roadmapCreate.captures.length, 1);
+    assert.equal(roadmapCreate.captures[0].kind, 'node');
+    assert.equal(roadmapCreate.captures[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.view('Roadmap'));
+    assert.equal(roadmapCreate.captures[0].nodeIdPath, 'createProjectV2View.projectV2View.id');
+  });
+
+  test('the project id rides an ArgvRef on a bare create, the same way it does on the with-fields create', () => {
+    const result = planViews(remoteWithViews([]), { kind: 'absent' }, CONTEXT);
+    const roadmapCreate = result.operations[0];
+    const projectRef = roadmapCreate.args.find((a) => typeof a === 'object' && a !== null && a.from === BOOTSTRAP_LOGICAL_KEY.project());
     assert.ok(projectRef, 'must carry an ArgvRef to the project key');
     assert.equal(projectRef.part, TOP_ARGV_REF_PART.NODE_ID);
     assert.equal(projectRef.prefix, 'projectId=');
-    assert.ok(createOp.args.includes('fieldIds[]=PVTSSF_status'));
   });
 
-  test('the create-view operation carries exactly one node capture: logicalKey view:backlog, nodeIdPath createProjectV2View.projectV2View.id', () => {
+  test('the By-Wave create carries three field ids, resolved from the snapshot, in the specification\'s declared order: Wave, Phase, Status', () => {
     const result = planViews(remoteWithViews([]), { kind: 'absent' }, CONTEXT);
-    const createOp = result.operations[0];
-    assert.equal(createOp.captures.length, 1);
-    assert.equal(createOp.captures[0].kind, 'node');
-    assert.equal(createOp.captures[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
-    assert.equal(createOp.captures[0].nodeIdPath, 'createProjectV2View.projectV2View.id');
+    const byWaveCreate = result.operations.find((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('By-Wave') && o.kind === 'create-view');
+    assert.deepEqual(
+      byWaveCreate.args.filter((a) => typeof a === 'string' && a.startsWith('fieldIds[]=')),
+      ['fieldIds[]=PVTF_wave', 'fieldIds[]=PVTF_phase', 'fieldIds[]=PVTSSF_status'],
+    );
   });
 
-  test('the update-view argv carries filter=-status:Done and resolves viewId through an ArgvRef from view:backlog (never a literal) when created in the same plan', () => {
+  test('each filtered view\'s filter lands on its update, never its create', () => {
     const result = planViews(remoteWithViews([]), { kind: 'absent' }, CONTEXT);
-    const updateOp = result.operations[1];
-    assert.ok(updateOp.args.includes('filter=-status:Done'));
-    const viewIdRef = updateOp.args.find((a) => typeof a === 'object' && a !== null && typeof a.from === 'string' && a.prefix === 'viewId=');
-    assert.ok(viewIdRef, 'must carry a viewId ArgvRef');
-    assert.equal(viewIdRef.from, BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
-    assert.equal(viewIdRef.part, TOP_ARGV_REF_PART.NODE_ID);
-    assert.equal(updateOp.args.some((a) => typeof a === 'string' && a.startsWith('viewId=')), false);
+    const tableByPhaseCreate = result.operations.find((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Table-by-Phase') && o.kind === 'create-view');
+    assert.equal(tableByPhaseCreate.args.some((a) => typeof a === 'string' && a.startsWith('filter=')), false);
+    const tableByPhaseUpdate = result.operations.find((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Table-by-Phase') && o.kind === 'update-view');
+    assert.ok(tableByPhaseUpdate.args.includes('filter=label:gsd:phase'));
+    const byWaveUpdate = result.operations.find((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('By-Wave') && o.kind === 'update-view');
+    assert.ok(byWaveUpdate.args.includes('filter=label:gsd:plan'));
+    const backlogUpdate = result.operations.find((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog') && o.kind === 'update-view');
+    assert.ok(backlogUpdate.args.includes('filter=-status:Done'));
   });
 
-  test('every operation and checkpoint planViews emits carries stage: BOOTSTRAP_STAGE.VIEWS', () => {
-    const created = planViews(remoteWithViews([]), { kind: 'absent' }, CONTEXT);
-    for (const op of created.operations) assert.equal(op.stage, BOOTSTRAP_STAGE.VIEWS);
-
-    const converged = planViews(remoteWithViews([remoteView('PVTV_1', 'Backlog', 'TABLE_LAYOUT', '-status:Done')]), { kind: 'absent' }, CONTEXT);
-    for (const cp of converged.checkpoints) assert.equal(cp.stage, BOOTSTRAP_STAGE.VIEWS);
+  test('no argv entry, and neither new document constant, contains a grouping or sort field name', () => {
+    const result = planViews(remoteWithViews([]), { kind: 'absent' }, CONTEXT);
+    for (const op of result.operations) {
+      for (const entry of op.args) {
+        const text = typeof entry === 'string' ? entry : JSON.stringify(entry);
+        assert.doesNotMatch(text, /roupBy/);
+        assert.doesNotMatch(text, /sortBy/);
+      }
+    }
+    for (const doc of [CREATE_VIEW_DOCUMENT, UPDATE_VIEW_SHAPE_DOCUMENT]) {
+      assert.doesNotMatch(doc, /roupBy/);
+      assert.doesNotMatch(doc, /sortBy/);
+    }
   });
 
-  test('a remote view already matching name, layout, and filter emits zero operations and one checkpoint keyed view:backlog carrying its observed node id', () => {
-    const result = planViews(remoteWithViews([remoteView('PVTV_1', 'Backlog', 'TABLE_LAYOUT', '-status:Done')]), { kind: 'absent' }, CONTEXT);
-    assert.equal(result.operations.length, 0);
-    assert.equal(result.checkpoints.length, 1);
-    assert.equal(result.checkpoints[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
-    assert.equal(result.checkpoints[0].nodeId, 'PVTV_1');
-  });
-
-  test('a sync map holding view:backlog -> an id present in the remote views list under a different name resolves by id and emits one update-view restoring the name, never a second create', () => {
-    const strictMap = { kind: 'valid', map: { completions: { [BOOTSTRAP_LOGICAL_KEY.view('Backlog')]: { nodeId: 'PVTV_renamed' } } } };
-    const remote = remoteWithViews([remoteView('PVTV_renamed', 'Something Else', 'TABLE_LAYOUT', '-status:Done')]);
-    const result = planViews(remote, strictMap, CONTEXT);
-    assert.equal(result.operations.length, 1);
-    assert.equal(result.operations[0].kind, 'update-view');
-    assert.equal(result.operations.filter((o) => o.kind === 'create-view').length, 0);
-    const nameArg = result.operations[0].args.find((a) => typeof a === 'string' && a.startsWith('name='));
-    assert.equal(nameArg, 'name=Backlog');
-    const viewIdArg = result.operations[0].args.find((a) => typeof a === 'string' && a.startsWith('viewId='));
-    assert.equal(viewIdArg, 'viewId=PVTV_renamed');
-  });
-
-  test('no field named Status on the remote emits zero view operations and one blocked entry, never a create that silently omits the field', () => {
-    const result = planViews(remoteWithViews([], []), { kind: 'absent' }, CONTEXT);
-    assert.equal(result.operations.length, 0);
-    assert.equal(result.checkpoints.length, 0);
-    assert.equal(result.blocked.length, 1);
-    assert.equal(result.blocked[0].reason, BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED);
-  });
-
-  test('every operation and checkpoint planViews emits carries the supplied completion context verbatim', () => {
+  test('every operation carries stage: BOOTSTRAP_STAGE.VIEWS and the supplied completion context verbatim', () => {
     const context = { owner: 'zzz', repo: 'zzz-repo', repositoryNumber: 999 };
-    const created = planViews(remoteWithViews([]), { kind: 'absent' }, context);
-    for (const op of created.operations) assert.deepEqual(op.completionContext, context);
-    const converged = planViews(remoteWithViews([remoteView('PVTV_1', 'Backlog', 'TABLE_LAYOUT', '-status:Done')]), { kind: 'absent' }, context);
-    for (const cp of converged.checkpoints) assert.deepEqual(cp.completionContext, context);
+    const result = planViews(remoteWithViews([]), { kind: 'absent' }, context);
+    assert.ok(result.operations.length > 0);
+    for (const op of result.operations) {
+      assert.equal(op.stage, BOOTSTRAP_STAGE.VIEWS);
+      assert.deepEqual(op.completionContext, context);
+    }
   });
 });
 
-describe('mutation document parity: view documents (D-06)', () => {
-  test('CREATE_VIEW_WITH_FIELDS_DOCUMENT carries no filter variable (RESEARCH Pitfall 2: only update can set filter)', () => {
+describe('mutation document parity: view documents (D-06 / plan 06-02 Task 1)', () => {
+  test('CREATE_VIEW_WITH_FIELDS_DOCUMENT and CREATE_VIEW_DOCUMENT both carry no filter variable (only update can set filter)', () => {
     assert.doesNotMatch(CREATE_VIEW_WITH_FIELDS_DOCUMENT, /\bfilter\b/);
+    assert.doesNotMatch(CREATE_VIEW_DOCUMENT, /\bfilter\b/);
   });
 
-  test('neither view document selects rateLimit', () => {
+  test('CREATE_VIEW_DOCUMENT and UPDATE_VIEW_SHAPE_DOCUMENT carry no configuration input at all', () => {
+    assert.doesNotMatch(CREATE_VIEW_DOCUMENT, /configuration/);
+    assert.doesNotMatch(UPDATE_VIEW_SHAPE_DOCUMENT, /configuration/);
+  });
+
+  test('none of the four view documents selects rateLimit', () => {
     assert.doesNotMatch(CREATE_VIEW_WITH_FIELDS_DOCUMENT, /rateLimit/);
     assert.doesNotMatch(UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT, /rateLimit/);
+    assert.doesNotMatch(CREATE_VIEW_DOCUMENT, /rateLimit/);
+    assert.doesNotMatch(UPDATE_VIEW_SHAPE_DOCUMENT, /rateLimit/);
   });
 
   test('CREATE_VIEW_WITH_FIELDS_DOCUMENT is byte-identical to BOOTSTRAP_DOCUMENTS.createViewWithFields', () => {
@@ -1034,6 +1104,14 @@ describe('mutation document parity: view documents (D-06)', () => {
 
   test('UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT is byte-identical to BOOTSTRAP_DOCUMENTS.updateViewShapeWithFilter', () => {
     assert.equal(UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT, bootstrapRemote.BOOTSTRAP_DOCUMENTS.updateViewShapeWithFilter);
+  });
+
+  test('CREATE_VIEW_DOCUMENT is byte-identical to BOOTSTRAP_DOCUMENTS.createView', () => {
+    assert.equal(CREATE_VIEW_DOCUMENT, bootstrapRemote.BOOTSTRAP_DOCUMENTS.createView);
+  });
+
+  test('UPDATE_VIEW_SHAPE_DOCUMENT is byte-identical to BOOTSTRAP_DOCUMENTS.updateViewShape', () => {
+    assert.equal(UPDATE_VIEW_SHAPE_DOCUMENT, bootstrapRemote.BOOTSTRAP_DOCUMENTS.updateViewShape);
   });
 });
 
@@ -1660,9 +1738,16 @@ describe('planBootstrap run-fatal suppression', () => {
     assert.ok(structurePlan.operations.length > 0, 'structure pass must plan the missing Phase field');
     assert.equal(structurePlan.blocked.length, 0);
 
+    // fatalRemote deliberately omits `Phase` from `fields` (proving the
+    // structure pass's own field-create path above) — the same omission
+    // also leaves Table-by-Phase's AND By-Wave's declared visible fields
+    // unresolved in the options pass (By-Wave declares Phase too, beyond
+    // Wave), two blocked entries independent of the Status merge this test
+    // otherwise exercises.
     const optionsPlan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target: fatalTarget() }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.ok(optionsPlan.operations.length > 0, 'options pass must plan the missing Status option');
-    assert.equal(optionsPlan.blocked.length, 0);
+    assert.equal(optionsPlan.blocked.length, 2);
+    assert.ok(optionsPlan.blocked.every((b) => b.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED));
   });
 
   // ── plan 03-05 Task 3: the run-fatal criterion plan 03-04 could not carry ──
@@ -1705,6 +1790,7 @@ describe('planBootstrap options pass wiring', () => {
       available: true, projectOutcome: 'resolved',
       statusField: statusField([opt('id-todo', 'Todo', 'GRAY', '')]),
       fields: [{ id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-extra', 'Extra', 'PURPLE', '')] }],
+      views: seedBareViewsConverged(),
     };
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.equal(plan.operations.length, 2);
@@ -1713,7 +1799,7 @@ describe('planBootstrap options pass wiring', () => {
   });
 
   test('Autonomous absent from the snapshot: the options pass still plans the Status merge alone', () => {
-    const remote = { available: true, projectOutcome: 'resolved', statusField: statusField([opt('id-todo', 'Todo', 'GRAY', '')]), fields: [] };
+    const remote = { available: true, projectOutcome: 'resolved', statusField: statusField([opt('id-todo', 'Todo', 'GRAY', '')]), fields: [], views: seedBareViewsConverged() };
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.equal(plan.operations.length, 1);
     assert.equal(plan.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.field(STATUS_FIELD_NAME));
@@ -1793,13 +1879,18 @@ describe('planBootstrap options pass: autonomous checkpoints thread through ever
       available: true, projectOutcome: 'resolved',
       statusField: statusField([opt('id-todo', 'Todo', 'GRAY', ''), opt('id-inprogress', 'In Progress', 'BLUE', ''), opt('id-blocked', 'Blocked', 'RED', ''), opt('id-done', 'Done', 'GREEN', ''), opt('id-deferred', 'Deferred', 'YELLOW', '')]),
       fields: [{ id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', '')] }],
+      views: seedBareViewsConverged(),
     };
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.equal(plan.operations.length, 0);
-    assert.equal(plan.checkpoints.length, 7);
+    // 5 Status option checkpoints + 2 Autonomous option checkpoints + 2 more
+    // from Roadmap/Board's own seeded-converged views (plan 06-02) — nine.
+    assert.equal(plan.checkpoints.length, 9);
     assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')));
     assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')));
     assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.statusOption('Todo')));
+    assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Roadmap')));
+    assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Board')));
   });
 
   test('merge.kind operation (Status divergent, Autonomous independently converged): the Status write dispatches and the two autonomous checkpoints still surface — checkpoints are not exclusively a converged-branch concept', () => {
@@ -1807,12 +1898,17 @@ describe('planBootstrap options pass: autonomous checkpoints thread through ever
       available: true, projectOutcome: 'resolved',
       statusField: statusField([opt('id-todo', 'Todo', 'GRAY', '')]), // missing four GSD options -> divergent -> operation branch
       fields: [{ id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', '')] }], // exactly Yes/No -> converged
+      views: seedBareViewsConverged(),
     };
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.equal(plan.operations.length, 1);
     assert.equal(plan.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.field(STATUS_FIELD_NAME));
-    assert.equal(plan.checkpoints.length, 2);
-    assert.ok(plan.checkpoints.every((c) => c.logicalKey.startsWith('option:autonomous:')));
+    // 2 Autonomous option checkpoints + 2 from Roadmap/Board's own
+    // seeded-converged views — checkpoints are not exclusively a
+    // converged-Status-branch concept, and views checkpoint independently.
+    assert.equal(plan.checkpoints.length, 4);
+    assert.equal(plan.checkpoints.filter((c) => c.logicalKey.startsWith('option:autonomous:')).length, 2);
+    assert.equal(plan.checkpoints.filter((c) => c.logicalKey.startsWith('view:')).length, 2);
   });
 });
 
