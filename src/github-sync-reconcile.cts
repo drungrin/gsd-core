@@ -631,9 +631,15 @@ function buildFieldValueOperations(
  *   Wave cell needs a `clearProjectV2ItemFieldValue` mutation this capability
  *   has never called). When non-null, `wave`'s value is the one argv entry
  *   in this builder that is a validated positive integer rather than a
- *   developer string; it still rides the raw `-f` flag, because
- *   `github-sync-operation.cts`'s SECURITY rule records that new code always
- *   does and there is no typing benefit.
+ *   developer string. LIVE FINDING (05-08): it rides the typed `-F` flag, not
+ *   `-f` — `UPDATE_FIELD_VALUE_NUMBER_DOCUMENT` declares `$value: Float!`,
+ *   and GitHub's GraphQL endpoint refuses to coerce the raw-string encoding
+ *   `-f` produces ("Could not coerce value \"1\" to Float", reproduced live
+ *   against board #10). `-F` lets `gh` send a JSON number instead, which the
+ *   live schema accepts. This corrects this comment's own prior claim that
+ *   there was no typing benefit; `github-sync-operation.cts`'s SECURITY rule
+ *   permits `-F` for exactly this case (a validated positive integer, never
+ *   developer text).
  */
 function buildPlanFieldValueOperations(
   plan: DesiredPlan,
@@ -692,6 +698,18 @@ function buildPlanFieldValueOperations(
 
   const operations: MutationOperation[] = resolved.map((entry, index) => {
     const isLast = index === resolved.length - 1;
+    // LIVE FINDING (05-08): $value is declared Float! in
+    // UPDATE_FIELD_VALUE_NUMBER_DOCUMENT. `gh api graphql -f value=<n>` sends
+    // the value as a raw JSON string, which GraphQL refuses to coerce to
+    // Float! ("Could not coerce value \"1\" to Float", reproduced live
+    // against board #10, 2026-08-03). The typed -F flag lets gh's own
+    // type-guessing send a JSON number instead, which the live schema
+    // accepts. This is squarely inside the SECURITY rule's documented
+    // exception (github-sync-operation.cts): Wave is a validated positive
+    // integer (parsed via /^wave:\s*(\d+)\s*$/), never a developer string, so
+    // -F carries no forgery risk here — only the NUMBER-typed value entry
+    // uses it; every other value on this operation stays on -f.
+    const valueFlag = entry.dataType === FIELD_VALUE_DATA_TYPE.NUMBER ? '-F' : '-f';
     const args: ArgvEntry[] = [
       'api', 'graphql',
       '-f', `query=${documentForFieldType(entry.dataType)}`,
@@ -700,7 +718,7 @@ function buildPlanFieldValueOperations(
       '-f', { from: BOOTSTRAP_LOGICAL_KEY.project(), part: ARGV_REF_PART.NODE_ID, prefix: 'projectId=' },
       '-f', { from: projectItemKey, part: ARGV_REF_PART.NODE_ID, prefix: 'itemId=' },
       '-f', `fieldId=${entry.fieldId}`,
-      '-f', entry.valueEntry,
+      valueFlag, entry.valueEntry,
     ];
 
     return {

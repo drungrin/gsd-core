@@ -1125,13 +1125,16 @@ test('buildPlanFieldValueOperations: two plans sharing a Wave value each produce
   assert.ok(resultB.operations.every((op) => op.logicalKey === 'plan:02-02'));
 });
 
-test('buildPlanFieldValueOperations: the Wave write uses the NUMBER document and carries a validated integer literal on the raw flag', () => {
+test('buildPlanFieldValueOperations: the Wave write uses the NUMBER document and carries a validated integer literal on the typed flag (LIVE FINDING 05-08: GraphQL Float! rejects the raw-string encoding)', () => {
   const plan = planFieldFixture({ wave: 7 });
   const result = buildPlanFieldValueOperations(plan, ['wave'], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
   assert.equal(result.operations.length, 1);
   assert.match(queryOf(result.operations[0]), /value:\{number:\$value\}/);
-  assert.ok(result.operations[0].args.includes('value=7'));
-  assert.equal(result.operations[0].args.filter((arg) => arg === '-F').length, 0, 'Wave still rides the raw flag despite being a validated integer');
+  const args = result.operations[0].args;
+  const valueIndex = args.indexOf('value=7');
+  assert.ok(valueIndex > 0, 'value=7 present in args');
+  assert.equal(args[valueIndex - 1], '-F', 'Wave rides the typed flag so GitHub can coerce it to Float!');
+  assert.equal(args.filter((arg) => arg === '-F').length, 1, 'exactly one -F flag on this operation (the Wave value only)');
 });
 
 test('buildPlanFieldValueOperations: no field-write operation\'s query= argv entry contains any plan title, task name, requirement id, or phase id text (T-5-01 injection control)', () => {

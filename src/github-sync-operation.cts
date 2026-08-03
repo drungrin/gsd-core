@@ -43,7 +43,12 @@
  * operation (the prior sole exception) was rewritten to put its node ids on
  * the raw flag too, closing the one case that used to justify the typed
  * flag's node-id allowance. New code puts node ids on the raw flag: there is
- * no typing benefit and the raw flag is strictly safer. This module does not itself choose `-f`/`-F` — that choice lives in
+ * no typing benefit and the raw flag is strictly safer. LIVE FINDING
+ * (05-08): the exception for validated positive integers is exercised by
+ * `github-sync-reconcile.cts`'s plan `Wave` field write — a GraphQL `Float!`
+ * variable rejects the raw-string encoding `-f` produces, so that one value
+ * entry rides `-F`, proven live against board #10. This module does not
+ * itself choose `-f`/`-F` — that choice lives in
  * each `ArgvEntry`'s literal flag string, supplied by the operation's
  * builder — but the rule is recorded here so no builder has to rediscover
  * it.
