@@ -7,6 +7,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { stateExtractField } from './state-document.cjs';
 
 const DESIRED_REASON = Object.freeze({
   OK: 'ok',
@@ -51,12 +52,14 @@ interface DesiredPlan {
   wave: number | null;
   autonomous: boolean;
   requirements: string[];
+  /** Ordered, trimmed `depends_on` plan ids, empties dropped. Empty when the plan declares none — a real state, never an unavailable read. Unresolved/unknown/self-referential ids parse cleanly; resolution is a later stage's concern, not this parser's. */
+  dependsOn: string[];
   complete: boolean;
   /** D-04: the sub-issue title, via `planTitleFor`'s three-tier fallback chain — total by construction, never empty. */
   title: string;
   /** D-01: the PLAN.md body's `<task>`/`<name>` blocks, in document order, no deduplication. */
   tasks: string[];
-  /** Plan 05-01's tracer scope: the two-state form `plan.complete ? DONE : TODO`. Plan 05-02 replaces this with D-09's three-state `derivePlanStatus`. */
+  /** D-09/PLAN-02..04, via `derivePlanStatus`: total by construction, exactly one of the three `PHASE_STATUS` members. */
   status: PhaseStatus;
 }
 
@@ -82,6 +85,8 @@ interface DesiredState {
   phases: DesiredPhase[];
   plans: DesiredPlan[];
   currentPhase: string | null;
+  /** D-09: the plan id at STATE.md's own recorded position, via `parseCurrentPlan` — sourced from the STATE.md string this function already reads, never a second read. Null when STATE.md asserts no position, in which case no plan is In Progress. */
+  currentPlan: string | null;
   milestones: DesiredMilestone[];
   /** Titles of desired-milestone entries discarded by dedupeMilestonesByVersion (D-26 identity, cycle-2 non-HIGH #5). */
   duplicateMilestones: string[];
@@ -94,6 +99,7 @@ function unavailable(): DesiredState {
     phases: [],
     plans: [],
     currentPhase: null,
+    currentPlan: null,
     milestones: [],
     duplicateMilestones: [],
   };
@@ -203,6 +209,24 @@ function derivePhaseStatus(id: string, checklist: Map<string, boolean>, currentP
   return id === currentPhaseId ? PHASE_STATUS.IN_PROGRESS : PHASE_STATUS.TODO;
 }
 
+/**
+ * PLAN-02/PLAN-03/PLAN-04 collapsed into the one total function D-09
+ * requires, mirroring `derivePhaseStatus`'s exact two-branch shape:
+ * `complete === true` returns Done unconditionally — completeness wins over
+ * position, even for a plan whose id also equals `currentPlanId` (a stale
+ * `current_plan` pointing at an already-finished plan). Otherwise the
+ * plan's id equalling `currentPlanId` is In Progress; every other
+ * incomplete plan is Todo. `currentPlanId` null means STATE.md asserts no
+ * position: nothing is In Progress and PLAN-04's "every other plan is Todo"
+ * covers the whole set. Pure in (`complete`, `id`, `currentPlanId`) alone —
+ * the plan list's own order plays no part, so `Blocked`/`Deferred` are
+ * unreachable by construction (D-10).
+ */
+function derivePlanStatus(plan: { id: string; complete: boolean }, currentPlanId: string | null): PhaseStatus {
+  if (plan.complete === true) return PHASE_STATUS.DONE;
+  return plan.id === currentPlanId ? PHASE_STATUS.IN_PROGRESS : PHASE_STATUS.TODO;
+}
+
 function parseRoadmap(raw: string, checklist: Map<string, boolean>, currentPhaseId: string | null): DesiredPhase[] | null {
   const matches = [...raw.matchAll(/^### Phase (\d+(?:\.\d+)?):\s*(.+)$/gm)];
   if (matches.length === 0) return null;
@@ -230,16 +254,71 @@ function parseCurrentPhase(raw: string): string | null {
   return match ? normalizeId(match[1]) : null;
 }
 
-function parsePlanMetadata(raw: string): Pick<DesiredPlan, 'wave' | 'autonomous' | 'requirements'> | null {
+/**
+ * A leading `---\n...\n---` frontmatter block, stripped down to whatever
+ * follows it. Shared by `parseCurrentPlan`'s body-field fallback and
+ * `parsePlanTaskNames`'s task-block scan — both need "the document minus its
+ * frontmatter", not the frontmatter object `parsePlanMetadata` extracts.
+ */
+function stripLeadingFrontmatter(raw: string): string {
+  const match = /^---\n[\s\S]*?\n---(?:\n|$)([\s\S]*)$/.exec(raw);
+  return match ? match[1] : raw;
+}
+
+/**
+ * D-09: mirrors `src/state.cts:1391`'s own `current_plan` resolution
+ * byte-for-byte in precedence — the `current_plan` frontmatter key first,
+ * then a body field labelled exactly `Current Plan` (via `stateExtractField`,
+ * the same bold/plain/pipe-table shapes `state.cts` itself reads) — so
+ * github-sync and the host can never disagree about where the loop is.
+ * Unlike `parseCurrentPhase` the captured value is a plan id (`NN-PP`), not a
+ * bare phase number: only the phase segment is normalized through
+ * `normalizeId`, and the plan segment is left exactly as written. Neither
+ * source present returns null — no plan is In Progress, and
+ * `derivePlanStatus`'s Todo branch covers the whole set. A body line reading
+ * `Plan: Not started` is a different label (`Plan`, not `Current Plan`) and
+ * is never a match.
+ */
+function parseCurrentPlan(raw: string): string | null {
+  const frontmatterMatch = /^current_plan:\s*['"]?([^'"\n]+?)['"]?\s*$/m.exec(raw);
+  const rawValue = frontmatterMatch ? frontmatterMatch[1].trim() : stateExtractField(stripLeadingFrontmatter(raw), 'Current Plan');
+  if (!rawValue) return null;
+  const idMatch = /^(\d+(?:\.\d+)?)-(\d+)$/.exec(rawValue);
+  if (!idMatch) return rawValue;
+  return `${normalizeId(idMatch[1])}-${idMatch[2]}`;
+}
+
+/**
+ * Strips one pair of matching quotes (single or double) from `value`'s
+ * outer edges, if present, leaving an unquoted entry untouched. `depends_on`
+ * entries are written quoted (`["05-01", "05-02"]`, the shape a real PLAN.md
+ * frontmatter uses) as often as bare (`[05-01, 05-02]`); both must parse to
+ * the same plain id string.
+ */
+function stripOuterQuotes(value: string): string {
+  if (value.length >= 2 && ((value[0] === '"' && value.at(-1) === '"') || (value[0] === '\'' && value.at(-1) === '\''))) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+function parsePlanMetadata(raw: string): Pick<DesiredPlan, 'wave' | 'autonomous' | 'requirements' | 'dependsOn'> | null {
   const frontmatter = /^---\n([\s\S]*?)\n---(?:\n|$)/.exec(raw)?.[1];
   if (!frontmatter) return null;
   const waveMatch = /^wave:\s*(\d+)\s*$/m.exec(frontmatter);
   const autonomousMatch = /^autonomous:\s*(true|false)\s*$/m.exec(frontmatter);
   const requirementsMatch = /^requirements:\s*\[([^\]]*)\]\s*$/m.exec(frontmatter);
+  // Same bracket-list shape `requirements` uses; `depends_on` entries are
+  // additionally quote-stripped since real PLAN.md frontmatter (this very
+  // file's own, e.g.) writes them quoted. Resolution/validation of the ids
+  // is a later stage's concern — a plan naming an unknown or self-referential
+  // id still parses cleanly here.
+  const dependsOnMatch = /^depends_on:\s*\[([^\]]*)\]\s*$/m.exec(frontmatter);
   return {
     wave: waveMatch ? Number(waveMatch[1]) : null,
     autonomous: autonomousMatch?.[1] === 'true',
     requirements: requirementsMatch?.[1].split(',').map((item) => item.trim()).filter(Boolean) ?? [],
+    dependsOn: dependsOnMatch?.[1].split(',').map((item) => stripOuterQuotes(item.trim())).filter(Boolean) ?? [],
   };
 }
 
@@ -282,8 +361,7 @@ function planTitleFor(id: string, description: string | undefined, phaseTitle: s
  * contribute their own entry.
  */
 function parsePlanTaskNames(raw: string): string[] {
-  const afterFrontmatter = /^---\n[\s\S]*?\n---(?:\n|$)([\s\S]*)$/.exec(raw);
-  const body = afterFrontmatter ? afterFrontmatter[1] : raw;
+  const body = stripLeadingFrontmatter(raw);
   const names: string[] = [];
   const taskPattern = /<task\b[^>]*>([\s\S]*?)<\/task>/g;
   let taskMatch: RegExpExecArray | null;
@@ -294,7 +372,7 @@ function parsePlanTaskNames(raw: string): string[] {
   return names;
 }
 
-function readPlans(planningDir: string, roadmapRaw: string, phases: DesiredPhase[] | null): DesiredPlan[] | null {
+function readPlans(planningDir: string, roadmapRaw: string, phases: DesiredPhase[] | null, currentPlanId: string | null): DesiredPlan[] | null {
   const phaseRoot = path.join(planningDir, 'phases');
   let phaseDirs: string[];
   try { phaseDirs = fs.readdirSync(phaseRoot); } catch { return []; }
@@ -322,7 +400,7 @@ function readPlans(planningDir: string, roadmapRaw: string, phases: DesiredPhase
         complete,
         title: planTitleFor(id, planDescriptions.get(id), phaseTitles.get(phaseId)),
         tasks: parsePlanTaskNames(raw),
-        status: complete ? PHASE_STATUS.DONE : PHASE_STATUS.TODO,
+        status: derivePlanStatus({ id, complete }, currentPlanId),
       });
     }
   }
@@ -503,9 +581,10 @@ function readDesiredState(cwd: string): DesiredState {
     const roadmapRaw = fs.readFileSync(path.join(planningDir, 'ROADMAP.md'), 'utf8');
     const stateRaw = fs.readFileSync(path.join(planningDir, 'STATE.md'), 'utf8');
     const currentPhase = parseCurrentPhase(stateRaw);
+    const currentPlan = parseCurrentPlan(stateRaw);
     const checklist = parsePhaseChecklist(roadmapRaw);
     const phases = parseRoadmap(roadmapRaw, checklist, currentPhase);
-    const plans = readPlans(planningDir, roadmapRaw, phases);
+    const plans = readPlans(planningDir, roadmapRaw, phases, currentPlan);
     const milestonesResult = parseMilestones(roadmapRaw, stateRaw, planningDir);
     if (!phases || !currentPhase || !plans || !milestonesResult) return unavailable();
     return {
@@ -514,6 +593,7 @@ function readDesiredState(cwd: string): DesiredState {
       phases,
       plans,
       currentPhase,
+      currentPlan,
       milestones: milestonesResult.milestones,
       duplicateMilestones: milestonesResult.duplicates,
     };
@@ -531,4 +611,6 @@ export = {
   planTitleFor,
   parsePlanTaskNames,
   parseRoadmapPlanDescriptions,
+  parseCurrentPlan,
+  derivePlanStatus,
 };

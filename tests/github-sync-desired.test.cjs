@@ -10,6 +10,7 @@ const { createTempDir, cleanup } = require('./helpers.cjs');
 const {
   readDesiredState, DESIRED_REASON, dedupeMilestonesByVersion, PHASE_STATUS,
   planTitleFor, parsePlanTaskNames, parseRoadmapPlanDescriptions,
+  parseCurrentPlan, derivePlanStatus,
 } = require('../gsd-core/bin/lib/github-sync-desired.cjs');
 
 function write(repoDir, relativePath, content) {
@@ -37,14 +38,15 @@ test('readDesiredState projects roadmap phases and plan metadata in stable order
   assert.equal(result.reason, DESIRED_REASON.OK);
   assert.deepEqual(result.phases.map((phase) => phase.id), ['02', '10']);
   assert.deepEqual(result.plans, [{
-    id: '02-01', phaseId: '02', wave: 2, autonomous: true, requirements: ['SYNC-05'], complete: true,
+    id: '02-01', phaseId: '02', wave: 2, autonomous: true, requirements: ['SYNC-05'], dependsOn: [], complete: true,
     // Plan 05-01 (D-04/D-01/D-05): no ROADMAP plan-list row for 02-01, so the
     // title falls back to its phase's own title ("Sync"); the plan body
     // carries no <task> blocks, so tasks is empty; complete: true derives
-    // Done under this tracer's two-state form.
+    // Done regardless of current_plan position (05-02: derivePlanStatus).
     title: '02-01 — Sync', tasks: [], status: PHASE_STATUS.DONE,
   }]);
   assert.equal(result.currentPhase, '02');
+  assert.equal(result.currentPlan, null);
 });
 
 test('readDesiredState returns fixed typed unavailable data for malformed local inputs', (t) => {
@@ -59,6 +61,7 @@ test('readDesiredState returns fixed typed unavailable data for malformed local 
     phases: [],
     plans: [],
     currentPhase: null,
+    currentPlan: null,
     milestones: [],
     duplicateMilestones: [],
   });
@@ -694,4 +697,146 @@ test('readPlans (via readDesiredState): title populates through all three planTi
   assert.equal(byId('01-02').title, '01-02 — One');
   assert.deepEqual(byId('01-02').tasks, []);
   assert.equal(byId('03-01').title, '03-01');
+});
+
+// ─── Phase 5 (05-02 Task 1): parseCurrentPlan, derivePlanStatus (D-09) ────
+
+test('parseCurrentPlan: a quoted current_plan frontmatter value returns the plan id', () => {
+  assert.equal(parseCurrentPlan('---\ncurrent_plan: "04-03"\n---\nsome body\n'), '04-03');
+});
+
+test('parseCurrentPlan: an unquoted current_plan frontmatter value also returns the plan id', () => {
+  assert.equal(parseCurrentPlan('---\ncurrent_plan: 04-03\n---\n'), '04-03');
+});
+
+test('parseCurrentPlan: no frontmatter key but a body line labelled "Current Plan" (bold) returns that value', () => {
+  assert.equal(parseCurrentPlan('---\ncurrent_phase: 04\n---\n**Current Plan:** 04-03\n'), '04-03');
+});
+
+test('parseCurrentPlan: no frontmatter key but a plain "Current Plan:" body line returns that value', () => {
+  assert.equal(parseCurrentPlan('---\ncurrent_phase: 04\n---\nCurrent Plan: 04-03\n'), '04-03');
+});
+
+test('parseCurrentPlan: the frontmatter key takes precedence over a conflicting body field, mirroring state.cts', () => {
+  assert.equal(parseCurrentPlan('---\ncurrent_plan: "04-03"\n---\n**Current Plan:** 04-99\n'), '04-03');
+});
+
+test('parseCurrentPlan: neither the frontmatter key nor a "Current Plan" body field present returns null; a "Plan: Not started" body line is not a match', () => {
+  assert.equal(parseCurrentPlan('---\ncurrent_phase: 04\n---\nPlan: Not started\n'), null);
+  assert.equal(parseCurrentPlan('---\ncurrent_phase: 04\n---\n**Plan:** Not started\n'), null);
+  assert.equal(parseCurrentPlan('---\n---\n'), null);
+});
+
+test('parseCurrentPlan: the phase segment is normalized through normalizeId; the plan segment is left as written', () => {
+  assert.equal(parseCurrentPlan('---\ncurrent_plan: "4-03"\n---\n'), '04-03');
+});
+
+test('derivePlanStatus: complete true returns Done — completeness wins over position even when the plan also names the current position', () => {
+  assert.equal(derivePlanStatus({ id: '04-03', complete: true }, '04-03'), PHASE_STATUS.DONE);
+});
+
+test('derivePlanStatus: incomplete and id equals the resolved current-plan id returns In Progress', () => {
+  assert.equal(derivePlanStatus({ id: '04-03', complete: false }, '04-03'), PHASE_STATUS.IN_PROGRESS);
+});
+
+test('derivePlanStatus: incomplete and id differs from the resolved current-plan id returns Todo', () => {
+  assert.equal(derivePlanStatus({ id: '04-04', complete: false }, '04-03'), PHASE_STATUS.TODO);
+});
+
+test('derivePlanStatus: incomplete and no recorded position (null) returns Todo — nothing is In Progress', () => {
+  assert.equal(derivePlanStatus({ id: '04-04', complete: false }, null), PHASE_STATUS.TODO);
+});
+
+test('derivePlanStatus: never returns Blocked, Deferred, undefined, or null across the full (complete, position) matrix', () => {
+  const memberSet = new Set(Object.values(PHASE_STATUS));
+  const ids = ['04-01', '04-02'];
+  const currentPositions = ['04-01', '04-02', '04-99', null];
+  for (const id of ids) {
+    for (const complete of [true, false]) {
+      for (const currentPlanId of currentPositions) {
+        const status = derivePlanStatus({ id, complete }, currentPlanId);
+        assert.ok(memberSet.has(status), `derivePlanStatus({id:${id},complete:${complete}}, ${currentPlanId}) returned ${status}, not a PHASE_STATUS member`);
+        assert.notEqual(status, 'Blocked');
+        assert.notEqual(status, 'Deferred');
+        assert.notEqual(status, undefined);
+        assert.notEqual(status, null);
+      }
+    }
+  }
+});
+
+test('derivePlanStatus is a pure function of (complete, id, currentPlanId) alone: reversing the input plan list changes no plan\'s derived status', () => {
+  const currentPlanId = '04-02';
+  const plans = [
+    { id: '04-01', complete: false },
+    { id: '04-02', complete: false },
+    { id: '04-03', complete: true },
+    { id: '04-04', complete: false },
+  ];
+  const forward = Object.fromEntries(plans.map((plan) => [plan.id, derivePlanStatus(plan, currentPlanId)]));
+  const reversed = Object.fromEntries([...plans].reverse().map((plan) => [plan.id, derivePlanStatus(plan, currentPlanId)]));
+  assert.deepEqual(reversed, forward);
+});
+
+test('readDesiredState: the plan named by current_plan (frontmatter) and lacking a SUMMARY.md derives In Progress; a sibling with a SUMMARY.md derives Done regardless; every other plan derives Todo', (t) => {
+  const repoDir = createTempDir('github-sync-desired-planstatus-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 04: Four\n\n**Goal**: four\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 04\ncurrent_plan: "04-02"\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/04-four/04-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+  write(repoDir, '.planning/phases/04-four/04-01-SUMMARY.md', '# done\n');
+  write(repoDir, '.planning/phases/04-four/04-02-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+  write(repoDir, '.planning/phases/04-four/04-03-PLAN.md', '---\nwave: 2\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  assert.equal(result.currentPlan, '04-02');
+  const byId = (id) => result.plans.find((plan) => plan.id === id);
+  assert.equal(byId('04-01').status, PHASE_STATUS.DONE);
+  assert.equal(byId('04-02').status, PHASE_STATUS.IN_PROGRESS);
+  assert.equal(byId('04-03').status, PHASE_STATUS.TODO);
+});
+
+test('readDesiredState: a plan that is both complete and named by current_plan derives Done — completeness wins over position', (t) => {
+  const repoDir = createTempDir('github-sync-desired-planstatus-donewins-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 04: Four\n\n**Goal**: four\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 04\ncurrent_plan: "04-01"\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/04-four/04-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+  write(repoDir, '.planning/phases/04-four/04-01-SUMMARY.md', '# done\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.plans.find((plan) => plan.id === '04-01').status, PHASE_STATUS.DONE);
+});
+
+test('readDesiredState: STATE.md asserting no current_plan position yields Todo for every incomplete plan, never In Progress', (t) => {
+  const repoDir = createTempDir('github-sync-desired-planstatus-noposition-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 04: Four\n\n**Goal**: four\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 04\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/04-four/04-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+  write(repoDir, '.planning/phases/04-four/04-02-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  assert.equal(result.currentPlan, null);
+  for (const plan of result.plans) {
+    assert.equal(plan.status, PHASE_STATUS.TODO);
+  }
+});
+
+test('readDesiredState: a phase directory with zero PLAN.md files contributes zero plans and leaves the read available', (t) => {
+  const repoDir = createTempDir('github-sync-desired-planstatus-emptyphase-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 04: Four\n\n**Goal**: four\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 04\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  fs.mkdirSync(path.join(repoDir, '.planning/phases/04-four'), { recursive: true });
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  assert.deepEqual(result.plans, []);
 });
