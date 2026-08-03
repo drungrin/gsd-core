@@ -9,10 +9,13 @@ const path = require('node:path');
 const {
   readPartialSyncTarget,
   readProjectTitle,
+  readViewLayout,
   resolveTarget,
   writeProjectNumber,
   CONFIG_WRITE_REASON,
   RESOLVE_TARGET_REASON,
+  VIEW_LAYOUT_CONFIG,
+  DEFAULT_VIEW_LAYOUT_CONFIG,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-config.cjs');
 const { readSyncTarget } = require('../gsd-core/bin/lib/github-sync-target.cjs');
 const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
@@ -363,6 +366,121 @@ describe('readProjectTitle', () => {
         assert.equal(readProjectTitle(dir), null);
       } finally { cleanup(dir); }
     }
+  });
+});
+
+// ─── readViewLayout ─────────────────────────────────────────────────────────
+
+describe('readViewLayout', () => {
+  const BOARD_LAYOUT = VIEW_LAYOUT_CONFIG[DEFAULT_VIEW_LAYOUT_CONFIG];
+
+  function writeViewLayoutConfig(dir, layoutValue) {
+    writeConfig(dir, { github_sync: { enabled: true, view: { layout: layoutValue } } });
+  }
+
+  // One row per line of the <feature> table.
+  const TABLE = [
+    { name: 'board', value: 'board', expected: 'BOARD_LAYOUT' },
+    { name: 'table', value: 'table', expected: 'TABLE_LAYOUT' },
+    { name: 'roadmap', value: 'roadmap', expected: 'ROADMAP_LAYOUT' },
+    { name: 'empty string', value: '', expected: 'BOARD_LAYOUT' },
+    { name: 'wrong case', value: 'Board', expected: 'BOARD_LAYOUT' },
+    { name: 'the GraphQL member, not the config spelling', value: 'BOARD_LAYOUT', expected: 'BOARD_LAYOUT' },
+    { name: 'unrecognized value', value: 'kanban', expected: 'BOARD_LAYOUT' },
+    { name: 'number', value: 42, expected: 'BOARD_LAYOUT' },
+    { name: 'null', value: null, expected: 'BOARD_LAYOUT' },
+    { name: 'boolean', value: true, expected: 'BOARD_LAYOUT' },
+    { name: 'object', value: {}, expected: 'BOARD_LAYOUT' },
+    { name: 'array', value: [], expected: 'BOARD_LAYOUT' },
+    { name: 'trailing space', value: 'board ', expected: 'BOARD_LAYOUT' },
+  ];
+
+  for (const { name, value, expected } of TABLE) {
+    test(`github_sync.view.layout = ${JSON.stringify(value)} (${name}) returns ${expected}`, () => {
+      const dir = tempDir();
+      try {
+        writeViewLayoutConfig(dir, value);
+        assert.equal(readViewLayout(dir), expected);
+      } finally { cleanup(dir); }
+    });
+  }
+
+  test('an absent view.layout key, an absent github_sync block, and an absent config file all return the board default', () => {
+    // Absent view.layout key.
+    const dirNoKey = tempDir();
+    try {
+      writeConfig(dirNoKey, { github_sync: { enabled: true, view: {} } });
+      assert.equal(readViewLayout(dirNoKey), BOARD_LAYOUT);
+    } finally { cleanup(dirNoKey); }
+
+    // Absent github_sync block entirely.
+    const dirNoBlock = tempDir();
+    try {
+      writeConfig(dirNoBlock, { unrelated: true });
+      assert.equal(readViewLayout(dirNoBlock), BOARD_LAYOUT);
+    } finally { cleanup(dirNoBlock); }
+
+    // Absent/unreadable config file.
+    const dirNoConfig = tempDir();
+    cleanup(dirNoConfig); // never create .planning at all
+    assert.equal(readViewLayout(dirNoConfig), BOARD_LAYOUT);
+  });
+
+  test('every value in the table belongs to the three-member GraphQL enum, never a fourth value', () => {
+    const validMembers = new Set(Object.values(VIEW_LAYOUT_CONFIG));
+    assert.equal(validMembers.size, 3, 'the closed map must carry exactly three GraphQL enum members');
+    for (const { value } of TABLE) {
+      const dir = tempDir();
+      try {
+        writeViewLayoutConfig(dir, value);
+        assert.ok(validMembers.has(readViewLayout(dir)), `value ${JSON.stringify(value)} must map to one of the three GraphQL enum members`);
+      } finally { cleanup(dir); }
+    }
+  });
+
+  test('does not throw when .planning/config.json is a directory, is empty, contains null, or contains a JSON array', () => {
+    const dirIsDirectory = tempDir();
+    try {
+      fs.mkdirSync(path.join(dirIsDirectory, '.planning', 'config.json'), { recursive: true });
+      let result;
+      assert.doesNotThrow(() => { result = readViewLayout(dirIsDirectory); });
+      assert.equal(result, BOARD_LAYOUT);
+    } finally { cleanup(dirIsDirectory); }
+
+    const dirEmpty = tempDir();
+    try {
+      fs.mkdirSync(path.join(dirEmpty, '.planning'), { recursive: true });
+      fs.writeFileSync(path.join(dirEmpty, '.planning', 'config.json'), '');
+      let result;
+      assert.doesNotThrow(() => { result = readViewLayout(dirEmpty); });
+      assert.equal(result, BOARD_LAYOUT);
+    } finally { cleanup(dirEmpty); }
+
+    const dirNull = tempDir();
+    try {
+      fs.mkdirSync(path.join(dirNull, '.planning'), { recursive: true });
+      fs.writeFileSync(path.join(dirNull, '.planning', 'config.json'), 'null');
+      let result;
+      assert.doesNotThrow(() => { result = readViewLayout(dirNull); });
+      assert.equal(result, BOARD_LAYOUT);
+    } finally { cleanup(dirNull); }
+
+    const dirArray = tempDir();
+    try {
+      fs.mkdirSync(path.join(dirArray, '.planning'), { recursive: true });
+      fs.writeFileSync(path.join(dirArray, '.planning', 'config.json'), '[]');
+      let result;
+      assert.doesNotThrow(() => { result = readViewLayout(dirArray); });
+      assert.equal(result, BOARD_LAYOUT);
+    } finally { cleanup(dirArray); }
+  });
+
+  test('a github_sync.view that is a string rather than an object returns the board default (the nested-key guard)', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, view: 'board' } });
+      assert.equal(readViewLayout(dir), BOARD_LAYOUT);
+    } finally { cleanup(dir); }
   });
 });
 
