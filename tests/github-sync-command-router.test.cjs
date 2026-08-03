@@ -112,7 +112,7 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
     });
   } finally { mock.restoreAll(); }
   assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101, 303] }], ['reconcile', 3], ['issueUpdate', 0, '/fixture'], ['apply', 'phase:01', { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } }]]);
-  assert.deepEqual(chunks, ['{\n  "kind": "completed",\n  "issueUpdateReports": []\n}']);
+  assert.deepEqual(chunks, ['{\n  "kind": "completed",\n  "issueUpdateReports": [],\n  "subIssueCeilingWarnings": []\n}']);
 });
 
 // ─── Bug fix: collectIssueNodeIdHints must not feed bootstrap completions
@@ -307,6 +307,101 @@ describe('github-sync router: plan 04-04 Task 3 — issue-update preparation sta
     const parsed = JSON.parse(chunks.join(''));
     assert.equal(parsed.operationsDispatched, 0);
     assert.deepEqual(parsed.issueUpdateReports, [{ logicalKey: 'phase:07', reason: 'region_damaged', detail: 'two begin fences' }]);
+  });
+});
+
+// ─── Plan 05-07: the sub-issue-per-parent ceiling warning surfaces from
+// both `status` and `sync`, and neither command gains new authority ────────
+
+describe('github-sync router: plan 05-07 — sub-issue ceiling warning wiring', () => {
+  afterEach(() => {
+    mock.restoreAll();
+  });
+
+  test('status against a plan with a sub-issue-ceiling warning emits the group and dispatches no mutation', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: false,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _status: realStatus,
+        _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
+        _desired: { readDesiredState() { return { available: true }; } },
+        _remote: { readRemoteSnapshot() { return { available: true, reason: 'ok' }; } },
+        _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+        _reconcile: {
+          planReconciliation() {
+            return {
+              operations: [], noops: [], blocked: [], uncertain: [],
+              subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
+            };
+          },
+        },
+        // status is a dry run — neither seam below may ever be reached.
+        _issueUpdate: { prepareIssueUpdates() { throw new Error('status must never call the preparation stage'); } },
+        _apply: { applyMutationPlan() { throw new Error('status must never apply mutations'); } },
+      });
+    } finally { mock.restoreAll(); }
+    const out = chunks.join('');
+    assert.match(out, /sub-issue-ceiling-warnings: 1/);
+    assert.match(out, /\n {2}- 05 \(91\/100\)\n/);
+  });
+
+  test('sync against a plan with a sub-issue-ceiling warning carries the warning in its result and still exits 0', () => {
+    process.exitCode = 0;
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight() { return { ok: true, reason: 'ok', message: 'ok' }; } },
+        _desired: { readDesiredState() { return { available: true }; } },
+        _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
+        _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+        _remote: { readRemoteSnapshot() { return { available: true }; } },
+        _reconcile: {
+          planReconciliation() {
+            return {
+              operations: [{ logicalKey: 'phase:01', kind: 'create' }],
+              noops: [], blocked: [], uncertain: [],
+              subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
+            };
+          },
+        },
+        _issueUpdate: { prepareIssueUpdates() { return { operations: [], reports: [] }; } },
+        _apply: { applyMutationPlan(plan) { return { kind: 'completed', operationsDispatched: plan.operations.length }; } },
+      });
+    } finally { mock.restoreAll(); }
+    assert.strictEqual(process.exitCode, 0);
+    const parsed = JSON.parse(chunks.join(''));
+    assert.equal(parsed.operationsDispatched, 1);
+    assert.deepEqual(parsed.subIssueCeilingWarnings, [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }]);
+  });
+
+  test('sync against a plan predating warnings (no subIssueCeilingWarnings field at all) still carries an empty array in its result', () => {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight() { return { ok: true, reason: 'ok', message: 'ok' }; } },
+        _desired: { readDesiredState() { return { available: true }; } },
+        _target: { readSyncTarget() { return { available: true, target: { owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7 } }; } },
+        _map: { readSyncMapStrict() { return { kind: 'valid', map: { completions: {} } }; } },
+        _remote: { readRemoteSnapshot() { return { available: true }; } },
+        _reconcile: { planReconciliation() { return { operations: [], noops: [], blocked: [], uncertain: [] }; } },
+        _issueUpdate: { prepareIssueUpdates() { return { operations: [], reports: [] }; } },
+        _apply: { applyMutationPlan() { return { kind: 'completed' }; } },
+      });
+    } finally { mock.restoreAll(); }
+    const parsed = JSON.parse(chunks.join(''));
+    assert.deepEqual(parsed.subIssueCeilingWarnings, []);
   });
 });
 

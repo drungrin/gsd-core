@@ -387,8 +387,17 @@ function routeGithubSyncCommandRouter({
                 if (strictMap?.kind === 'blocking') {
                   result = { kind: 'blocked', reason: 'sync_map_blocking' };
                 } else {
+                  // Plan 05-07 (D-12/discretion item): no streaming progress
+                  // mechanism is added for a long first run. The create list
+                  // and counts already dispatched below tell a developer how
+                  // much work this run will do before it starts, and a second
+                  // output surface beside renderStatusV1's would cost more
+                  // than the one sentence 05-08 spends documenting that a
+                  // first run on an established repository takes minutes,
+                  // and that killing it is free — every mutation is
+                  // checkpointed, so a resumed run picks up where it left off.
                   const plan = reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap) as {
-                    operations: unknown[]; pendingIssueUpdates?: unknown[];
+                    operations: unknown[]; pendingIssueUpdates?: unknown[]; subIssueCeilingWarnings?: unknown[];
                   };
                   // Plan 04-04 Task 3: the read-splice-write preparation
                   // stage runs here, between planning and applying — never
@@ -404,7 +413,12 @@ function routeGithubSyncCommandRouter({
                     cwd,
                     map: strictMap?.kind === 'valid' ? strictMap.map ?? null : null,
                   }) as Record<string, unknown>;
-                  result = { ...applyResult, issueUpdateReports: prepared.reports };
+                  // Plan 05-07: the plan's own reported sub-issue-ceiling
+                  // warnings ride the result beside issueUpdateReports, so a
+                  // developer running `sync` sees them without also running
+                  // `status` — never a new authority, sync still exits 0
+                  // with warnings present (the exit-0-never-gates posture).
+                  result = { ...applyResult, issueUpdateReports: prepared.reports, subIssueCeilingWarnings: plan.subIssueCeilingWarnings ?? [] };
                 }
               }
             }

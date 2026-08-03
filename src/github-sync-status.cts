@@ -20,6 +20,8 @@ const TARGET_UNAVAILABLE_MESSAGES: Readonly<Record<string, string>> = Object.fre
 });
 
 interface StatusInput { available: boolean; reason: string; field?: string; }
+/** Plan 05-07 (D-14): one phase's parent-issue sub-issue count at or over the warn threshold — never a mutation authority, only a reported fact. */
+interface SubIssueCeilingWarning { phaseId: string; issueNumber: number; count: number; limit: number; }
 interface ReconciliationPlan {
   operations: Array<{ kind: string; logicalKey: string }>;
   noops: Array<{ logicalKey: string }>;
@@ -28,6 +30,8 @@ interface ReconciliationPlan {
   /** Plan 04-04 Task 3: optional so a pre-04-04-shaped plan fixture still type-checks and renders as empty. */
   pendingIssueUpdates?: Array<{ logicalKey: string }>;
   orphans?: Array<{ logicalKey: string; issueNumber?: number }>;
+  /** Plan 05-07: optional so a pre-05-07-shaped plan fixture still type-checks and renders as empty. */
+  subIssueCeilingWarnings?: SubIssueCeilingWarning[];
 }
 
 interface StatusV1 {
@@ -43,6 +47,8 @@ interface StatusV1 {
   orphans: Array<{ logicalKey: string; issueNumber?: number }>;
   /** Plan 04-04 Task 3: pending issue-content updates, by logical key only — `status` never reads the issue to learn more than the plan already named. */
   pendingIssueUpdates: string[];
+  /** Plan 05-07 (D-14): always present, empty when nothing applies — matches every other group; never gates. */
+  subIssueCeilingWarnings: SubIssueCeilingWarning[];
   limitations: string[];
 }
 
@@ -61,18 +67,18 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
         creates: [], updates: [], noops: [],
         blocked: [remote.field === undefined ? { reason: remote.reason } : { reason: remote.reason, detail: remote.field }],
         uncertain: [],
-        orphans: [], pendingIssueUpdates: [],
+        orphans: [], pendingIssueUpdates: [], subIssueCeilingWarnings: [],
         limitations: ['The local github_sync.target configuration is invalid; no remote read was attempted.'],
       };
     }
     return {
       version: STATUS_SCHEMA_VERSION, available: false, message: UNAVAILABLE_MESSAGE,
       creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
-      orphans: [], pendingIssueUpdates: [],
+      orphans: [], pendingIssueUpdates: [], subIssueCeilingWarnings: [],
       limitations: ['Remote data is currently unavailable; no changes were made.'],
     };
   }
-  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], orphans: [] };
+  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], orphans: [], subIssueCeilingWarnings: [] };
   return {
     version: STATUS_SCHEMA_VERSION, available: true,
     creates: safePlan.operations.filter((operation) => operation.kind === 'create').map((operation) => operation.logicalKey),
@@ -82,6 +88,7 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
     uncertain: safePlan.uncertain.map(({ reason }) => ({ reason })),
     orphans: (safePlan.orphans ?? []).map(({ logicalKey, issueNumber }) => (issueNumber === undefined ? { logicalKey } : { logicalKey, issueNumber })),
     pendingIssueUpdates: (safePlan.pendingIssueUpdates ?? []).map(({ logicalKey }) => logicalKey),
+    subIssueCeilingWarnings: (safePlan.subIssueCeilingWarnings ?? []).map(({ phaseId, issueNumber, count, limit }) => ({ phaseId, issueNumber, count, limit })),
     limitations: [],
   };
 }
@@ -94,7 +101,9 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
  * or JSON. Plan 04-04 Task 3 (D-11) adds two more groups after the original
  * five: `orphans` (a phase's logical key, with its issue number in
  * parentheses when known) and `updates-pending` (a pending issue-content
- * update's logical key). All seven groups always render their count line,
+ * update's logical key). Plan 05-07 (D-14) adds an eighth,
+ * `sub-issue-ceiling-warnings` (a phase's id, with its count against the
+ * limit in parentheses). All eight groups always render their count line,
  * even at zero.
  *
  * Kept pure and total: reads only `status` fields, never the filesystem,
@@ -120,6 +129,10 @@ function renderStatusV1(status: StatusV1, raw: boolean): string {
   // blocked group already uses for its detail.
   appendGroup('orphans', status.orphans.map(({ logicalKey, issueNumber }) => (issueNumber === undefined ? logicalKey : `${logicalKey} (${issueNumber})`)));
   appendGroup('updates-pending', status.pendingIssueUpdates);
+  // Plan 05-07 (D-14): a warning renders as the phase's own identifier
+  // followed by its count against the limit, in the same parenthesized-
+  // detail shape the `orphans` group already uses.
+  appendGroup('sub-issue-ceiling-warnings', status.subIssueCeilingWarnings.map(({ phaseId, count, limit }) => `${phaseId} (${count}/${limit})`));
   if (status.limitations.length > 0) {
     lines.push('limitations:');
     for (const limitation of status.limitations) lines.push(`  - ${limitation}`);

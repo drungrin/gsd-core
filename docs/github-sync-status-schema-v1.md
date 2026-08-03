@@ -8,14 +8,17 @@ a terminal, and `--raw` is for automation.
 
 ## Default output: the human summary (D-13)
 
-Running `status` with no flags prints a heading, then seven group lines in this fixed order —
-`creates:`, `updates:`, `no-ops:`, `blocked:`, `uncertain:`, `orphans:`, `updates-pending:` —
-each showing its count. Every group always appears, even at zero (D-14). When a group is
-non-empty, each member follows on its own indented line: `creates`, `updates`, and `no-ops` list
-logical keys verbatim; `blocked` lists its typed reason, with a safe `detail` appended in
-parentheses when present; `uncertain` lists its typed reason; `orphans` lists a phase's logical
-key, with its issue number appended in parentheses when known (plan 04-04, D-11);
-`updates-pending` lists a pending issue-content update's logical key (plan 04-04). If the report
+Running `status` with no flags prints a heading, then eight group lines in this fixed order —
+`creates:`, `updates:`, `no-ops:`, `blocked:`, `uncertain:`, `orphans:`, `updates-pending:`,
+`sub-issue-ceiling-warnings:` — each showing its count. Every group always appears, even at zero
+(D-14). When a group is non-empty, each member follows on its own indented line: `creates`,
+`updates`, and `no-ops` list logical keys verbatim; `blocked` lists its typed reason, with a safe
+`detail` appended in parentheses when present; `uncertain` lists its typed reason; `orphans` lists
+a phase's logical key, with its issue number appended in parentheses when known (plan 04-04,
+D-11); `updates-pending` lists a pending issue-content update's logical key (plan 04-04);
+`sub-issue-ceiling-warnings` lists a phase's id, with its sub-issue count against GitHub's
+100-per-parent limit appended in parentheses (plan 05-07, D-14) — a warning only, never a
+refusal: the same operations dispatch whether or not this group is non-empty. If the report
 carries any `limitations`, a final `limitations:` line lists each one, indented; the line is
 omitted entirely when there are none. This is the surface SYNC-07 promises: every planned
 create, update, no-op, orphan, and pending update is named, and every blocked or uncertain entry
@@ -43,6 +46,7 @@ described above.
 | `uncertain` | Typed operation or remote uncertainties. |
 | `orphans` | Logical keys of phases whose completions exist but are absent from the desired state, each optionally paired with its known issue number (plan 04-04, D-11). Never acted on — report-only. |
 | `pendingIssueUpdates` | Ordered logical keys of phases whose issue content (title/body/milestone) would be updated in place (plan 04-04). `status` names these without reading the issue body. |
+| `subIssueCeilingWarnings` | Phases whose parent issue's sub-issue count has reached or passed GitHub's 100-per-parent ceiling's warn threshold (90), each carrying `phaseId`, `issueNumber`, `count`, and `limit` (plan 05-07, D-14). Computed from data the run already read — no additional remote call. Report-only: never blocks, never changes the operations dispatched. |
 | `limitations` | Fixed, actionable limitations that apply to this report. |
 | `message` | Present only for unavailable status; a fixed operator-facing remediation. |
 
