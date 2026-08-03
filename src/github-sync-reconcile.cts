@@ -685,9 +685,10 @@ function buildPlanFieldValueOperations(
       }
       valueEntry = { from: autonomousOptionKey, part: ARGV_REF_PART.NODE_ID, prefix: 'value=' };
     } else if (spec.fieldName === 'wave') {
-      // SECURITY: a validated positive integer, not a developer string — but
-      // still on the raw flag (github-sync-operation.cts's module header:
-      // new code puts every value on the raw flag).
+      // SECURITY: a validated positive integer, not a developer string.
+      // Dispatched on -F below (see the LIVE FINDING comment on the
+      // operations map a few lines down) — never -f, per the live Float!
+      // coercion fix.
       valueEntry = `value=${desiredValues.wave}`;
     } else {
       valueEntry = `value=${textValueFor(spec.fieldName, desiredValues)}`;
