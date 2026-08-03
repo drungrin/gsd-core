@@ -304,6 +304,14 @@ A plan's `Status` is derived from disk truth, never read back from the board:
 `Deferred` — is reverted to the disk-derived value on the next sync; this is deliberate, not a
 bug, so a developer who hand-sets a plan to `Blocked` should expect to see it revert.
 
+**A plan already complete on its first sync (WR-02, 05-REVIEW re-review).** GitHub's REST
+issue-create endpoint has no `state` parameter, so a freshly created plan issue is always open
+regardless of `plan.complete`. If a plan's `SUMMARY.md` already exists the first time `sync`
+creates its issue, the issue is created open even though its `Status` field is written as `Done`
+in the same run — a real, visible mismatch for exactly one run if a developer looks at the issue
+list right after that first sync. It is cosmetic and self-heals on the very next `sync`, which
+detects the open/closed state has not converged and dispatches the closing PATCH.
+
 **A plan issue closes when its SUMMARY.md appears and reopens when it disappears.** Deleting a
 SUMMARY.md by accident reopens its plan's issue on the next sync — that is the mirror working
 correctly, not a defect to guard against.
