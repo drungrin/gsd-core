@@ -69,6 +69,18 @@ const OPERATION_REASON = Object.freeze({
   DEPENDENCY_SLOT_MISMATCH: 'dependency_slot_mismatch',
 } as const);
 
+/**
+ * Plan 05-07 (D-14): GitHub's own documented ceiling on sub-issues per
+ * parent issue.
+ */
+const PLAN_SUB_ISSUE_LIMIT = 100;
+/**
+ * Plan 05-07 (D-14): the count at which a developer is warned — ten plans
+ * before the ceiling, cheap runway to split an oversized phase before a
+ * create ever fails.
+ */
+const PLAN_SUB_ISSUE_WARN_THRESHOLD = 90;
+
 /** The `gsd:phase` label's own name, as declared in `GSD_LABELS` (github-sync-bootstrap-plan.cts) — never re-spelled. */
 const PHASE_LABEL_NAME = 'gsd:phase';
 /** Phase 5: the `gsd:plan` label's own name, as declared in `GSD_LABELS` — never re-spelled. */
@@ -155,11 +167,20 @@ interface DesiredPlan {
 }
 interface DesiredState { available: boolean; reason: string; phases: DesiredPhase[]; plans?: DesiredPlan[]; milestones?: DesiredMilestone[]; }
 interface RemoteItem { id?: unknown; content?: { id?: unknown; number?: unknown } | null; }
+/**
+ * Plan 05-07: only the two fields the per-parent sub-issue ceiling count
+ * needs — `readRemoteSnapshot` (`github-sync-remote.cts`) tags every node
+ * with the parent issue number it was read under; `number` is declared but
+ * unused by the count itself, kept for shape fidelity with the real node.
+ */
+interface RemoteSubIssueNode { number?: unknown; parentIssueNumber?: unknown; }
 interface RemoteSnapshot {
   available: boolean;
   reason: string;
   target?: { owner: string; repo: string; repositoryNumber: number; projectNumber: number; projectNodeId?: unknown };
   items?: RemoteItem[];
+  /** Plan 05-07: optional so pre-05-07 fixtures (which never set it) still type-check; treated as empty when absent. */
+  subIssues?: RemoteSubIssueNode[];
   issueNodeIds?: Record<string, string> | Record<number, string>;
 }
 interface StrictMapCompletion { nodeId: string; issueNumber?: number; contentHash?: string; fieldState?: string; issueState?: PlanIssueStateValue; }
@@ -195,6 +216,19 @@ interface OrphanEntry {
   issueNumber?: number;
 }
 
+/**
+ * Plan 05-07 (D-14): a phase whose parent issue's sub-issue count has
+ * reached or passed `PLAN_SUB_ISSUE_WARN_THRESHOLD` — reported, never acted
+ * on. `count` and `limit` ride the warning itself so a renderer never has to
+ * re-import the threshold constants to show them.
+ */
+interface SubIssueCeilingWarning {
+  phaseId: string;
+  issueNumber: number;
+  count: number;
+  limit: number;
+}
+
 interface ReconciliationPlan {
   operations: MutationOperation[];
   noops: Array<{ logicalKey: string }>;
@@ -223,6 +257,13 @@ interface ReconciliationPlan {
    * do not rewrite, this seam.
    */
   pendingFieldChanges: Array<{ logicalKey: string; changed: FieldName[] }>;
+  /**
+   * Plan 05-07 (D-14): always present, empty when nothing applies — matches
+   * `noops`/`blocked`/`orphans`. Never gates: a run that warns dispatches
+   * exactly the same operations it would have dispatched without the
+   * warning (pinned by test, not merely by convention).
+   */
+  subIssueCeilingWarnings: SubIssueCeilingWarning[];
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -1076,7 +1117,7 @@ function planDependencyResolvable(
  * name, never acted on.
  */
 function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, strictMap: StrictMap): ReconciliationPlan {
-  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [] };
+  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [] };
   if (!desired.available) return { ...empty, blocked: [{ reason: OPERATION_REASON.DESIRED_UNAVAILABLE, detail: desired.reason }], uncertain: [] };
   if (!remote.available) return { ...empty, blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
   if (strictMap.kind === 'blocking') return { ...empty, blocked: [{ reason: OPERATION_REASON.MAP_BLOCKING, detail: strictMap.reason ?? 'invalid' }], uncertain: [] };
@@ -1441,7 +1482,31 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
     ...collectOrphans(desiredPlanIds, orphanPlanIdFromKey, PLAN_KEY_PREFIX),
   ];
 
-  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges };
+  // Plan 05-07 (D-14): a per-parent sub-issue count, computed entirely from
+  // `remote.subIssues` — the paginated read this run already performed
+  // (`github-sync-remote.cts`'s `readRemoteSnapshot`), never a new remote
+  // call. Every returned node counts, archived or not: whether GitHub's
+  // `subIssues` connection even returns archived sub-issues, and whether an
+  // archived sub-issue counts toward GitHub's own 100-per-parent cap, is
+  // undocumented and unverified here (05-RESEARCH.md Open Question 1) —
+  // counting everything makes the warning fire no later than it should
+  // under either interpretation, never later, so the defensiveness is
+  // harmless even if it turns out to be moot.
+  const subIssueCountsByParent = new Map<number, number>();
+  for (const node of remote.subIssues ?? []) {
+    if (typeof node.parentIssueNumber !== 'number') continue;
+    subIssueCountsByParent.set(node.parentIssueNumber, (subIssueCountsByParent.get(node.parentIssueNumber) ?? 0) + 1);
+  }
+  const subIssueCeilingWarnings: ReconciliationPlan['subIssueCeilingWarnings'] = [];
+  for (const phase of [...desired.phases].sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))) {
+    const issueCompletion = completions[issueKeyFor(phase.id)];
+    if (!issueCompletion || issueCompletion.issueNumber === undefined) continue;
+    const count = subIssueCountsByParent.get(issueCompletion.issueNumber);
+    if (count === undefined || count < PLAN_SUB_ISSUE_WARN_THRESHOLD) continue;
+    subIssueCeilingWarnings.push({ phaseId: phase.id, issueNumber: issueCompletion.issueNumber, count, limit: PLAN_SUB_ISSUE_LIMIT });
+  }
+
+  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges, subIssueCeilingWarnings };
 }
 
 export = {
@@ -1467,4 +1532,6 @@ export = {
   UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT,
   UPDATE_FIELD_VALUE_NUMBER_DOCUMENT,
   PLAN_FIELD_VALUE_SPEC,
+  PLAN_SUB_ISSUE_LIMIT,
+  PLAN_SUB_ISSUE_WARN_THRESHOLD,
 };

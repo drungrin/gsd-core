@@ -8,6 +8,7 @@ const {
   buildFieldValueOperations, buildPlanFieldValueOperations, PLAN_FIELD_VALUE_SPEC,
   planKeyFor, planIssueKeyFor, buildCreatePlanIssueOperation, buildAddSubIssueOperation, ADD_SUB_ISSUE_DOCUMENT,
   UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, bodyArgvEntry, buildPlanIssueStateOperation, PLAN_ISSUE_STATE,
+  PLAN_SUB_ISSUE_LIMIT, PLAN_SUB_ISSUE_WARN_THRESHOLD,
 } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
 const { GSD_LABELS, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const {
@@ -268,7 +269,7 @@ test('a desired state with zero phases produces zero operations, zero blocked en
   const plan = planReconciliation(empty, remoteWith(), map);
   assert.deepEqual(plan, {
     operations: [], noops: [], blocked: [], uncertain: [],
-    pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [],
+    pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
   });
 });
 
@@ -532,6 +533,198 @@ test('orphan entries are emitted in ascending logical-key order and are stable a
   const second = planReconciliation(single, remoteWith(), map);
   assert.deepEqual(first.orphans, [{ logicalKey: 'phase:02', issueNumber: 20 }, { logicalKey: 'phase:10', issueNumber: 100 }]);
   assert.deepEqual(first.orphans, second.orphans);
+});
+
+// ─── Plan 05-07: the sub-issue-per-parent ceiling warning ─────────────────
+//
+// D-14: a phase whose parent issue's sub-issue count reaches the warn
+// threshold (90) is reported by `planReconciliation`, computed entirely
+// from `remote.subIssues` — the paginated read the run already performed —
+// and never gates: the same run dispatches the same operations whether or
+// not it warns.
+
+/** Every returned node counts equally: no `state` field, no shape beyond `parentIssueNumber` is read by the count. */
+function subIssuesForParent(parentIssueNumber, count) {
+  return Array.from({ length: count }, (_, index) => ({ id: `SUBISSUE_${parentIssueNumber}_${index}`, number: 2000 + index, parentIssueNumber }));
+}
+
+test('PLAN_SUB_ISSUE_LIMIT and PLAN_SUB_ISSUE_WARN_THRESHOLD are exported with the values 100 and 90', () => {
+  assert.equal(PLAN_SUB_ISSUE_LIMIT, 100);
+  assert.equal(PLAN_SUB_ISSUE_WARN_THRESHOLD, 90);
+});
+
+test('a phase issue with 89 sub-issues produces no warning; the same phase with 90 produces one warning carrying the phase id, the parent issue number, the count, and the limit', () => {
+  const phase = steadyPhase();
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyFieldValues(phase));
+  const map = steadyMap({ contentHashValue: hash, fieldStateValue: fieldState });
+
+  const below = planReconciliation(steadyDesired(phase), { ...steadyRemote(), subIssues: subIssuesForParent(55, 89) }, map);
+  assert.deepEqual(below.subIssueCeilingWarnings, []);
+
+  const at = planReconciliation(steadyDesired(phase), { ...steadyRemote(), subIssues: subIssuesForParent(55, 90) }, map);
+  assert.deepEqual(at.subIssueCeilingWarnings, [{ phaseId: STEADY_ID, issueNumber: 55, count: 90, limit: PLAN_SUB_ISSUE_LIMIT }]);
+});
+
+test('counts of 99, 100, and 137 each produce a warning — the threshold is a floor, not an equality test', () => {
+  const phase = steadyPhase();
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyFieldValues(phase));
+  const map = steadyMap({ contentHashValue: hash, fieldStateValue: fieldState });
+
+  for (const count of [99, 100, 137]) {
+    const plan = planReconciliation(steadyDesired(phase), { ...steadyRemote(), subIssues: subIssuesForParent(55, count) }, map);
+    assert.deepEqual(plan.subIssueCeilingWarnings, [{ phaseId: STEADY_ID, issueNumber: 55, count, limit: PLAN_SUB_ISSUE_LIMIT }], `expected a warning at count ${count}`);
+  }
+});
+
+test('a phase with zero sub-issues produces no warning', () => {
+  const phase = steadyPhase();
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyFieldValues(phase));
+  const map = steadyMap({ contentHashValue: hash, fieldStateValue: fieldState });
+
+  const plan = planReconciliation(steadyDesired(phase), steadyRemote(), map);
+  assert.deepEqual(plan.subIssueCeilingWarnings, []);
+});
+
+test('a snapshot whose subIssues array is absent produces no warnings and no error', () => {
+  const phase = steadyPhase();
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyFieldValues(phase));
+  const map = steadyMap({ contentHashValue: hash, fieldStateValue: fieldState });
+  const remoteNoSubIssuesField = steadyRemote();
+  delete remoteNoSubIssuesField.subIssues;
+
+  assert.doesNotThrow(() => planReconciliation(steadyDesired(phase), remoteNoSubIssuesField, map));
+  const plan = planReconciliation(steadyDesired(phase), remoteNoSubIssuesField, map);
+  assert.deepEqual(plan.subIssueCeilingWarnings, []);
+});
+
+test('sub-issues belonging to two different parents are counted separately, and only the over-threshold parent warns', () => {
+  const two = steadyDesired(steadyPhase());
+  two.phases = [
+    { id: '04', title: 'Phase Four', goal: 'ship it', requirements: [], status: 'Todo' },
+    { id: '06', title: 'Phase Six', goal: 'ship it too', requirements: [], status: 'Todo' },
+  ];
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: STEADY_MILESTONE_NUMBER },
+        [issueKeyFor('04')]: { nodeId: 'ISSUE_NODE_04', issueNumber: 55 },
+        'phase:04': { nodeId: 'item-04', issueNumber: 55 },
+        [issueKeyFor('06')]: { nodeId: 'ISSUE_NODE_06', issueNumber: 66 },
+        'phase:06': { nodeId: 'item-06', issueNumber: 66 },
+      },
+    },
+  };
+  const remoteTwo = { ...steadyRemote(), subIssues: [...subIssuesForParent(55, 40), ...subIssuesForParent(66, 91)] };
+
+  const plan = planReconciliation(two, remoteTwo, map);
+  assert.deepEqual(plan.subIssueCeilingWarnings, [{ phaseId: '06', issueNumber: 66, count: 91, limit: PLAN_SUB_ISSUE_LIMIT }]);
+});
+
+test('every returned sub-issue node counts, with no filtering by state or by whether the child is a known GSD plan', () => {
+  const phase = steadyPhase();
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyFieldValues(phase));
+  const map = steadyMap({ contentHashValue: hash, fieldStateValue: fieldState });
+  // 90 nodes, none of which carry a `state`/`closed` field or any relation to
+  // a known GSD plan id — the count is arithmetic over the node list alone.
+  const unknownChildren = Array.from({ length: 90 }, (_, index) => ({ id: `RANDOM_${index}`, number: 3000 + index, parentIssueNumber: 55, isDraft: true, someOtherField: 'not a gsd plan' }));
+
+  const plan = planReconciliation(steadyDesired(phase), { ...steadyRemote(), subIssues: unknownChildren }, map);
+  assert.deepEqual(plan.subIssueCeilingWarnings, [{ phaseId: STEADY_ID, issueNumber: 55, count: 90, limit: PLAN_SUB_ISSUE_LIMIT }]);
+});
+
+test('the warnings array is always present on the reconciliation plan, empty when nothing applies, matching noops, blocked, and orphans', () => {
+  const phase = steadyPhase();
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyFieldValues(phase));
+  const map = steadyMap({ contentHashValue: hash, fieldStateValue: fieldState });
+
+  const plan = planReconciliation(steadyDesired(phase), steadyRemote(), map);
+  assert.ok(Array.isArray(plan.subIssueCeilingWarnings));
+  assert.deepEqual(plan.subIssueCeilingWarnings, []);
+});
+
+test('a run that warns emits exactly the same operations as the same run with the count reduced below the threshold — the no-gate control', () => {
+  const phase = steadyPhase({ status: 'Done' });
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: STEADY_MILESTONE_NUMBER });
+  const staleFieldState = renderFieldState({ ...steadyFieldValues(phase), status: 'Todo' });
+  const baseMap = steadyMap({ contentHashValue: hash, fieldStateValue: staleFieldState });
+  const mapWithResolvedStatusField = {
+    kind: 'valid',
+    map: {
+      completions: {
+        ...baseMap.map.completions,
+        'field:status': { nodeId: 'FIELD_STATUS' },
+        'option:status:done': { nodeId: 'OPTION_DONE' },
+      },
+    },
+  };
+
+  const belowRemote = { ...steadyRemote(), subIssues: subIssuesForParent(55, PLAN_SUB_ISSUE_WARN_THRESHOLD - 1) };
+  const aboveRemote = { ...steadyRemote(), subIssues: subIssuesForParent(55, PLAN_SUB_ISSUE_WARN_THRESHOLD) };
+
+  const belowPlan = planReconciliation(steadyDesired(phase), belowRemote, mapWithResolvedStatusField);
+  const abovePlan = planReconciliation(steadyDesired(phase), aboveRemote, mapWithResolvedStatusField);
+
+  assert.ok(belowPlan.operations.length > 0, 'fixture must produce real operations for the no-gate control to be meaningful');
+  assert.deepEqual(abovePlan.operations, belowPlan.operations);
+  assert.deepEqual(abovePlan.blocked, belowPlan.blocked);
+  assert.deepEqual(belowPlan.subIssueCeilingWarnings, []);
+  assert.deepEqual(abovePlan.subIssueCeilingWarnings, [{ phaseId: STEADY_ID, issueNumber: 55, count: PLAN_SUB_ISSUE_WARN_THRESHOLD, limit: PLAN_SUB_ISSUE_LIMIT }]);
+});
+
+test('the sub-issue ceiling count requires no additional remote call — a plain JSON remote snapshot (stripped of any function/seam) is sufficient input', () => {
+  const phase = steadyPhase();
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyFieldValues(phase));
+  const map = steadyMap({ contentHashValue: hash, fieldStateValue: fieldState });
+  const remoteWithWarning = { ...steadyRemote(), subIssues: subIssuesForParent(55, 90) };
+  // A round trip through JSON strips any function/prototype the count could
+  // only have obtained by calling out — proving the count is arithmetic over
+  // plain data already in hand, not a fresh transport call.
+  const plainRemote = JSON.parse(JSON.stringify(remoteWithWarning));
+
+  const plan = planReconciliation(steadyDesired(phase), plainRemote, map);
+  assert.deepEqual(plan.subIssueCeilingWarnings, [{ phaseId: STEADY_ID, issueNumber: 55, count: 90, limit: PLAN_SUB_ISSUE_LIMIT }]);
+});
+
+test('warning entries are emitted in ascending phase-id order (the same numeric-aware comparison the orphan pass uses) and are stable across runs', () => {
+  const two = steadyDesired(steadyPhase());
+  two.phases = [
+    { id: '10', title: 'Phase Ten', goal: 'g', requirements: [], status: 'Todo' },
+    { id: '2', title: 'Phase Two', goal: 'g', requirements: [], status: 'Todo' },
+  ];
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: STEADY_MILESTONE_NUMBER },
+        [issueKeyFor('10')]: { nodeId: 'ISSUE_NODE_10', issueNumber: 110 },
+        'phase:10': { nodeId: 'item-10', issueNumber: 110 },
+        [issueKeyFor('2')]: { nodeId: 'ISSUE_NODE_2', issueNumber: 22 },
+        'phase:2': { nodeId: 'item-2', issueNumber: 22 },
+      },
+    },
+  };
+  const remoteBoth = { ...steadyRemote(), subIssues: [...subIssuesForParent(110, 91), ...subIssuesForParent(22, 92)] };
+
+  const first = planReconciliation(two, remoteBoth, map);
+  const second = planReconciliation(two, remoteBoth, map);
+  assert.deepEqual(first.subIssueCeilingWarnings.map((entry) => entry.phaseId), ['2', '10']);
+  assert.deepEqual(first.subIssueCeilingWarnings, second.subIssueCeilingWarnings);
 });
 
 // ─── Plan 04-05 Task 2: item field values (buildFieldValueOperations) ─────
