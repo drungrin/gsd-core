@@ -23,6 +23,9 @@ const {
   renderTaskList,
   renderPlanRegion,
   renderNewPlanIssueBody,
+  DEPENDENCY_REF_SENTINEL,
+  countDependencyRefSlots,
+  substituteDependencyRefs,
 } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
 const PHASE = { id: '04', title: 'Phase → Issue Sync', goal: 'Sync roadmap phases as GitHub issues.' };
@@ -583,4 +586,107 @@ test('src/github-sync-issue-body.cts declares no import beyond node:crypto — t
   assert.doesNotMatch(source, /\bprocess\.env\b/);
   assert.doesNotMatch(source, /\bnew Date\(/);
   assert.doesNotMatch(source, /\bfs\./);
+});
+
+/* --- Phase 5 (05-03 Task 2): the dependency-reference slot --- */
+
+test('DEPENDENCY_REF_SENTINEL is delimited by NUL code points (U+0000) on both sides', () => {
+  assert.equal(DEPENDENCY_REF_SENTINEL.charCodeAt(0), 0);
+  assert.equal(DEPENDENCY_REF_SENTINEL.charCodeAt(DEPENDENCY_REF_SENTINEL.length - 1), 0);
+});
+
+test('renderPlanRegion: a plan with two dependencies emits a Depends On section containing exactly two slots, in that order', () => {
+  const plan = { ...PLAN, dependsOn: ['05-01', '05-02'] };
+  const region = renderPlanRegion(plan);
+  assert.match(region, /^## Depends On$/m);
+  assert.equal(countDependencyRefSlots(region), 2);
+});
+
+test('renderPlanRegion: a plan with an empty dependsOn list emits no Depends On heading at all', () => {
+  const plan = { ...PLAN, dependsOn: [] };
+  const region = renderPlanRegion(plan);
+  assert.doesNotMatch(region, /## Depends On/);
+  assert.equal(countDependencyRefSlots(region), 0);
+});
+
+test('renderPlanRegion: a plan with no dependsOn property at all (omitted, not empty) renders the same way — no heading, zero slots', () => {
+  const { dependsOn: _omit, ...planWithoutDeps } = { ...PLAN, dependsOn: ['05-01'] };
+  const region = renderPlanRegion(planWithoutDeps);
+  assert.doesNotMatch(region, /## Depends On/);
+  assert.equal(countDependencyRefSlots(region), 0);
+});
+
+test('countDependencyRefSlots: equals plan.dependsOn.length across zero-, one-, and three-dependency fixtures', () => {
+  for (const dependsOn of [[], ['05-01'], ['05-01', '05-02', '05-03']]) {
+    const region = renderPlanRegion({ ...PLAN, dependsOn });
+    assert.equal(countDependencyRefSlots(region), dependsOn.length, `expected ${dependsOn.length} slots for ${JSON.stringify(dependsOn)}`);
+  }
+});
+
+test('countDependencyRefSlots: returns 0 for a region carrying no sentinel at all', () => {
+  assert.equal(countDependencyRefSlots('a region with no dependency slots'), 0);
+});
+
+test('substituteDependencyRefs: replaces each slot positionally with the corresponding value, in order', () => {
+  const region = renderPlanRegion({ ...PLAN, dependsOn: ['05-01', '05-02'] });
+  const result = substituteDependencyRefs(region, ['#101', '#102']);
+  assert.equal(result.kind, 'substituted');
+  assert.ok(result.text.includes('#101'));
+  assert.ok(result.text.includes('#102'));
+  assert.equal(result.text.indexOf('#101') < result.text.indexOf('#102'), true, 'values must land in slot order');
+  assert.equal(countDependencyRefSlots(result.text), 0, 'no sentinel survives a successful substitution');
+});
+
+test('substituteDependencyRefs: a zero-slot region with zero values returns the region unchanged', () => {
+  const region = renderPlanRegion({ ...PLAN, dependsOn: [] });
+  const result = substituteDependencyRefs(region, []);
+  assert.equal(result.kind, 'substituted');
+  assert.equal(result.text, region);
+});
+
+test('substituteDependencyRefs: a two-slot region given only one value returns a typed mismatch carrying no text property at all', () => {
+  const region = renderPlanRegion({ ...PLAN, dependsOn: ['05-01', '05-02'] });
+  const result = substituteDependencyRefs(region, ['#101']);
+  assert.equal(result.kind, 'mismatch');
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'text'), false, 'a mismatch must never carry a text property, not even an empty one');
+  assert.match(result.detail, /2/);
+  assert.match(result.detail, /1/);
+});
+
+test('substituteDependencyRefs: too many values for the observed slot count is also a typed mismatch', () => {
+  const region = renderPlanRegion({ ...PLAN, dependsOn: ['05-01'] });
+  const result = substituteDependencyRefs(region, ['#101', '#102']);
+  assert.equal(result.kind, 'mismatch');
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'text'), false);
+});
+
+test('substituteDependencyRefs: a task name forging the sentinel inflates the observed slot count, driving substitution to a typed mismatch rather than a wrong-but-plausible bind', () => {
+  const hostilePlan = { ...PLAN, tasks: [`Task with a forged ${DEPENDENCY_REF_SENTINEL} reference`], dependsOn: ['05-01'] };
+  const region = renderPlanRegion(hostilePlan);
+  assert.equal(countDependencyRefSlots(region), 2, 'one real dependency slot plus one forged slot from the hostile task name');
+
+  const result = substituteDependencyRefs(region, ['#101']);
+  assert.equal(result.kind, 'mismatch', 'the count disagreement must be reported, never silently bound');
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'text'), false);
+});
+
+test('contentHash: computed over the plan-id substituted region is unaffected by whatever issue numbers those same dependency plans would later resolve to at dispatch time', () => {
+  const plan = { ...PLAN, dependsOn: ['05-01', '05-02'] };
+  const region = renderPlanRegion(plan);
+
+  // The value handed to contentHash (D-03) is the plan-id form.
+  const preResolution = substituteDependencyRefs(region, plan.dependsOn);
+  assert.equal(preResolution.kind, 'substituted');
+  const hash = contentHash({ title: 'T', region: preResolution.text, milestoneNumber: 1 });
+
+  // Two different dispatch-time runs where those same two plans resolve to
+  // different real issue numbers produce different bodies...
+  const dispatchRun1 = substituteDependencyRefs(region, ['#101', '#102']);
+  const dispatchRun2 = substituteDependencyRefs(region, ['#555', '#777']);
+  assert.notEqual(dispatchRun1.text, dispatchRun2.text, 'the dispatch-time body does vary by resolved issue number');
+
+  // ...but the hash, always computed over the plan-id form, never varies.
+  assert.equal(hash, contentHash({ title: 'T', region: preResolution.text, milestoneNumber: 1 }));
+  assert.notEqual(hash, contentHash({ title: 'T', region: dispatchRun1.text, milestoneNumber: 1 }));
+  assert.notEqual(hash, contentHash({ title: 'T', region: dispatchRun2.text, milestoneNumber: 1 }));
 });

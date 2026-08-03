@@ -163,6 +163,75 @@ export interface RenderablePlan {
   title: string;
   status: PlanStatus;
   tasks: string[];
+  /**
+   * Plan 05-03 Task 2 (D-02/D-03): ordered plan ids this plan depends on.
+   * Rendered as one dependency-reference slot per entry, resolved to a real
+   * issue reference only at dispatch time (05-06). Optional and defaulting
+   * to empty, mirroring `RenderablePhase.successCriteria`/`.requirements` —
+   * an existing caller that does not yet supply it renders with no
+   * `## Depends On` section at all, exactly as if it had passed `[]`.
+   */
+  dependsOn?: string[];
+}
+
+/**
+ * D-03: a dependency reference is rendered now and resolved later. Delimited
+ * by NUL code points (U+0000) on both sides — a byte sequence that cannot
+ * survive in a well-formed GitHub issue body or in any PLAN.md-derived
+ * developer text, so the sentinel's presence anywhere outside this module's
+ * own output already signals a corrupt input, never a plausible authoring
+ * choice. `countDependencyRefSlots`/`substituteDependencyRefs` below are the
+ * anti-forgery pair: a slot-count disagreement is reported, never guessed
+ * past (T-5-06).
+ */
+export const DEPENDENCY_REF_SENTINEL = ' gsd:dep-ref ';
+
+/**
+ * Counts non-overlapping occurrences of `DEPENDENCY_REF_SENTINEL` in `region`
+ * via the same split-length-minus-one technique `spliceRegion` already uses
+ * for its own fence tokens — literal scanning, no markdown parser.
+ */
+export function countDependencyRefSlots(region: string): number {
+  return region.split(DEPENDENCY_REF_SENTINEL).length - 1;
+}
+
+/**
+ * The two-member result of a dependency-slot substitution. The `mismatch`
+ * member deliberately carries no `text` field at all — mirroring
+ * `SpliceOutcome`'s damaged member — so no caller can read a partial
+ * substitution out of a failed one.
+ */
+export type DependencyRefSubstitution =
+  | { kind: 'substituted'; text: string }
+  | { kind: 'mismatch'; detail: string };
+
+/**
+ * Strictly positional and total: replaces the Nth sentinel occurrence with
+ * the Nth entry of `values`, and scans for nothing else. Refuses — returning
+ * the typed `mismatch` member — when the slot count and the value count
+ * differ, rather than binding a value to the wrong slot or leaving a slot
+ * unfilled. This is the anti-forgery guarantee D-03/T-5-06 rests on: if a
+ * developer string (a task name, a title) ever happened to contain the
+ * sentinel, the observed slot count would no longer match the caller's
+ * intended dependency count, and this function reports rather than silently
+ * mis-binding a reference to the wrong issue.
+ */
+export function substituteDependencyRefs(region: string, values: string[]): DependencyRefSubstitution {
+  const slotCount = countDependencyRefSlots(region);
+  if (slotCount !== values.length) {
+    return {
+      kind: 'mismatch',
+      detail: `expected ${slotCount} dependency reference slot(s), received ${values.length} value(s)`,
+    };
+  }
+  if (slotCount === 0) return { kind: 'substituted', text: region };
+
+  const parts = region.split(DEPENDENCY_REF_SENTINEL);
+  let text = parts[0];
+  for (let index = 0; index < values.length; index += 1) {
+    text += values[index] + parts[index + 1];
+  }
+  return { kind: 'substituted', text };
 }
 
 /**
@@ -207,6 +276,13 @@ const PLAN_PATH_SUFFIX = '-PLAN.md';
 export function renderPlanRegion(plan: RenderablePlan): string {
   const taskLines = plan.tasks.length > 0 ? renderTaskList(plan.status, plan.tasks) : NO_TASKS_PLACEHOLDER;
   const lines: string[] = ['## Tasks', '', TASK_GLYPH_LEGEND, '', taskLines];
+
+  const dependsOn = plan.dependsOn ?? [];
+  if (dependsOn.length > 0) {
+    const refsLine = dependsOn.map(() => DEPENDENCY_REF_SENTINEL).join(', ');
+    lines.push('', '## Depends On', '', refsLine);
+  }
+
   lines.push(
     '',
     '---',
