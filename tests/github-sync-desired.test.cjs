@@ -749,6 +749,38 @@ test('readDesiredState: CR-03 pin — an unreadable phase subdirectory (a file w
   assert.deepEqual(result.malformedPlans, [path.join('phases', '01-one')], 'the offending phase subdirectory is named');
 });
 
+// ─── WR-01 pin (05-REVIEW re-review): wave: 0 is not a positive integer ───
+
+test('readDesiredState: WR-01 pin — wave: 0 does not parse as a real value, falling through to null exactly like an absent wave: key', (t) => {
+  const repoDir = createTempDir('github-sync-desired-wave-zero-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/01-one/01-01-PLAN.md', '---\nwave: 0\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  const plan = result.plans.find((entry) => entry.id === '01-01');
+  assert.equal(
+    plan.wave,
+    null,
+    'WR-01: wave: 0 is not a positive integer, so it no longer parses as the number 0 — every comment describing Wave\'s argv encoding in github-sync-reconcile.cts calls it "a validated positive integer", and 0 is not one',
+  );
+});
+
+test('readDesiredState: WR-01 — a positive wave value still parses normally, unaffected by the tightened regex', (t) => {
+  const repoDir = createTempDir('github-sync-desired-wave-positive-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/01-one/01-01-PLAN.md', '---\nwave: 3\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+  const plan = result.plans.find((entry) => entry.id === '01-01');
+  assert.equal(plan.wave, 3);
+});
+
 // ─── Phase 5 (05-02 Task 1): parseCurrentPlan, derivePlanStatus (D-09) ────
 
 test('parseCurrentPlan: a quoted current_plan frontmatter value returns the plan id', () => {

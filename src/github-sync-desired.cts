@@ -316,7 +316,15 @@ function stripOuterQuotes(value: string): string {
 function parsePlanMetadata(raw: string): Pick<DesiredPlan, 'wave' | 'autonomous' | 'requirements' | 'dependsOn'> | null {
   const frontmatter = /^---\n([\s\S]*?)\n---(?:\n|$)/.exec(raw)?.[1];
   if (!frontmatter) return null;
-  const waveMatch = /^wave:\s*(\d+)\s*$/m.exec(frontmatter);
+  // WR-01 (05-REVIEW re-review): `[1-9]\d*` (never `\d+`) so `wave: 0` does
+  // not parse to the number `0` — every comment in this codebase describing
+  // Wave's argv encoding calls it "a validated positive integer" (e.g.
+  // `github-sync-reconcile.cts`'s `-F` justification), and `0` is not a
+  // positive integer. `\d+` used to accept it, which meant a `wave: 0` plan
+  // dispatched a real field write and left that justification inaccurate for
+  // the one value it didn't actually cover. `wave: 0` now falls through to
+  // `null`, exactly like an absent `wave:` key.
+  const waveMatch = /^wave:\s*([1-9]\d*)\s*$/m.exec(frontmatter);
   const autonomousMatch = /^autonomous:\s*(true|false)\s*$/m.exec(frontmatter);
   const requirementsMatch = /^requirements:\s*\[([^\]]*)\]\s*$/m.exec(frontmatter);
   // Same bracket-list shape `requirements` uses; `depends_on` entries are
