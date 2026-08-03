@@ -64,6 +64,7 @@ test('readDesiredState returns fixed typed unavailable data for malformed local 
     currentPlan: null,
     milestones: [],
     duplicateMilestones: [],
+    malformedPlans: [],
   });
 });
 
@@ -697,6 +698,55 @@ test('readPlans (via readDesiredState): title populates through all three planTi
   assert.equal(byId('01-02').title, '01-02 — One');
   assert.deepEqual(byId('01-02').tasks, []);
   assert.equal(byId('03-01').title, '03-01');
+});
+
+// ─── CR-03 pin (05-REVIEW re-review): one malformed plan file/subdirectory
+// never silences the whole readPlans/readDesiredState run ──────────────────
+
+test('readDesiredState: CR-03 pin — a PLAN.md with no frontmatter block is skipped and named in malformedPlans, never suppressing sibling plans in the same or another phase directory', (t) => {
+  const repoDir = createTempDir('github-sync-desired-malformed-plan-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n\n### Phase 02: Two\n\n**Goal**: two\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/01-one/01-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+  // No frontmatter block at all — a legacy pre-frontmatter-era file, or a
+  // plan mid-edit when sync happens to run: exactly the case CR-03 covers.
+  write(repoDir, '.planning/phases/01-one/01-02-PLAN.md', '# Just a heading, no frontmatter block\n');
+  write(repoDir, '.planning/phases/02-two/02-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true, 'CR-03: one malformed plan file no longer collapses the whole read to unavailable()');
+  assert.equal(result.reason, DESIRED_REASON.OK);
+  assert.deepEqual(
+    result.plans.map((plan) => plan.id),
+    ['01-01', '02-01'],
+    'the two well-formed plans, across both phase directories, still parse — the malformed sibling is skipped, not the whole tree',
+  );
+  assert.deepEqual(
+    result.malformedPlans,
+    [path.join('phases', '01-one', '01-02-PLAN.md')],
+    'the offending file\'s path is named, not collapsed into a single opaque local_unavailable reason',
+  );
+});
+
+test('readDesiredState: CR-03 pin — an unreadable phase subdirectory (a file where a directory is expected) is skipped and named in malformedPlans, without aborting other phase directories', (t) => {
+  const repoDir = createTempDir('github-sync-desired-malformed-phasedir-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n\n### Phase 02: Two\n\n**Goal**: two\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/02-two/02-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+  // A regular file at the phase-subdirectory path — fs.readdirSync throws
+  // ENOTDIR on it, the same fault class a permissions error would cause.
+  const phasesDir = path.join(repoDir, '.planning', 'phases');
+  fs.mkdirSync(phasesDir, { recursive: true });
+  fs.writeFileSync(path.join(phasesDir, '01-one'), 'not a directory\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true, 'CR-03: one unreadable phase subdirectory no longer collapses the whole read to unavailable()');
+  assert.deepEqual(result.plans.map((plan) => plan.id), ['02-01'], 'the other phase directory\'s plan still parses');
+  assert.deepEqual(result.malformedPlans, [path.join('phases', '01-one')], 'the offending phase subdirectory is named');
 });
 
 // ─── Phase 5 (05-02 Task 1): parseCurrentPlan, derivePlanStatus (D-09) ────

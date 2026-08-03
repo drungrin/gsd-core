@@ -90,6 +90,16 @@ interface DesiredState {
   milestones: DesiredMilestone[];
   /** Titles of desired-milestone entries discarded by dedupeMilestonesByVersion (D-26 identity, cycle-2 non-HIGH #5). */
   duplicateMilestones: string[];
+  /**
+   * CR-03 (05-REVIEW re-review): `<planningDir>`-relative paths of
+   * `<NN>-<PP>-PLAN.md` files `readPlans` could not parse (no frontmatter
+   * block, or an unreadable phase subdirectory/file) — skipped individually
+   * rather than collapsing the whole read to `unavailable()`, so one
+   * malformed or legacy plan file never silences sync for every other phase
+   * and plan. Empty when every plan file parsed cleanly, which is the
+   * overwhelming common case.
+   */
+  malformedPlans: string[];
 }
 
 function unavailable(): DesiredState {
@@ -102,6 +112,7 @@ function unavailable(): DesiredState {
     currentPlan: null,
     milestones: [],
     duplicateMilestones: [],
+    malformedPlans: [],
   };
 }
 
@@ -372,24 +383,58 @@ function parsePlanTaskNames(raw: string): string[] {
   return names;
 }
 
-function readPlans(planningDir: string, roadmapRaw: string, phases: DesiredPhase[] | null, currentPlanId: string | null): DesiredPlan[] | null {
+/**
+ * CR-03 (05-REVIEW re-review): scopes every failure to the one offending
+ * plan file (or phase subdirectory), never the whole tree. Previously a
+ * single `<NN>-<PP>-PLAN.md` with no frontmatter, or one unreadable phase
+ * subdirectory/file, made this function return `null`, which
+ * `readDesiredState` collapsed into `unavailable()` — silencing sync for
+ * every phase and plan in the repository until the one bad file was found
+ * and fixed, with no indication of which file was at fault. Each of the
+ * three failure sites below now records the offending path in `malformed`
+ * and `continue`s (or, for a whole phase subdirectory, skips just that
+ * directory) instead of aborting the read — mirroring the "one bad object
+ * never suppresses the rest of the run" principle this same phase applies
+ * everywhere else it introduces new failure surface (an unresolvable
+ * dependency blocks one plan, a damaged fence blocks one issue, an
+ * unresolved field blocks one phase's writes).
+ */
+function readPlans(planningDir: string, roadmapRaw: string, phases: DesiredPhase[] | null, currentPlanId: string | null): { plans: DesiredPlan[]; malformed: string[] } {
   const phaseRoot = path.join(planningDir, 'phases');
   let phaseDirs: string[];
-  try { phaseDirs = fs.readdirSync(phaseRoot); } catch { return []; }
+  try { phaseDirs = fs.readdirSync(phaseRoot); } catch { return { plans: [], malformed: [] }; }
   const planDescriptions = parseRoadmapPlanDescriptions(roadmapRaw);
   const phaseTitles = new Map<string, string>((phases ?? []).map((phase) => [phase.id, phase.title]));
   const plans: DesiredPlan[] = [];
+  const malformed: string[] = [];
   for (const phaseDir of phaseDirs.sort()) {
     const directory = path.join(phaseRoot, phaseDir);
     let entries: string[];
-    try { entries = fs.readdirSync(directory); } catch { return null; }
+    try {
+      entries = fs.readdirSync(directory);
+    } catch {
+      // An unreadable phase subdirectory (permissions, a file where a
+      // directory was expected, etc.) is scoped to itself — every other
+      // phase directory is still walked.
+      malformed.push(path.join('phases', phaseDir));
+      continue;
+    }
     for (const entry of entries.sort()) {
       const match = /^(\d+(?:\.\d+)?)-(\d+)-PLAN\.md$/.exec(entry);
       if (!match) continue;
+      const relativePath = path.join('phases', phaseDir, entry);
       let raw: string;
-      try { raw = fs.readFileSync(path.join(directory, entry), 'utf8'); } catch { return null; }
+      try {
+        raw = fs.readFileSync(path.join(directory, entry), 'utf8');
+      } catch {
+        malformed.push(relativePath);
+        continue;
+      }
       const metadata = parsePlanMetadata(raw);
-      if (!metadata) return null;
+      if (!metadata) {
+        malformed.push(relativePath);
+        continue;
+      }
       const id = `${normalizeId(match[1])}-${match[2]}`;
       const phaseId = normalizeId(match[1]);
       const complete = fs.existsSync(path.join(directory, `${match[1]}-${match[2]}-SUMMARY.md`));
@@ -404,7 +449,7 @@ function readPlans(planningDir: string, roadmapRaw: string, phases: DesiredPhase
       });
     }
   }
-  return plans.sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
+  return { plans: plans.sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true })), malformed };
 }
 
 const EM_DASH = '—';
@@ -584,18 +629,26 @@ function readDesiredState(cwd: string): DesiredState {
     const currentPlan = parseCurrentPlan(stateRaw);
     const checklist = parsePhaseChecklist(roadmapRaw);
     const phases = parseRoadmap(roadmapRaw, checklist, currentPhase);
-    const plans = readPlans(planningDir, roadmapRaw, phases, currentPlan);
+    // CR-03 (05-REVIEW re-review): readPlans() itself never returns null any
+    // more — a malformed plan file (or unreadable phase subdirectory) is
+    // scoped to itself and recorded in `malformed` instead of aborting the
+    // whole read, so it is deliberately NOT part of the `unavailable()` gate
+    // below. A malformed plan degrades the plans array by exactly one entry
+    // (named in `malformedPlans`) and never suppresses every other phase and
+    // plan.
+    const plansResult = readPlans(planningDir, roadmapRaw, phases, currentPlan);
     const milestonesResult = parseMilestones(roadmapRaw, stateRaw, planningDir);
-    if (!phases || !currentPhase || !plans || !milestonesResult) return unavailable();
+    if (!phases || !currentPhase || !milestonesResult) return unavailable();
     return {
       available: true,
       reason: DESIRED_REASON.OK,
       phases,
-      plans,
+      plans: plansResult.plans,
       currentPhase,
       currentPlan,
       milestones: milestonesResult.milestones,
       duplicateMilestones: milestonesResult.duplicates,
+      malformedPlans: plansResult.malformed,
     };
   } catch {
     return unavailable();
