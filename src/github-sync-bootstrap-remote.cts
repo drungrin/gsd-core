@@ -164,6 +164,13 @@ const BOOTSTRAP_DOCUMENTS = Object.freeze({
   // `buildUpdateViewShapeOperation` uses to pick between this and
   // `updateViewShapeWithFilter`.
   updateViewShape: 'mutation($viewId:ID!,$name:String!,$layout:ProjectV2ViewLayout!) { # github-sync-bootstrap:updateViewShape\n updateProjectV2View(input:{viewId:$viewId,name:$name,layout:$layout}) { projectV2View { id name layout } } }',
+  // Phase 6 D-09/D-11 (plan 06-04): the leftmost-view retype — exactly two
+  // variables, `viewId` and `layout`, and no way to express a name, filter,
+  // or configuration write (T-06-14). Dispatched by
+  // github-sync-bootstrap-plan.cts's planLeftmostViewLayout, not this
+  // module — pinned byte-identical to that module's local copy by a
+  // differential test, the same pattern updateViewShape establishes.
+  updateViewLayout: 'mutation($viewId:ID!,$layout:ProjectV2ViewLayout!) { # github-sync-bootstrap:updateViewLayout\n updateProjectV2View(input:{viewId:$viewId,layout:$layout}) { projectV2View { id layout } } }',
 });
 
 const STATUS_FIELD_NAME = 'Status';

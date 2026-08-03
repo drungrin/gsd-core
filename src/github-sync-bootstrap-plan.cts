@@ -75,6 +75,12 @@ const BOOTSTRAP_LOGICAL_KEY = Object.freeze({
   // rule P3 D-17/D-23 established. No caller concatenates the `view:` prefix
   // by hand.
   view: (name: string): string => `view:${slug(name)}`,
+  // Phase 6 D-09/plan 06-04: the adopted leftmost view's own reserved key —
+  // a nullary generator, not a `view(name)` call, so the reserved string
+  // cannot be produced accidentally by a GSD view specification named
+  // "Leftmost". Identity here is positional (the observed leftmost view),
+  // never a name — see `planLeftmostViewLayout`'s own comment for why.
+  leftmostView: (): string => 'view:leftmost',
 });
 
 /** D-19 order: Todo, In Progress, Blocked, Done, Deferred. Colours/descriptions set once, never reconciled (D-18). */
@@ -1229,6 +1235,106 @@ function planViews(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, co
   return { operations, checkpoints, blocked };
 }
 
+// ─── planLeftmostViewLayout ─────────────────────────────────────────────────
+
+// Duplicated from src/github-sync-bootstrap-remote.cts's BOOTSTRAP_DOCUMENTS,
+// byte-for-byte — a differential test pins the copies against each other,
+// the same pattern every other view document above establishes. No
+// `rateLimit` selection, for the same live-verified reason. Carries exactly
+// two variables — `viewId` and `layout` — and cannot express a name, filter,
+// or configuration write; T-06-14's mitigation.
+const UPDATE_VIEW_LAYOUT_DOCUMENT =
+  'mutation($viewId:ID!,$layout:ProjectV2ViewLayout!) { # github-sync-bootstrap:updateViewLayout\n' +
+  ' updateProjectV2View(input:{viewId:$viewId,layout:$layout}) { projectV2View { id layout } } }';
+
+/**
+ * D-09/D-11's single-property retype: `viewId` rides a literal (the view was
+ * observed on THIS run's own `views` read, the same reason
+ * `buildRenameFieldOperation`'s `fieldId` rides a literal rather than an
+ * `ArgvRef`) and `layout` is the caller's already-validated configured value.
+ * No `name`, no `filter`, no `configuration` — the document itself has no
+ * variable for any of them.
+ */
+function buildUpdateViewLayoutOperation(remoteView: RemoteViewLike, layout: string, context: CompletionContext): StageTaggedOperation {
+  const leftmostKey = BOOTSTRAP_LOGICAL_KEY.leftmostView();
+  return {
+    kind: 'update-view-layout',
+    logicalKey: leftmostKey,
+    args: [
+      'api', 'graphql',
+      '-f', `query=${UPDATE_VIEW_LAYOUT_DOCUMENT}`,
+      '-f', `viewId=${remoteView.id}`,
+      '-f', `layout=${layout}`,
+    ],
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.UPDATE,
+    hasPointsBudget: false,
+    // Re-points an existing view's layout — mints nothing new.
+    contentCreation: false,
+    captures: [{ kind: 'node', logicalKey: leftmostKey, nodeIdPath: 'updateProjectV2View.projectV2View.id' }],
+    stage: BOOTSTRAP_STAGE.VIEWS,
+  };
+}
+
+interface LeftmostViewPlanResult {
+  operations: StageTaggedOperation[];
+  checkpoints: StageTaggedCheckpoint[];
+}
+
+/**
+ * D-09..D-11's leftmost-view retype. `remote.views` is read with
+ * `orderBy: {field: POSITION, direction: ASC}` (github-sync-bootstrap-remote
+ * .cts's `BOOTSTRAP_DOCUMENTS.views`), so `remote.views[0]` — read
+ * POSITIONALLY, never through the `view:leftmost` completion — reflects the
+ * real visual tab order, including after a manual drag (T-06-13's
+ * mitigation). This is a deliberate departure from D-01's stored-id-first
+ * identity rule: the property this key satisfies ("the board opens on
+ * something useful") is positional by definition, so following a stored id
+ * would keep retyping a view the board no longer opens on once a developer
+ * reorders tabs. The `view:leftmost` completion this function's own
+ * checkpoint/capture writes is a record of what was adopted, not the
+ * identity source for the next run.
+ *
+ * An empty `remote.views` (no project yet, or a genuinely view-less board)
+ * has nothing adoptable and returns zero operations, zero checkpoints — the
+ * same "nothing to do yet" shape `planViews`' own unset short-circuit
+ * returns, reached here without a separate check because `remote.views` is
+ * always empty on that outcome too (github-sync-bootstrap-remote.cts only
+ * populates it once the project itself resolves).
+ *
+ * The leftmost view is excluded from adoption by TWO independent checks
+ * (D-11): its name matches one of `GSD_VIEWS`' five declared names (catches
+ * a board GSD bootstrapped before this key existed), or its id equals the
+ * stored `view:<slug>` completion for one of the five (catches a GSD view a
+ * developer renamed by hand, which D-01's own identity rule would still
+ * recognise as GSD's). Either match means the key is satisfied with zero
+ * operations — no view is ever minted, and a GSD-owned view's layout is
+ * `planViews`' concern, not this one's.
+ */
+function planLeftmostViewLayout(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, configuredLayout: string, context: CompletionContext): LeftmostViewPlanResult {
+  const remoteViews = remote.views ?? [];
+  if (remoteViews.length === 0) return { operations: [], checkpoints: [] };
+
+  const leftmost = remoteViews[0];
+
+  if (GSD_VIEWS.some((gsdView) => gsdView.name === leftmost.name)) return { operations: [], checkpoints: [] };
+
+  const completions = strictMap.kind === 'valid' ? strictMap.map?.completions ?? {} : {};
+  const isGsdViewById = GSD_VIEWS.some((gsdView) => completions[BOOTSTRAP_LOGICAL_KEY.view(gsdView.name)]?.nodeId === leftmost.id);
+  if (isGsdViewById) return { operations: [], checkpoints: [] };
+
+  const leftmostKey = BOOTSTRAP_LOGICAL_KEY.leftmostView();
+  if (leftmost.layout === configuredLayout) {
+    return {
+      operations: [],
+      checkpoints: [{ logicalKey: leftmostKey, nodeId: leftmost.id, completionContext: context, stage: BOOTSTRAP_STAGE.VIEWS }],
+    };
+  }
+
+  return { operations: [buildUpdateViewLayoutOperation(leftmost, configuredLayout, context)], checkpoints: [] };
+}
+
 // ─── remote-layer to operation-layer reason translation (cycle-2 non-HIGH #14) ──
 
 /**
@@ -1438,6 +1544,8 @@ interface PlanBootstrapInput {
   strictMap: StrictMapLike;
   target: BootstrapTarget;
   projectTitle?: string | null;
+  /** Phase 6 plan 06-04: the already-validated `github_sync.view.layout` GraphQL enum member. Absent (an un-updated caller) falls back to `VIEW_LAYOUT.BOARD`, never `undefined` reaching argv. */
+  viewLayout?: string;
 }
 
 interface BootstrapPlan {
@@ -1543,27 +1651,34 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
   // and blocked entries into every return path below.
   const viewsPlan = planViews(input.remote, input.strictMap, context);
 
+  // Phase 6 D-09..D-11/plan 06-04: the leftmost-view retype runs immediately
+  // after planViews, folded into every return path the same way — an
+  // un-updated caller (viewLayout absent) still gets the documented `board`
+  // default rather than `undefined` reaching argv.
+  const configuredLayout = input.viewLayout ?? VIEW_LAYOUT.BOARD;
+  const leftmostViewPlan = planLeftmostViewLayout(input.remote, input.strictMap, configuredLayout, context);
+
   if (merge.kind === 'noop') {
     return {
       ...emptyPlan(),
       noops: [{ reason: merge.reason }],
-      operations: [...autonomousPlan.operations, ...viewsPlan.operations],
-      checkpoints: [...autonomousPlan.checkpoints, ...viewsPlan.checkpoints],
+      operations: [...autonomousPlan.operations, ...viewsPlan.operations, ...leftmostViewPlan.operations],
+      checkpoints: [...autonomousPlan.checkpoints, ...viewsPlan.checkpoints, ...leftmostViewPlan.checkpoints],
       blocked: viewsPlan.blocked,
     };
   }
   if (merge.kind === 'converged') {
     return {
       ...emptyPlan(),
-      checkpoints: [...merge.checkpoints, ...autonomousPlan.checkpoints, ...viewsPlan.checkpoints],
-      operations: [...autonomousPlan.operations, ...viewsPlan.operations],
+      checkpoints: [...merge.checkpoints, ...autonomousPlan.checkpoints, ...viewsPlan.checkpoints, ...leftmostViewPlan.checkpoints],
+      operations: [...autonomousPlan.operations, ...viewsPlan.operations, ...leftmostViewPlan.operations],
       blocked: viewsPlan.blocked,
     };
   }
   return {
     ...emptyPlan(),
-    operations: [merge.operation, ...autonomousPlan.operations, ...viewsPlan.operations],
-    checkpoints: [...autonomousPlan.checkpoints, ...viewsPlan.checkpoints],
+    operations: [merge.operation, ...autonomousPlan.operations, ...viewsPlan.operations, ...leftmostViewPlan.operations],
+    checkpoints: [...autonomousPlan.checkpoints, ...viewsPlan.checkpoints, ...leftmostViewPlan.checkpoints],
     blocked: viewsPlan.blocked,
   };
 }
@@ -1577,6 +1692,7 @@ export = {
   planLabels,
   planMilestones,
   planViews,
+  planLeftmostViewLayout,
   parseMilestoneVersionToken,
   validateFatalConditions,
   optionInputArgv,
@@ -1603,4 +1719,5 @@ export = {
   UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT,
   CREATE_VIEW_DOCUMENT,
   UPDATE_VIEW_SHAPE_DOCUMENT,
+  UPDATE_VIEW_LAYOUT_DOCUMENT,
 };
