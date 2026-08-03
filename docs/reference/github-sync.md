@@ -132,6 +132,108 @@ gsd-tools github-sync sync [--raw]
 Reconciles phase and plan state into GitHub Issues linked to the Project board, following the
 same one-way, checkpointed-apply discipline `init` uses for the board's own structure.
 
+## Phase Issues
+
+`sync` mirrors every `.planning/ROADMAP.md` phase into a repository Issue: created if none is
+mapped yet, updated in place on every later `sync` if its content has drifted, and never
+duplicated. Each phase issue carries the `gsd:phase` label, is assigned to its GSD milestone, and
+is added to the Project board as an item.
+
+### Identity marker
+
+The first line of a phase issue's body is an identity marker:
+
+```
+<!-- gsd:phase id="04" -->
+```
+
+This is the issue's identity, independent of the generated region below it. It is what a future
+repair path (not shipped by this capability today) would use to re-find an issue if the local
+sync map were ever lost — which is why it is a *separate* token from the fence pair that follows,
+rather than combined into one delimiter: a developer who damages or removes the generated region
+still leaves an issue whose identity is intact and repairable.
+
+### The fenced region
+
+Everything GSD generates and rewrites lives between two literal fence tokens:
+
+```
+<!-- gsd:begin -->
+<!-- gsd:end -->
+```
+
+**The contract, in one sentence: everything between the fences is regenerated on every `sync`;
+everything outside them — above the begin fence, below the end fence — is preserved
+byte-for-byte and keeps its exact position.** A developer can write anything they like around a
+phase issue's generated region — a note, a link, a follow-up comment — and it survives every
+future `sync`.
+
+**The one edit that does *not* survive is an edit made *inside* the fences.** If a developer
+edits the goal, the success-criteria list, or the requirement IDs directly on GitHub, that edit
+is silently overwritten the next time `sync` runs and the phase's content has changed on
+`ROADMAP.md`'s side (the content hash no longer matches, so the whole region is rewritten from
+disk). **GSD cannot detect that this happened** — the stored content hash tracks GSD's own
+intent, not a live diff against the remote body, so a hand-edited region reads as "unchanged"
+right up until the roadmap moves and the region is regenerated out from under it. This is a
+recorded tradeoff, not an oversight: a developer is entitled to know it before their first `sync`,
+not discover it after their first loss. **Treat the region as read-only** — write commentary
+outside the fences instead.
+
+### What the region carries
+
+Inside the fences: the phase's goal under a `## Goal` heading, its success criteria as a plain
+numbered list under `## Success Criteria`, and its requirement IDs as plain comma-separated text
+under `## Requirements` — followed by a provenance line naming `.planning/ROADMAP.md` and the
+phase's own section, so a reader arriving from a GitHub notification understands the issue is a
+projection before they consider editing it. No markdown checkbox appears anywhere in the region:
+a one-way mirror must never invite an edit it will silently discard.
+
+### Damaged regions
+
+If a phase issue's body has no fence pair at all, `sync` treats it as unambiguous drift-free
+recovery and appends a fresh region to the end of the body, leaving every existing line verbatim
+— nothing generated was ever at risk, so this case self-heals with no report.
+
+If the fence pair is unbalanced, duplicated, or inverted (an end fence appearing before its
+begin fence), `sync` refuses to guess: it writes nothing to that issue and names it in the run's
+report as needing manual repair. **The repair a developer performs:** open the issue on GitHub
+and hand-edit the body so exactly one `<!-- gsd:begin -->` and one `<!-- gsd:end -->` appear, in
+that order — the next `sync` then converges it normally.
+
+### Board fields
+
+`sync` writes four item fields on the Project board: the built-in `GSD ID` (the phase's own
+logical key, e.g. `phase:04`), `Phase` (the phase id exactly as it appears on disk), and
+`Requirements` (the comma-joined requirement-id list) as plain text, plus the built-in `Status`
+single-select — derived from `.planning/ROADMAP.md`'s checklist together with `STATE.md`'s
+current phase, never from a hand-edited board value. `Wave` and `Autonomous` are deliberately
+left empty by this capability: both are plan-level facts, populated once plan sub-issues sync.
+
+**Issue open/closed state is never touched by phase-issue sync.** Completing a phase does not
+close its issue — that would be a second, weaker state machine driven by a hand-edited roadmap
+checkbox, and Phase 6 is expected to revisit whether plan sub-issues justify it.
+
+### What is deliberately never done
+
+Phase-issue sync never closes, reopens, deletes, comments on, or relabels an issue it manages.
+A phase removed from `ROADMAP.md` — or renumbered, which orphans its old id — has its issue and
+map entry left exactly in place: `status` and `sync` report it as an orphaned phase issue by
+number, and nothing more. Nothing GSD did not create is ever destroyed.
+
+### Scope requirement
+
+Creating and updating phase issues writes to Projects v2, the same as every other mutation in
+this capability, and needs the `project` OAuth scope:
+
+```
+gh auth refresh -s project
+```
+
+See [The `project` scope](#the-project-scope) under `preflight` below for the CI/token
+alternative.
+
+---
+
 ## `preflight`
 
 **Synopsis**
