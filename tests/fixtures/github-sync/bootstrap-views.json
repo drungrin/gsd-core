@@ -1,0 +1,33 @@
+{
+  "provenance": "Recorded live against drungrin/gsd-core Project v2 board #10 'GSD Sync UAT 02' (PVT_kwHOAMcbHs4BfFaJ), 2026-08-03, gh 2.96.0 (2026-07-02). Captured during plan 06-01 Task 1's D-07 tracer probe: viewsReadResponse is the real `views` connection read before any GSD view existed; createViewResponse and updateViewFilterResponse are the real create-then-update pair dispatched against a throwaway probe view (name 'GSD Probe (delete me)', deleted via deleteProjectV2View immediately after — the only use of that mutation anywhere in this phase). Full transcripts, including the two additional filter-grammar probes (label:gsd:phase, label:gsd:plan) and the teardown, are recorded verbatim in .planning/phases/06-views-capability-documentation/06-VIEW-PROBE.md. Not hand-authored.",
+  "viewsReadResponse": {
+    "data": {
+      "repositoryOwner": {
+        "projectV2": {
+          "id": "PVT_kwHOAMcbHs4BfFaJ",
+          "views": {
+            "nodes": [
+              { "id": "PVTV_lAHOAMcbHs4BfFaJzgLKWSY", "name": "View 1", "layout": "TABLE_LAYOUT", "filter": null },
+              { "id": "PVTV_lAHOAMcbHs4BfFaJzgLLiTg", "name": "View 2", "layout": "BOARD_LAYOUT", "filter": null }
+            ],
+            "pageInfo": { "hasNextPage": false, "endCursor": "Mg" }
+          }
+        }
+      }
+    }
+  },
+  "createViewResponse": {
+    "data": {
+      "createProjectV2View": {
+        "projectV2View": { "id": "PVTV_lAHOAMcbHs4BfFaJzgLLwBI", "name": "GSD Probe (delete me)", "layout": "TABLE_LAYOUT" }
+      }
+    }
+  },
+  "updateViewFilterResponse": {
+    "data": {
+      "updateProjectV2View": {
+        "projectV2View": { "id": "PVTV_lAHOAMcbHs4BfFaJzgLLwBI", "name": "GSD Probe (delete me)", "layout": "TABLE_LAYOUT", "filter": "-status:Done" }
+      }
+    }
+  }
+}

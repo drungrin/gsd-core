@@ -14,12 +14,17 @@ const {
   BOOTSTRAP_REMOTE_REASON,
   PROJECT_OUTCOME,
   STATUS_FIELD_NAME,
+  BOOTSTRAP_DOCUMENTS,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
 
 const repoObjectsFixture = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/bootstrap-repo-objects.json'), 'utf8'),
 );
-const { planStatusOptionMerge, planProject, planFields, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
+const { planStatusOptionMerge, planProject, planFields, planViews, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
+
+const bootstrapViewsFixture = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/bootstrap-views.json'), 'utf8'),
+);
 
 function envelope(data) {
   return { data };
@@ -438,7 +443,12 @@ const bootstrapContract = JSON.parse(
  * them as MutationOperations, applied later by applyMutationPlan) — they are
  * captured here from planProject's own emitted operation args, in the
  * create-path scenario, so Guard 1's completeness check still sees all four
- * contract-registered document names.
+ * contract-registered document names. Plan 06-01 Task 2: `views` IS
+ * dispatched by readBootstrapRemoteState itself (unconditionally, on every
+ * resolved-project read) and is captured the same way `repository`/
+ * `fieldsWithTypes` are; `createViewWithFields`/`updateViewShapeWithFilter`
+ * are captured from planViews' own emitted operations, mirroring the
+ * planFields/planProject precedent above.
  */
 function captureDispatchedBootstrapDocuments() {
   const documents = new Map();
@@ -451,7 +461,7 @@ function captureDispatchedBootstrapDocuments() {
       // GraphQL-only document-contract harness (Guard 1 below asserts
       // completeness over BOOTSTRAP_DOCUMENTS, not over every execGh call).
       if (!query) return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify([[]]) };
-      const name = ['repository', 'fieldsWithTypes'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
+      const name = ['repository', 'fieldsWithTypes', 'views'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
       if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
       if (name === 'repository') {
         return {
@@ -459,17 +469,10 @@ function captureDispatchedBootstrapDocuments() {
           stdout: JSON.stringify({ data: { repository: { id: 'R_1', owner: { id: 'O_1', login: 'octo' }, projectsV2: { nodes: [{ number: 7 }], pageInfo: { hasNextPage: false, endCursor: null } } } } }),
         };
       }
-      // Plan 06-01 Task 1: readBootstrapRemoteState now unconditionally
-      // dispatches the views document on every resolved-project read. This
-      // harness gives it a decodable empty response WITHOUT yet capturing it
-      // into `documents` (and it is not yet registered in the contract
-      // fixture) — Task 2 extends this harness to capture and register it,
-      // alongside the two new mutation documents, per Guard 1's completeness
-      // requirement.
-      if (query.includes('github-sync-bootstrap:views')) {
+      if (name === 'views') {
         return {
           exitCode: 0, reason: 'ok', stderr: '',
-          stdout: JSON.stringify({ data: { repositoryOwner: { projectV2: { views: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } }),
+          stdout: JSON.stringify(bootstrapViewsFixture.viewsReadResponse),
         };
       }
       return {
@@ -511,6 +514,20 @@ function captureDispatchedBootstrapDocuments() {
     const query = operation.args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
     const name = ['createFieldText', 'createFieldNumber', 'createFieldSingleSelect', 'renameField']
       .find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
+    if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
+  }
+
+  // plan 06-01 Task 2: createViewWithFields/updateViewShapeWithFilter are
+  // captured from planViews' own create-path plan (an empty views list and a
+  // resolvable Status field, so Backlog's create+update pair both emit).
+  const viewsCreatePathPlan = planViews(
+    { available: true, projectOutcome: 'resolved', statusField: null, fields: [{ id: 'PVTSSF_1', name: 'Status', dataType: 'SINGLE_SELECT', options: [] }], views: [] },
+    { kind: 'absent' },
+    { owner: 'octo', repo: 'example', repositoryNumber: 1 },
+  );
+  for (const operation of viewsCreatePathPlan.operations) {
+    const query = operation.args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
+    const name = ['createViewWithFields', 'updateViewShapeWithFilter'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
     if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
   }
 
@@ -620,6 +637,60 @@ describe('bootstrap GraphQL document contract', () => {
     for (const key of keys) {
       assert.ok(bootstrapContract.documents.fieldsWithTypes.selects.includes(key), `fixture key ${key} drifted from the recorded selection`);
     }
+  });
+
+  // ─── the same five guards, applied to the `views` document (plan 06-01 ──
+  // Task 2) — the first `nodeKind: "OBJECT"` paginated entry in this
+  // contract, so Guard 2 here proves the NEGATIVE: no fragment is required.
+
+  test('completeness (Guard 1, views-specific): the views document is dispatched by readBootstrapRemoteState itself and carries the orderBy:POSITION argument', () => {
+    const documents = captureDispatchedBootstrapDocuments();
+    assert.ok(documents.has('views'), 'views must be captured as an actually-dispatched document');
+    assert.match(documents.get('views'), /orderBy:\{field:POSITION,\s*direction:ASC\}/);
+  });
+
+  test('union safety (Guard 2, views): a concrete OBJECT node type selects bare scalars directly, with no inline fragment required or present', () => {
+    const documents = captureDispatchedBootstrapDocuments();
+    const nodesBody = extractBody(documents.get('views'), 'nodes');
+    assert.ok(nodesBody, 'views must select a nodes block');
+    assert.equal(collectInlineFragments(nodesBody).length, 0, 'an OBJECT type needs no inline fragment');
+    assert.equal(bootstrapContract.documents.views.nodeKind, 'OBJECT');
+    assert.deepEqual(bootstrapContract.documents.views.fragmentTargets, []);
+  });
+
+  test('selection parity (Guard 3, views): the bare scalar selection inside nodes equals the recorded selects list, minus the nested pageInfo block', () => {
+    const documents = captureDispatchedBootstrapDocuments();
+    const nodesBody = extractBody(documents.get('views'), 'nodes');
+    const fieldNames = collectDepthZeroFieldNames(nodesBody);
+    assert.deepStrictEqual(fieldNames.sort(), [...bootstrapContract.documents.views.selects].sort());
+  });
+
+  test('pagination (Guard 4, views): the views document selects pageInfo { hasNextPage endCursor } AND carries orderBy:{field:POSITION,direction:ASC} (RESEARCH Pitfall 1)', () => {
+    const documents = captureDispatchedBootstrapDocuments();
+    const query = documents.get('views');
+    const pageInfoBody = extractBody(query, 'pageInfo');
+    assert.ok(pageInfoBody, 'views must select pageInfo');
+    const fields = [...pageInfoBody.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)].map((m) => m[0]);
+    assert.deepStrictEqual(fields.sort(), ['endCursor', 'hasNextPage']);
+    assert.match(query, /orderBy:\{field:POSITION,\s*direction:ASC\}/);
+  });
+
+  test('fixture parity (Guard 5, views): every key on the live-captured views node falls within the recorded selects list', () => {
+    const viewNode = bootstrapViewsFixture.viewsReadResponse.data.repositoryOwner.projectV2.views.nodes[0];
+    const keys = Object.keys(viewNode);
+    for (const key of keys) {
+      assert.ok(bootstrapContract.documents.views.selects.includes(key), `fixture key ${key} drifted from the recorded selection`);
+    }
+  });
+
+  test('deliberately dropping the orderBy argument from BOOTSTRAP_DOCUMENTS.views would fail Guard 1/4\'s orderBy assertions (verifies the guard actually detects the regression it exists for)', () => {
+    // A direct fail-first control on the live production document text
+    // itself, not merely the harness: this does not mutate the module, it
+    // just proves the regex the two guards above depend on is not
+    // vacuously true against text that lacks the argument.
+    const withoutOrderBy = BOOTSTRAP_DOCUMENTS.views.replace(/,orderBy:\{field:POSITION,direction:ASC\}/, '');
+    assert.doesNotMatch(withoutOrderBy, /orderBy:\{field:POSITION,\s*direction:ASC\}/);
+    assert.match(BOOTSTRAP_DOCUMENTS.views, /orderBy:\{field:POSITION,\s*direction:ASC\}/);
   });
 
   test('the merged-write mutation string carries the updateSingleSelectOptions comment tag', () => {
