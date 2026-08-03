@@ -840,3 +840,147 @@ test('readDesiredState: a phase directory with zero PLAN.md files contributes ze
   assert.equal(result.available, true);
   assert.deepEqual(result.plans, []);
 });
+
+// ─── Phase 5 (05-02 Task 2): depends_on, and the title fallback chain ─────
+
+test('readDesiredState: depends_on: ["05-01", "05-02"] yields dependsOn in that order, quotes stripped', (t) => {
+  const repoDir = createTempDir('github-sync-desired-dependson-quoted-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 05: Five\n\n**Goal**: five\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 05\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/05-five/05-03-PLAN.md', '---\nwave: 2\nautonomous: true\nrequirements: []\ndepends_on: ["05-01", "05-02"]\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.deepEqual(result.plans.find((plan) => plan.id === '05-03').dependsOn, ['05-01', '05-02']);
+});
+
+test('readDesiredState: depends_on: [] yields an empty dependency list', (t) => {
+  const repoDir = createTempDir('github-sync-desired-dependson-emptybrackets-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 05: Five\n\n**Goal**: five\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 05\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/05-five/05-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\ndepends_on: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.deepEqual(result.plans.find((plan) => plan.id === '05-01').dependsOn, []);
+});
+
+test('readDesiredState: an omitted depends_on key also yields an empty dependency list — a real state, never an unavailable read', (t) => {
+  const repoDir = createTempDir('github-sync-desired-dependson-omitted-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 05: Five\n\n**Goal**: five\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 05\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/05-five/05-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  assert.deepEqual(result.plans.find((plan) => plan.id === '05-01').dependsOn, []);
+});
+
+test('readDesiredState: an unquoted, irregularly spaced depends_on list yields trimmed entries with no empties', (t) => {
+  const repoDir = createTempDir('github-sync-desired-dependson-irregular-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 05: Five\n\n**Goal**: five\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 05\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/05-five/05-03-PLAN.md', '---\nwave: 2\nautonomous: true\nrequirements: []\ndepends_on: [ 05-01 ,  05-02 ]\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.deepEqual(result.plans.find((plan) => plan.id === '05-03').dependsOn, ['05-01', '05-02']);
+});
+
+test('readDesiredState: a depends_on entry naming an id with no PLAN.md on disk parses cleanly and leaves the read available — resolution is a later stage\'s concern', (t) => {
+  const repoDir = createTempDir('github-sync-desired-dependson-unknownid-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 05: Five\n\n**Goal**: five\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 05\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/05-five/05-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\ndepends_on: ["99-99"]\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  assert.deepEqual(result.plans.find((plan) => plan.id === '05-01').dependsOn, ['99-99']);
+});
+
+test('readDesiredState: a depends_on entry naming its own plan (self-reference) parses without error', (t) => {
+  const repoDir = createTempDir('github-sync-desired-dependson-selfref-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 05: Five\n\n**Goal**: five\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 05\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/05-five/05-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\ndepends_on: ["05-01"]\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  assert.deepEqual(result.plans.find((plan) => plan.id === '05-01').dependsOn, ['05-01']);
+});
+
+test('parseRoadmapPlanDescriptions: a row "- [x] 04-03-PLAN.md — The convergence primitives" maps 04-03 to "The convergence primitives"', () => {
+  const descriptions = parseRoadmapPlanDescriptions('- [x] 04-03-PLAN.md — The convergence primitives\n');
+  assert.equal(descriptions.get('04-03'), 'The convergence primitives');
+});
+
+test('parseRoadmapPlanDescriptions: a bare row "- [x] 02-05-PLAN.md" with no separator contributes no map entry', () => {
+  const descriptions = parseRoadmapPlanDescriptions('- [x] 02-05-PLAN.md\n');
+  assert.equal(descriptions.has('02-05'), false);
+});
+
+test('planTitleFor: "02-05" with no description but a phase title "Sync Engine Core" returns "02-05 — Sync Engine Core"', () => {
+  assert.equal(planTitleFor('02-05', undefined, 'Sync Engine Core'), '02-05 — Sync Engine Core');
+});
+
+test('planTitleFor: "09-01" with neither a description nor a phase title returns the bare id "09-01"', () => {
+  assert.equal(planTitleFor('09-01', undefined, undefined), '09-01');
+});
+
+test('planTitleFor never returns an empty or whitespace-only string across the full tier matrix', () => {
+  const inputs = [
+    ['id-only', undefined, undefined],
+    ['id-only', undefined, ''],
+    ['id-only', '', undefined],
+    ['id-only', '', ''],
+    ['id-only', undefined, 'Phase Title'],
+    ['id-only', 'Description', undefined],
+    ['id-only', 'Description', 'Phase Title'],
+  ];
+  for (const [id, description, phaseTitle] of inputs) {
+    const title = planTitleFor(id, description, phaseTitle);
+    assert.ok(title.length > 0, `planTitleFor(${id}, ${JSON.stringify(description)}, ${JSON.stringify(phaseTitle)}) returned an empty string`);
+    assert.notEqual(title.trim(), '', `planTitleFor(${id}, ${JSON.stringify(description)}, ${JSON.stringify(phaseTitle)}) returned a whitespace-only string`);
+  }
+});
+
+test('readDesiredState: a plan whose PLAN.md exists but whose phase is absent from ROADMAP.md still yields a non-empty title and does not make the projection unavailable', (t) => {
+  const repoDir = createTempDir('github-sync-desired-title-noRoadmapPhase-');
+  t.after(() => cleanup(repoDir));
+  write(repoDir, '.planning/ROADMAP.md', '# Roadmap\n\n### Phase 01: One\n\n**Goal**: one\n');
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/09-orphan/09-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  const plan = result.plans.find((p) => p.id === '09-01');
+  assert.equal(plan.title, '09-01');
+  assert.ok(plan.title.length > 0);
+});
+
+test('readDesiredState: a row with no description contributes no entry to parseRoadmapPlanDescriptions, and the plan still receives a title through tier two (the phase title)', (t) => {
+  const repoDir = createTempDir('github-sync-desired-title-tier2-viadescription-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    ['# Roadmap', '', '- [x] 02-05-PLAN.md', '', '### Phase 02: Sync Engine Core', '', '**Goal**: sync', ''].join('\n'),
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 02\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  write(repoDir, '.planning/phases/02-sync/02-05-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(parseRoadmapPlanDescriptions(fs.readFileSync(path.join(repoDir, '.planning/ROADMAP.md'), 'utf8')).has('02-05'), false);
+  assert.equal(result.plans.find((plan) => plan.id === '02-05').title, '02-05 — Sync Engine Core');
+});
