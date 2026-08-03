@@ -1395,7 +1395,7 @@ const capabilities = {
     "role": "feature",
     "version": "1.8.0",
     "title": "GitHub Project mirror",
-    "description": "Mirrors `.planning/` phase and plan state into a GitHub Project v2 board, one-way (disk → GitHub). Default-off. Ships an auth preflight (`gsd-tools github-sync preflight`), a read-only status report (`status`), a reconciling sync engine for phase/plan issues (`sync`), and an idempotent Project bootstrap that creates and repairs the board itself — fields, the Status merge, labels, and milestones (`init`).",
+    "description": "Mirrors `.planning/` phase and plan state into a GitHub Project v2 board, one-way (disk → GitHub). Default-off. Ships an auth preflight (`gsd-tools github-sync preflight`), a read-only status report (`status`), a reconciling sync engine for phase/plan issues (`sync`), and an idempotent Project bootstrap that creates and repairs the board itself — fields, the Status merge, labels, milestones, and views (`init`).",
     "tier": "full",
     "requires": [],
     "engines": {
@@ -1442,6 +1442,16 @@ const capabilities = {
         "type": "string",
         "default": "",
         "description": "Title used when `init` creates a Project v2 board (empty means the repository name followed by the word Roadmap)."
+      },
+      "github_sync.view.layout": {
+        "type": "enum",
+        "values": [
+          "board",
+          "table",
+          "roadmap"
+        ],
+        "default": "board",
+        "description": "Layout `init` applies to the project's pre-existing leftmost view on every run."
       }
     },
     "commands": [
@@ -3882,6 +3892,7 @@ const configKeys = {
   "github_sync.target.repository_number": "github-sync",
   "github_sync.target.project_number": "github-sync",
   "github_sync.project_title": "github-sync",
+  "github_sync.view.layout": "github-sync",
   "graphify.enabled": "graphify",
   "intel.enabled": "intel",
   "mempalace.enabled": "mempalace",
@@ -4075,6 +4086,17 @@ const configSchema = {
     "type": "string",
     "default": "",
     "description": "Title used when `init` creates a Project v2 board (empty means the repository name followed by the word Roadmap)."
+  },
+  "github_sync.view.layout": {
+    "owner": "github-sync",
+    "type": "enum",
+    "default": "board",
+    "description": "Layout `init` applies to the project's pre-existing leftmost view on every run.",
+    "values": [
+      "board",
+      "table",
+      "roadmap"
+    ]
   },
   "graphify.enabled": {
     "owner": "graphify",
