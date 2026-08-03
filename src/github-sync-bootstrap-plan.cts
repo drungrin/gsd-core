@@ -1112,6 +1112,40 @@ interface ViewPlanResult {
 }
 
 /**
+ * The `views` read document (`id name layout filter`) is not contractually
+ * guaranteed to always return `null` for "no filter" — 06-VIEW-PROBE.md
+ * Question 4 observed `null` on every read this phase's own probe made, but
+ * an empty string means the same thing. Both forms are normalized to `null`
+ * here, in exactly one place, so a filter-comparison call site never has to
+ * repeat the `?? null` / `=== ''` judgment call.
+ */
+function normalizedViewFilter(filter: string | null): string | null {
+  return filter === null || filter === '' ? null : filter;
+}
+
+/**
+ * D-02's converged predicate: true only when the remote view's `name`,
+ * `layout`, and `filter` all equal the specification's. `resolvedFieldIds`
+ * is accepted for signature symmetry with the rest of this module's
+ * identity/converge pairs but is deliberately NOT compared: the `views` read
+ * document selects `id name layout filter` only (06-VIEW-PROBE.md Question
+ * 4) — `configuration.visibleFieldIds` is never read back at plan time, so
+ * there is no observed value to compare against. Folding it into this
+ * predicate would make even a fully-correct board emit an update on every
+ * run (SC1's "re-running `init` reuses them" would never hold), so
+ * convergence is decided on the three properties this phase can actually
+ * observe. Accepted consequence, stated once here: a developer who hides a
+ * visible-field column by hand loses that customization only on the next
+ * run that ALSO changes name/layout/filter — never on a run that changes
+ * nothing else.
+ */
+function viewIsConverged(spec: GsdViewDeclaration, remoteView: RemoteViewLike, _resolvedFieldIds: string[]): boolean {
+  return remoteView.name === spec.name &&
+    remoteView.layout === spec.layout &&
+    normalizedViewFilter(remoteView.filter) === normalizedViewFilter(spec.filter);
+}
+
+/**
  * D-01..D-06's view composer, a sixth instance of the list-then-create/
  * adopt/converge pattern `planFields`/`planLabels`/`planMilestones` already
  * establish — but with D-02's three-way branch instead of `planFields`'
@@ -1185,8 +1219,7 @@ function planViews(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, co
       continue;
     }
     claimedRemoteIds.add(match.view.id);
-    const converged = match.view.name === gsdView.name && match.view.layout === gsdView.layout && match.view.filter === gsdView.filter;
-    if (converged) {
+    if (viewIsConverged(gsdView, match.view, fieldIds)) {
       checkpoints.push({ logicalKey: viewKey, nodeId: match.view.id, completionContext: context, stage: BOOTSTRAP_STAGE.VIEWS });
       continue;
     }

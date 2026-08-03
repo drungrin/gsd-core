@@ -41,6 +41,7 @@ const {
   BOOTSTRAP_STAGE,
   GSD_FIELDS,
   GSD_LABELS,
+  GSD_VIEWS,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const { applyMutationPlan } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
 const { mutatedKeys } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
@@ -193,6 +194,29 @@ function worldExecGh(world) {
         const viewNode = world.views.find((v) => v.id === viewId);
         if (viewNode) { viewNode.name = name; viewNode.layout = layout; viewNode.filter = filter; }
         return graphqlOk({ updateProjectV2View: { projectV2View: { id: viewId, name, layout, filter } } });
+      }
+      // Plan 06-02: the configuration-free pair — Roadmap and Board declare
+      // neither a filter nor a visible field, so their create routes through
+      // this bare document instead of createViewWithFields (no follow-up
+      // update needed at create time). The trailing `\n` distinguishes this
+      // marker from `createViewWithFields`'s, which also starts with
+      // `createView` — `.includes` alone would false-positive-match it.
+      if (queryArg.includes('github-sync-bootstrap:createView\n')) {
+        const name = argValue(args, 'name=');
+        const layout = argValue(args, 'layout=');
+        const viewNode = { id: `PVTV_${slugify(name)}_${seq}`, name, layout, filter: null };
+        world.views.push(viewNode);
+        return graphqlOk({ createProjectV2View: { projectV2View: { id: viewNode.id } } });
+      }
+      // The bare update half — restores name/layout alone for a
+      // matched-but-diverged Roadmap or Board (D-01's repair path).
+      if (queryArg.includes('github-sync-bootstrap:updateViewShape\n')) {
+        const viewId = argValue(args, 'viewId=');
+        const name = argValue(args, 'name=');
+        const layout = argValue(args, 'layout=');
+        const viewNode = world.views.find((v) => v.id === viewId);
+        if (viewNode) { viewNode.name = name; viewNode.layout = layout; }
+        return graphqlOk({ updateProjectV2View: { projectV2View: { id: viewId, name, layout } } });
       }
       throw new Error(`worldExecGh: unrecognized query in test fixture: ${queryArg}`);
     }
@@ -477,11 +501,12 @@ describe('fresh-board sequence', () => {
       // completions — plan 05-04's fix (Phase 5 Pitfall 1).
       BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'),
       BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'),
-      // Plan 06-01: a fresh board has no pre-existing Backlog view, so the
-      // views stage creates one this same run — the create's NodeCapture
-      // records view:backlog immediately, and the following update-view
-      // (filter) rides that same key.
-      BOOTSTRAP_LOGICAL_KEY.view('Backlog'),
+      // Plan 06-01/06-02: a fresh board has no pre-existing GSD views, so the
+      // views stage creates all five this same run — Roadmap/Board via a
+      // bare create (their own NodeCapture records the key directly);
+      // Table-by-Phase/By-Wave/Backlog via create-then-late-bound-update,
+      // both landing under the same key in this one run.
+      ...GSD_VIEWS.map((v) => BOOTSTRAP_LOGICAL_KEY.view(v.name)),
     ];
     assert.deepEqual(Object.keys(onDisk.map.completions).sort(), expectedKeys.sort());
 
@@ -495,20 +520,26 @@ describe('fresh-board sequence', () => {
     }
   });
 
-  test("run 1's options pass emits exactly one Status merge operation, zero Autonomous operations (the create response already supplied Yes/No), and the Backlog view's create+update (plan 06-01)", (t) => {
+  test("run 1's options pass emits exactly one Status merge operation, zero Autonomous operations (the create response already supplied Yes/No), and every D-08 view's create (plan 06-01/06-02)", (t) => {
     const cwd = createTempProject('bootstrap-composition-options-');
     t.after(() => cleanup(cwd));
     const world = createWorld({ owner: 'octo', repo: 'roadmap' });
     const execGh = worldExecGh(world);
     const round1 = runInitRound({ cwd, desired: desiredFixture(), world, target: freshTarget(), execGh });
 
-    const nonViewOps = round1.optionsPlan.operations.filter((o) => o.logicalKey !== BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+    const nonViewOps = round1.optionsPlan.operations.filter((o) => !o.logicalKey.startsWith('view:'));
     assert.equal(nonViewOps.length, 1);
     assert.equal(nonViewOps[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.field('Status'));
     assert.equal(round1.optionsPlan.operations.some((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.field('Autonomous')), false);
 
-    const viewOps = round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
-    assert.deepEqual(viewOps.map((o) => o.kind), ['create-view', 'update-view']);
+    // Roadmap/Board declare no filter and no visible field, so each is a
+    // single bare create; Table-by-Phase/By-Wave/Backlog each ride D-06's
+    // two-operation create-then-update handoff.
+    assert.deepEqual(round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Roadmap')).map((o) => o.kind), ['create-view']);
+    assert.deepEqual(round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Board')).map((o) => o.kind), ['create-view']);
+    assert.deepEqual(round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Table-by-Phase')).map((o) => o.kind), ['create-view', 'update-view']);
+    assert.deepEqual(round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('By-Wave')).map((o) => o.kind), ['create-view', 'update-view']);
+    assert.deepEqual(round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog')).map((o) => o.kind), ['create-view', 'update-view']);
   });
 });
 
@@ -544,11 +575,18 @@ function adoptedBoardWorld() {
     { nodeId: 'M_archived_h', name: 'v0.9 — archived', number: 3, state: 'closed' },
     { nodeId: 'M_current_h', name: 'v1.0 — current', number: 4, state: 'open' },
   ];
-  // Plan 06-01: a Backlog view already matching D-08's spec exactly (name,
-  // TABLE_LAYOUT, -status:Done filter) — a "fully populated" board is only
-  // truly fully populated once views are part of what GSD checks, and this
-  // fixture's whole purpose is a zero-mutation adopt-everything proof.
-  world.views = [{ id: 'PVTV_backlog_h', name: 'Backlog', layout: 'TABLE_LAYOUT', filter: '-status:Done' }];
+  // Plan 06-01/06-02: all five D-08 views already matching their
+  // specification exactly (name, layout, filter) — a "fully populated"
+  // board is only truly fully populated once every GSD view is part of
+  // what `init` checks, and this fixture's whole purpose is a
+  // zero-mutation adopt-everything proof.
+  world.views = [
+    { id: 'PVTV_roadmap_h', name: 'Roadmap', layout: 'ROADMAP_LAYOUT', filter: null },
+    { id: 'PVTV_board_h', name: 'Board', layout: 'BOARD_LAYOUT', filter: null },
+    { id: 'PVTV_tablebyphase_h', name: 'Table-by-Phase', layout: 'TABLE_LAYOUT', filter: 'label:gsd:phase' },
+    { id: 'PVTV_bywave_h', name: 'By-Wave', layout: 'TABLE_LAYOUT', filter: 'label:gsd:plan' },
+    { id: 'PVTV_backlog_h', name: 'Backlog', layout: 'TABLE_LAYOUT', filter: '-status:Done' },
+  ];
   return world;
 }
 
@@ -592,10 +630,10 @@ describe('adopted-board case (BOOT-06 on the path where nothing is created)', ()
       // of nothing (plan 05-04, Phase 5 Pitfall 1).
       BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'),
       BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'),
-      // adoptedBoardWorld's Backlog view already matches D-08's spec exactly
-      // — the converged branch checkpoints it by name, zero mutations
-      // (plan 06-01).
-      BOOTSTRAP_LOGICAL_KEY.view('Backlog'),
+      // adoptedBoardWorld's five views already match D-08's specs exactly
+      // — the converged branch checkpoints each by name, zero mutations
+      // (plan 06-01/06-02).
+      ...GSD_VIEWS.map((v) => BOOTSTRAP_LOGICAL_KEY.view(v.name)),
     ];
     assert.deepEqual(Object.keys(onDisk.map.completions).sort(), expectedKeys.sort());
 
