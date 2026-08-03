@@ -1080,6 +1080,128 @@ describe('planViews: fresh-board sequence (plan 06-02 Task 1)', () => {
   });
 });
 
+describe('planViews: identity cases (plan 06-02 Task 2)', () => {
+  /** One remote view per GSD_VIEWS row, each converged exactly (name/layout/filter). */
+  function convergedRemoteViews() {
+    return GSD_VIEWS.map((v, i) => remoteView(`PVTV_${i}`, v.name, v.layout, v.filter));
+  }
+
+  test('converged: all five views present with declared name/layout/filter emit zero operations and five checkpoints, each carrying stage: views and its observed node id', () => {
+    const views = convergedRemoteViews();
+    const result = planViews(remoteWithViews(views), { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.blocked.length, 0);
+    assert.equal(result.checkpoints.length, 5);
+    assert.deepEqual(result.checkpoints.map((c) => c.logicalKey).sort(), GSD_VIEWS.map((v) => BOOTSTRAP_LOGICAL_KEY.view(v.name)).sort());
+    for (const cp of result.checkpoints) assert.equal(cp.stage, BOOTSTRAP_STAGE.VIEWS);
+    for (const view of views) {
+      const cp = result.checkpoints.find((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.view(view.name));
+      assert.equal(cp.nodeId, view.id);
+    }
+  });
+
+  test('layout drift: a remote Backlog carrying BOARD_LAYOUT converges via one update restoring TABLE_LAYOUT, its name, and its filter together in one mutation — zero creates', () => {
+    const views = convergedRemoteViews().map((v) => (v.name === 'Backlog' ? { ...v, layout: 'BOARD_LAYOUT' } : v));
+    const result = planViews(remoteWithViews(views), { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.filter((o) => o.kind === 'create-view').length, 0);
+    const backlogOps = result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+    assert.equal(backlogOps.length, 1);
+    assert.equal(backlogOps[0].kind, 'update-view');
+    assert.ok(backlogOps[0].args.includes('name=Backlog'));
+    assert.ok(backlogOps[0].args.includes('layout=TABLE_LAYOUT'));
+    assert.ok(backlogOps[0].args.includes('filter=-status:Done'));
+  });
+
+  test('filter cleared: a remote Backlog whose filter was hand-cleared to the probe-recorded unset form (null) converges via one update restoring -status:Done', () => {
+    const views = convergedRemoteViews().map((v) => (v.name === 'Backlog' ? { ...v, filter: null } : v));
+    const result = planViews(remoteWithViews(views), { kind: 'absent' }, CONTEXT);
+    const backlogOps = result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+    assert.equal(backlogOps.length, 1);
+    assert.equal(backlogOps[0].kind, 'update-view');
+    assert.ok(backlogOps[0].args.includes('filter=-status:Done'));
+  });
+
+  test('null and the empty string both count as "no filter": a Roadmap/Board specification (filter: null) matched against a remote view whose observed filter is the empty string converges with zero operations, never a needless update', () => {
+    const views = convergedRemoteViews().map((v) => (v.name === 'Roadmap' ? { ...v, filter: '' } : v));
+    const result = planViews(remoteWithViews(views), { kind: 'absent' }, CONTEXT);
+    assert.equal(result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Roadmap')).length, 0);
+    assert.ok(result.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Roadmap')));
+  });
+
+  test('renamed by hand: the map holds view:backlog -> a remote view present under a different name, resolved by id and restored, never a second create', () => {
+    const strictMap = { kind: 'valid', map: { completions: { [BOOTSTRAP_LOGICAL_KEY.view('Backlog')]: { nodeId: 'PVTV_renamed' } } } };
+    const views = convergedRemoteViews()
+      .filter((v) => v.name !== 'Backlog')
+      .concat([remoteView('PVTV_renamed', 'Old Backlog', 'TABLE_LAYOUT', '-status:Done')]);
+    const result = planViews(remoteWithViews(views), strictMap, CONTEXT);
+    assert.equal(result.operations.filter((o) => o.kind === 'create-view').length, 0);
+    const backlogOps = result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+    assert.equal(backlogOps.length, 1);
+    assert.equal(backlogOps[0].kind, 'update-view');
+    assert.ok(backlogOps[0].args.includes('name=Backlog'));
+    assert.ok(backlogOps[0].args.includes('viewId=PVTV_renamed'));
+  });
+
+  test('vanished (D-04): the map holds view:board -> an id absent from the remote list, and no remote view is named Board -> one create, no blocked entry, no orphan-shaped member', () => {
+    const strictMap = { kind: 'valid', map: { completions: { [BOOTSTRAP_LOGICAL_KEY.view('Board')]: { nodeId: 'PVTV_gone' } } } };
+    const views = convergedRemoteViews().filter((v) => v.name !== 'Board');
+    const result = planViews(remoteWithViews(views), strictMap, CONTEXT);
+    const boardOps = result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Board'));
+    assert.equal(boardOps.length, 1);
+    assert.equal(boardOps[0].kind, 'create-view');
+    assert.equal(result.blocked.length, 0);
+    assert.deepEqual(Object.keys(result).sort(), ['blocked', 'checkpoints', 'operations']);
+  });
+
+  test('adopted by name (D-03): a pre-existing view named Table-by-Phase with a wrong layout and no stored completion converges via one update, whose own capture records view:table-by-phase', () => {
+    const views = convergedRemoteViews().map((v) => (v.name === 'Table-by-Phase' ? { ...v, layout: 'BOARD_LAYOUT' } : v));
+    const result = planViews(remoteWithViews(views), { kind: 'absent' }, CONTEXT);
+    const ops = result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Table-by-Phase'));
+    assert.equal(ops.length, 1);
+    assert.equal(ops[0].kind, 'update-view');
+    assert.equal(ops[0].captures.length, 1);
+    assert.equal(ops[0].captures[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.view('Table-by-Phase'));
+  });
+
+  test('cross-contamination: the map holds view:board -> the node id of the remote view actually named Backlog; view:board claims it by id and view:backlog falls through to its own create', () => {
+    const backlogNodeId = 'PVTV_backlog_actual';
+    const strictMap = { kind: 'valid', map: { completions: { [BOOTSTRAP_LOGICAL_KEY.view('Board')]: { nodeId: backlogNodeId } } } };
+    const views = convergedRemoteViews()
+      .filter((v) => v.name !== 'Board' && v.name !== 'Backlog')
+      .concat([remoteView(backlogNodeId, 'Backlog', 'TABLE_LAYOUT', '-status:Done')]);
+    const result = planViews(remoteWithViews(views), strictMap, CONTEXT);
+
+    const boardOps = result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Board'));
+    assert.equal(boardOps.length, 1);
+    assert.equal(boardOps[0].kind, 'update-view');
+    const boardViewIdArg = boardOps[0].args.find((a) => typeof a === 'string' && a.startsWith('viewId='));
+    assert.equal(boardViewIdArg, `viewId=${backlogNodeId}`);
+
+    // view:backlog must NOT also claim that same remote id — it falls
+    // through to its own create+update, late-bound to its OWN freshly
+    // created id via ArgvRef, never the literal `backlogNodeId`.
+    const backlogOps = result.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+    assert.deepEqual(backlogOps.map((o) => o.kind), ['create-view', 'update-view']);
+    const backlogUpdateLiteral = backlogOps[1].args.find((a) => typeof a === 'string' && a.startsWith('viewId='));
+    assert.equal(backlogUpdateLiteral, undefined);
+    const backlogUpdateRef = backlogOps[1].args.find((a) => typeof a === 'object' && a !== null && a.prefix === 'viewId=');
+    assert.equal(backlogUpdateRef.from, BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+  });
+
+  test('unresolvable field: no remote field named Wave contributes one blocked entry naming both By-Wave and Wave; By-Wave emits no operation and the other four views still plan', () => {
+    const fields = [field('PVTF_phase', 'Phase', 'TEXT'), field('PVTSSF_status', 'Status', 'SINGLE_SELECT', [])];
+    const result = planViews(remoteWithViews([], fields), { kind: 'absent' }, CONTEXT);
+    assert.equal(result.blocked.length, 1);
+    assert.equal(result.blocked[0].reason, BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED);
+    assert.match(result.blocked[0].detail, /By-Wave/);
+    assert.match(result.blocked[0].detail, /Wave/);
+    assert.equal(result.operations.some((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('By-Wave')), false);
+    for (const name of ['Roadmap', 'Board', 'Table-by-Phase', 'Backlog']) {
+      assert.ok(result.operations.some((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view(name)), `${name} must still plan`);
+    }
+  });
+});
+
 describe('mutation document parity: view documents (D-06 / plan 06-02 Task 1)', () => {
   test('CREATE_VIEW_WITH_FIELDS_DOCUMENT and CREATE_VIEW_DOCUMENT both carry no filter variable (only update can set filter)', () => {
     assert.doesNotMatch(CREATE_VIEW_WITH_FIELDS_DOCUMENT, /\bfilter\b/);
