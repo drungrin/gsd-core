@@ -166,6 +166,25 @@ export interface RenderablePlan {
 }
 
 /**
+ * D-05's accepted limitation made visible to the reader (plan 05-03 Task 1):
+ * one line directly beneath the `## Tasks` heading naming each of the three
+ * glyphs and stating plainly that the glyph reflects the plan's own derived
+ * status, not any per-task progress — GSD stores no per-task completion
+ * state on disk, so the renderer never implies knowledge it does not have.
+ */
+const TASK_GLYPH_LEGEND =
+  `Legend: ${TASK_GLYPH.Done} Done · ${TASK_GLYPH['In Progress']} In Progress · ${TASK_GLYPH.Todo} Todo` +
+  ' — every task shows its plan’s own status; GSD records no per-task completion state.';
+
+/**
+ * Plan 05-03 Task 1: the single explanatory placeholder line a zero-task
+ * plan renders under `## Tasks`, mirroring `renderPhaseRegion`'s own
+ * `_No goal recorded on the roadmap._` precedent for the identical
+ * situation — never an empty heading, never an empty list beneath one.
+ */
+const NO_TASKS_PLACEHOLDER = '_This plan records no tasks._';
+
+/**
  * The literal path template every rendered plan provenance line names.
  * `RenderablePlan` carries only the plan's own id, not the phase-directory
  * slug (`05-plan-sub-issues-task-rendering`), so the directory segment
@@ -186,7 +205,8 @@ const PLAN_PATH_SUFFIX = '-PLAN.md';
  * transparency rule, carried over unchanged from the phase renderer).
  */
 export function renderPlanRegion(plan: RenderablePlan): string {
-  const lines: string[] = ['## Tasks', '', renderTaskList(plan.status, plan.tasks)];
+  const taskLines = plan.tasks.length > 0 ? renderTaskList(plan.status, plan.tasks) : NO_TASKS_PLACEHOLDER;
+  const lines: string[] = ['## Tasks', '', TASK_GLYPH_LEGEND, '', taskLines];
   lines.push(
     '',
     '---',

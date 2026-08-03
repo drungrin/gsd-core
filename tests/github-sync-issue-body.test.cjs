@@ -4,6 +4,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   phaseMarker,
   FENCE_BEGIN,
@@ -515,4 +517,70 @@ test('spliceRegion: splicing a freshly rendered plan region into an existing pla
   assert.ok(result.body.endsWith(`${FENCE_END}\n${below}\n`));
   assert.ok(result.body.includes('New task'));
   assert.ok(!result.body.includes('Old task'));
+});
+
+/* --- Phase 5 (05-03 Task 1): the non-interactive task list's empty and encoding edges --- */
+
+test('renderPlanRegion: a zero-task plan renders the Tasks heading followed by exactly one placeholder line, never an empty heading or an empty list', () => {
+  const zeroTaskPlan = { ...PLAN, tasks: [] };
+  const region = renderPlanRegion(zeroTaskPlan);
+  assert.match(region, /^## Tasks$/m, 'heading must still be emitted');
+  const placeholderLines = region.split('\n').filter((line) => line.startsWith('_This plan records no tasks'));
+  assert.equal(placeholderLines.length, 1, 'exactly one placeholder line, not zero and not several');
+  assert.doesNotMatch(region, /^○ |^▶ |^✓ /m, 'no glyph-prefixed task line may appear when there are zero tasks');
+});
+
+test('renderTaskList: an empty task list renders no task lines at all (empty string, zero glyph lines)', () => {
+  assert.equal(renderTaskList('Todo', []), '');
+});
+
+test('renderPlanRegion: carries a one-line glyph legend directly beneath the Tasks heading naming all three glyphs and stating the glyph reflects the plan\'s own status, not per-task state', () => {
+  const region = renderPlanRegion(PLAN);
+  const lines = region.split('\n');
+  const headingIndex = lines.indexOf('## Tasks');
+  assert.ok(headingIndex >= 0);
+  const legendLine = lines.slice(headingIndex + 1).find((line) => line.startsWith('Legend:'));
+  assert.ok(legendLine, 'a legend line must exist beneath the Tasks heading');
+  for (const glyph of Object.values(TASK_GLYPH)) {
+    assert.ok(legendLine.includes(glyph), `legend must name glyph ${glyph}`);
+  }
+  assert.match(legendLine, /status/i, 'legend must state the glyph reflects the plan\'s own status');
+  assert.doesNotMatch(legendLine, /\[ \]/, 'the legend itself must never render a checkbox');
+});
+
+test('renderTaskList: a task name built from an emoji (astral-plane code point), a combining acute accent, and a CJK character appears in the output with strict string equality against the input — no normalization, no escaping, no truncation', () => {
+  const hostileName = '\u{1F680} café 日本語'; // rocket emoji, "cafe" + combining acute, CJK "Japanese language"
+  const rendered = renderTaskList('Todo', [hostileName]);
+  assert.equal(rendered, `${TASK_GLYPH.Todo} ${hostileName}`);
+  assert.ok(rendered.includes(hostileName));
+
+  const region = renderPlanRegion({ ...PLAN, tasks: [hostileName] });
+  assert.ok(region.includes(hostileName), 'the hostile task name must appear byte-identical in the full region too');
+});
+
+test('renderPlanRegion: rendering is deterministic across interleaved calls to two different plans, each returning strictly equal strings on repeat', () => {
+  const planA = { ...PLAN, id: 'A', tasks: ['Task A1', 'Task A2'] };
+  const planB = { ...PLAN, id: 'B', tasks: ['Task B1'] };
+
+  const a1 = renderPlanRegion(planA);
+  const b1 = renderPlanRegion(planB);
+  const a2 = renderPlanRegion(planA);
+  const b2 = renderPlanRegion(planB);
+
+  assert.equal(a1, a2, 'plan A renders byte-identically across interleaved calls');
+  assert.equal(b1, b2, 'plan B renders byte-identically across interleaved calls');
+  assert.notEqual(a1, b1, 'two distinct plans must not accidentally render identically');
+});
+
+test('src/github-sync-issue-body.cts declares no import beyond node:crypto — the module is pure with no fs, env, clock, or network access', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'github-sync-issue-body.cts'), 'utf8');
+  const importLines = source.match(/^import\s+.+\s+from\s+['"][^'"]+['"];?\s*$/gm) || [];
+  assert.ok(importLines.length > 0, 'the module must declare at least the crypto import');
+  for (const line of importLines) {
+    assert.match(line, /from\s+['"]node:crypto['"];?\s*$/, `unexpected import: ${line}`);
+  }
+  assert.doesNotMatch(source, /\brequire\(/, 'no CommonJS require() either');
+  assert.doesNotMatch(source, /\bprocess\.env\b/);
+  assert.doesNotMatch(source, /\bnew Date\(/);
+  assert.doesNotMatch(source, /\bfs\./);
 });
