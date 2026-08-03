@@ -42,11 +42,13 @@ const {
   GSD_FIELDS,
   GSD_LABELS,
   GSD_VIEWS,
+  VIEW_LAYOUT,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const { applyMutationPlan } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
 const { mutatedKeys } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
 const bootstrapRemoteMod = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
 const bootstrapConfigMod = require('../gsd-core/bin/lib/github-sync-bootstrap-config.cjs');
+const { buildInitReportV1 } = require('../gsd-core/bin/lib/github-sync-bootstrap-report.cjs');
 const {
   readSyncMapStrict,
   recordCompletion,
@@ -218,6 +220,15 @@ function worldExecGh(world) {
         if (viewNode) { viewNode.name = name; viewNode.layout = layout; }
         return graphqlOk({ updateProjectV2View: { projectV2View: { id: viewId, name, layout } } });
       }
+      // Plan 06-04: D-09/D-11's leftmost-view retype — layout alone, no
+      // name/filter change on the observed view.
+      if (queryArg.includes('github-sync-bootstrap:updateViewLayout')) {
+        const viewId = argValue(args, 'viewId=');
+        const layout = argValue(args, 'layout=');
+        const viewNode = world.views.find((v) => v.id === viewId);
+        if (viewNode) viewNode.layout = layout;
+        return graphqlOk({ updateProjectV2View: { projectV2View: { id: viewId, layout } } });
+      }
       throw new Error(`worldExecGh: unrecognized query in test fixture: ${queryArg}`);
     }
     if (args[0] === 'api' && typeof args[1] === 'string') {
@@ -312,14 +323,14 @@ function repositoryIdentity(target) {
  * driving `planBootstrap`/`applyMutationPlan` directly so a convergence
  * failure names the stage, not the command.
  */
-function runInitRound({ cwd, desired, world, target, projectTitle = null, execGh }) {
+function runInitRound({ cwd, desired, world, target, projectTitle = null, viewLayout = VIEW_LAYOUT.BOARD, execGh }) {
   const repository = repositoryIdentity(target);
   const strictMapBefore = readSyncMapStrict(cwd, repository);
   const remoteBefore = remoteFromWorld(world, target.projectNumber);
   let readCount = 1;
 
   const structurePlan = planBootstrap(
-    { desired, remote: remoteBefore, strictMap: strictMapBefore, target, projectTitle },
+    { desired, remote: remoteBefore, strictMap: strictMapBefore, target, projectTitle, viewLayout },
     { pass: BOOTSTRAP_PASS.STRUCTURE },
   );
   if (structurePlan.blocked.length > 0 || structurePlan.uncertain.length > 0) {
@@ -355,7 +366,7 @@ function runInitRound({ cwd, desired, world, target, projectTitle = null, execGh
   const optionsStrictMap = structureApply.map ? { kind: 'valid', map: structureApply.map } : { kind: 'absent' };
   const effectiveTarget = { ...target, projectNumber: effectiveProjectNumber };
   const optionsPlan = planBootstrap(
-    { desired, remote: optionsRemote, strictMap: optionsStrictMap, target: effectiveTarget, projectTitle },
+    { desired, remote: optionsRemote, strictMap: optionsStrictMap, target: effectiveTarget, projectTitle, viewLayout },
     { pass: BOOTSTRAP_PASS.OPTIONS },
   );
   if (optionsPlan.blocked.length > 0 || optionsPlan.uncertain.length > 0) {
@@ -594,6 +605,20 @@ function adoptedTarget() {
   return { owner: 'acme', repo: 'product', repositoryNumber: 55, projectNumber: 9 };
 }
 
+/**
+ * Plan 06-04: `adoptedBoardWorld()`'s fully-converged D-08 five, plus one
+ * extra unmapped view PREPENDED so it lands leftmost (`views[0]`) —
+ * GitHub's real auto-created `View 1`, never one of GSD's own five, so the
+ * views stage's own convergence stays a zero-mutation adopt (proven by the
+ * describe block above) while this one view isolates the leftmost-view
+ * retype end to end.
+ */
+function adoptedBoardWorldWithLeftmostView(layout) {
+  const world = adoptedBoardWorld();
+  world.views = [{ id: 'PVTV_view1_h', name: 'View 1', layout, filter: null }, ...world.views];
+  return world;
+}
+
 describe('adopted-board case (BOOT-06 on the path where nothing is created)', () => {
   test('a first run against a fully populated remote board with an absent map dispatches zero mutations and records every reserved key', (t) => {
     const cwd = createTempProject('bootstrap-composition-adopted-');
@@ -740,6 +765,69 @@ describe('adopted-board case (BOOT-06 on the path where nothing is created)', ()
     assert.deepEqual(Object.keys(onDiskRound2.map.completions).sort(), afterBackfillKeys);
     assert.ok(afterBackfillKeys.includes(BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')));
     assert.ok(afterBackfillKeys.includes(BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')));
+  });
+});
+
+// ─── Leftmost view layout convergence (plan 06-04, D-09/D-10/D-11) ─────────
+
+describe('leftmost view layout convergence (plan 06-04)', () => {
+  test('first run dispatches one updateProjectV2View carrying layout=BOARD_LAYOUT and the leftmost view\'s literal id, records view:leftmost, and reports the views stage with updated: 1; a second run against the world\'s own updated state dispatches zero view mutations', (t) => {
+    const cwd = createTempProject('bootstrap-composition-leftmost-');
+    t.after(() => cleanup(cwd));
+    const world = adoptedBoardWorldWithLeftmostView('TABLE_LAYOUT');
+
+    const round1 = runInitRound({ cwd, desired: desiredFixture(), world, target: adoptedTarget(), execGh: worldExecGh(world), viewLayout: VIEW_LAYOUT.BOARD });
+
+    const leftmostOps = round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.leftmostView());
+    assert.equal(leftmostOps.length, 1);
+    assert.equal(leftmostOps[0].kind, 'update-view-layout');
+    assert.ok(leftmostOps[0].args.includes('layout=BOARD_LAYOUT'));
+    assert.ok(leftmostOps[0].args.includes('viewId=PVTV_view1_h'));
+    assert.equal(leftmostOps[0].args.some((a) => typeof a === 'string' && a.startsWith('name=')), false);
+    assert.equal(leftmostOps[0].args.some((a) => typeof a === 'string' && a.startsWith('filter=')), false);
+
+    const onDisk = readSyncMapStrict(cwd, repositoryIdentity(adoptedTarget()));
+    assert.equal(onDisk.kind, 'valid');
+    assert.equal(onDisk.map.completions[BOOTSTRAP_LOGICAL_KEY.leftmostView()].nodeId, 'PVTV_view1_h');
+    assert.equal(world.views.find((v) => v.id === 'PVTV_view1_h').layout, 'BOARD_LAYOUT');
+
+    // Plan 06-04 Task 2: the init report DTO built from this run's own
+    // outcome journal must tally the leftmost retype under the views stage
+    // as `updated: 1` — the check that would catch resolveStage silently
+    // dropping view:leftmost (the one view key not produced by
+    // BOOTSTRAP_LOGICAL_KEY.view).
+    const reportDto = buildInitReportV1({
+      target: { owner: adoptedTarget().owner, repo: adoptedTarget().repo, projectNumber: adoptedTarget().projectNumber },
+      structurePlan: round1.structurePlan,
+      structureApply: round1.structureApply,
+      optionsPlan: round1.optionsPlan,
+      optionsApply: round1.optionsApply,
+    });
+    const viewsStage = reportDto.stages.find((s) => s.stage === 'views');
+    assert.ok(viewsStage, 'the report DTO must carry a views stage');
+    assert.equal(viewsStage.updated, 1);
+
+    const round2 = runInitRound({ cwd, desired: desiredFixture(), world, target: adoptedTarget(), execGh: forbiddenExecGh(), viewLayout: VIEW_LAYOUT.BOARD });
+    const leftmostOpsRound2 = round2.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.leftmostView());
+    assert.equal(leftmostOpsRound2.length, 0);
+    assert.equal(round2.optionsPlan.operations.filter((o) => o.kind === 'update-view-layout').length, 0);
+  });
+
+  test('flip: a converged-at-board snapshot re-run with the config set to "table" dispatches exactly one updateProjectV2View carrying layout=TABLE_LAYOUT', (t) => {
+    const cwd = createTempProject('bootstrap-composition-leftmost-flip-');
+    t.after(() => cleanup(cwd));
+    const world = adoptedBoardWorldWithLeftmostView('BOARD_LAYOUT');
+    // Converge once at "board" — the world's leftmost view already matches,
+    // so this run dispatches zero mutations and merely seeds the on-disk map.
+    const round1 = runInitRound({ cwd, desired: desiredFixture(), world, target: adoptedTarget(), execGh: worldExecGh(world), viewLayout: VIEW_LAYOUT.BOARD });
+    assert.equal(round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.leftmostView()).length, 0);
+
+    const round2 = runInitRound({ cwd, desired: desiredFixture(), world, target: adoptedTarget(), execGh: worldExecGh(world), viewLayout: VIEW_LAYOUT.TABLE });
+    const leftmostOps = round2.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.leftmostView());
+    assert.equal(leftmostOps.length, 1);
+    assert.equal(leftmostOps[0].kind, 'update-view-layout');
+    assert.ok(leftmostOps[0].args.includes('layout=TABLE_LAYOUT'));
+    assert.equal(world.views.find((v) => v.id === 'PVTV_view1_h').layout, 'TABLE_LAYOUT');
   });
 });
 

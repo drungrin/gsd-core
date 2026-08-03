@@ -1051,6 +1051,10 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
         strictMapRead: overrides.strictMapRead ?? { kind: 'absent' },
       }),
       readProjectTitle: () => overrides.projectTitle ?? null,
+      // Plan 06-04: the closed-enum GraphQL layout member readViewLayout
+      // always returns — a stub carrying no override still returns a
+      // realistic value, never undefined reaching planBootstrap's argv.
+      readViewLayout: overrides.readViewLayout ?? (() => overrides.viewLayout ?? 'BOARD_LAYOUT'),
       writeProjectNumber: overrides.writeProjectNumber ?? (() => ({ ok: true, reason: 'written' })),
       RESOLVE_TARGET_REASON,
     };
@@ -1164,6 +1168,7 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
             return { target: TARGET, reason: RESOLVE_TARGET_REASON.CONFIGURED, strictMapRead };
           },
           readProjectTitle: () => null,
+          readViewLayout: () => 'BOARD_LAYOUT',
           writeProjectNumber: () => ({ ok: true, reason: 'written' }),
           RESOLVE_TARGET_REASON,
         },
@@ -1221,6 +1226,7 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
               strictMapRead: realMapForInit.readSyncMapStrict(callCwd, { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber }),
             }),
             readProjectTitle: () => null,
+            readViewLayout: () => 'BOARD_LAYOUT',
             writeProjectNumber: () => ({ ok: true, reason: 'written' }),
             RESOLVE_TARGET_REASON,
           },
@@ -1453,6 +1459,7 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
         _bootstrapConfig: {
           resolveTarget: () => ({ target: null, reason: RESOLVE_TARGET_REASON.UNRESOLVABLE, strictMapRead: null }),
           readProjectTitle: () => null,
+          readViewLayout: () => 'BOARD_LAYOUT',
           writeProjectNumber: () => ({ ok: true, reason: 'written' }),
           RESOLVE_TARGET_REASON,
         },
@@ -1485,6 +1492,49 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
       },
     });
     assert.deepEqual(titles, ['Configured Board Title', 'Configured Board Title']);
+  });
+
+  // ─── plan 06-04: the configured view.layout value is threaded to planBootstrap ─
+
+  test('readViewLayout is called exactly once per init run', () => {
+    let readViewLayoutCalls = 0;
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET, {
+        readViewLayout: () => { readViewLayoutCalls += 1; return 'TABLE_LAYOUT'; },
+      }),
+      _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap: () => ({ operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] }),
+      },
+    });
+    assert.equal(readViewLayoutCalls, 1);
+  });
+
+  test('the injected viewLayout value reaches both planBootstrap calls (structure and options passes)', () => {
+    const layouts = [];
+    routeGithubSyncCommandRouter({
+      args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+      error: (message) => { throw new Error(message); },
+      _isCapabilityActive: () => true,
+      _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+      _desired: { readDesiredState: () => ({ available: true }) },
+      _bootstrapConfig: bootstrapConfigStub(TARGET, { viewLayout: 'TABLE_LAYOUT' }),
+      _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+      _bootstrapPlan: {
+        BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+        planBootstrap(input) {
+          layouts.push(input.viewLayout);
+          return { operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] };
+        },
+      },
+    });
+    assert.deepEqual(layouts, ['TABLE_LAYOUT', 'TABLE_LAYOUT']);
   });
 
   // ─── plan 03-03: the config write gate (D-02) ──────────────────────────────
