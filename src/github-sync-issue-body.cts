@@ -411,28 +411,52 @@ export function contentHash(projection: ContentProjection): string {
 }
 
 /**
- * D-12: the four item field values compared as their own convergence unit,
- * independent of the issue-content projection above — advancing a phase
- * emits one field write and touches no issue body.
+ * D-12: the item field values compared as their own convergence unit,
+ * independent of the issue-content projection above — advancing a phase (or
+ * a plan) emits one field write and touches no issue body.
+ *
+ * Plan 05-03 Task 3 (the `promote` decision recorded in `05-01-PLAN.md`'s
+ * `<assumption_delta_decision>`): `wave` and `autonomous` are Phase 5's two
+ * additional plan-only fields, added here as optional so every existing
+ * phase call site — which never sets either — type-checks unchanged.
  */
 export interface FieldValues {
   gsdId: string;
   phaseId: string;
   requirements: string[];
   status: string;
+  wave?: number | null;
+  autonomous?: boolean;
 }
 
-/** The four `FieldValues` keys, in the fixed order `changedFields` reports them. */
-const FIELD_NAMES = ['gsdId', 'phaseId', 'requirements', 'status'] as const;
-export type FieldName = typeof FIELD_NAMES[number];
+/**
+ * The phase item's four `FieldValues` keys, in the fixed order
+ * `renderFieldState`/`changedFields` have always reported them. Renamed from
+ * the prior internal `FIELD_NAMES` and exported (Task 3) — this exact name
+ * list, in this exact order, is what keeps `.planning/.github-sync.json`'s
+ * already-recorded phase `fieldState` strings parsing as `known` after this
+ * upgrade (the byte-identity constraint below).
+ */
+export const PHASE_FIELD_NAMES = ['gsdId', 'phaseId', 'requirements', 'status'] as const;
+
+/**
+ * The plan item's six `FieldValues` keys, in the fixed declared order this
+ * plan's Task 3 assigns them. A plan's board carries two fields no phase
+ * has — `wave` and `autonomous` — alongside the same four every phase
+ * already writes.
+ */
+export const PLAN_FIELD_NAMES = ['gsdId', 'phaseId', 'requirements', 'status', 'wave', 'autonomous'] as const;
+
+export type FieldName = typeof PHASE_FIELD_NAMES[number] | typeof PLAN_FIELD_NAMES[number];
 
 /**
  * A parsed field-state record: `known` when the serialized string decoded
- * to a well-shaped `FieldValues`, `unknown` for anything else — absent,
- * unparseable, or shape-mismatched input. An `unknown` previous state must
- * read as "every field differs", so the next run rewrites all four and
- * converges rather than skipping a write it cannot justify (see
- * `changedFields` below).
+ * to a well-shaped `FieldValues` for every name in the supplied declared
+ * list, `unknown` for anything else — absent, unparseable, shape-mismatched,
+ * or carrying an entry outside the declared list. An `unknown` previous
+ * state must read as "every declared field differs", so the next run
+ * rewrites all of them and converges rather than skipping a write it cannot
+ * justify (see `changedFields` below).
  */
 export type ParsedFieldState =
   | { kind: 'known'; values: FieldValues }
@@ -442,29 +466,58 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/**
- * Serializes the four item field values as a flat string via
- * `JSON.stringify`, for the same reason `contentHash` uses it. Stored as a
- * flat string on the completion record: the sync map's validator is a
- * closed schema of scalars, and a nested object would need a new validator
- * branch for no benefit.
- */
-export function renderFieldState(values: FieldValues): string {
-  return JSON.stringify({
-    gsdId: values.gsdId,
-    phaseId: values.phaseId,
-    requirements: values.requirements,
-    status: values.status,
-  });
+function sameRequirements(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+}
+
+/** Per-name shape validation, shared by `parseFieldState`'s wholesale check below. */
+function isValidFieldValue(name: FieldName, value: unknown): boolean {
+  if (name === 'requirements') {
+    return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+  }
+  if (name === 'wave') {
+    return value === null || (typeof value === 'number' && Number.isFinite(value));
+  }
+  if (name === 'autonomous') {
+    return typeof value === 'boolean';
+  }
+  // gsdId, phaseId, status
+  return typeof value === 'string';
 }
 
 /**
- * Parses a serialized field state. Never throws: any JSON parse failure,
- * any non-record top level, or any field whose shape does not match
- * `FieldValues` exactly (including a requirements entry that is not a
- * string) yields `{ kind: 'unknown' }` rather than a partial result.
+ * Serializes the declared field values as a flat string via
+ * `JSON.stringify`, for the same reason `contentHash` uses it. `names`
+ * defaults to `PHASE_FIELD_NAMES`, so no phase call site changes at all.
+ * Stored as a flat string on the completion record: the sync map's
+ * validator is a closed schema of scalars, and a nested object would need a
+ * new validator branch for no benefit.
+ *
+ * The byte-identity constraint is load-bearing, not cosmetic: serializes
+ * exactly the names in `names`, in list order — for `PHASE_FIELD_NAMES`
+ * this is the identical four-key-in-order shape the pre-generalization
+ * implementation always produced, so every `fieldState` string already
+ * recorded on disk keeps parsing.
  */
-export function parseFieldState(serialized: string): ParsedFieldState {
+export function renderFieldState(values: FieldValues, names: readonly FieldName[] = PHASE_FIELD_NAMES): string {
+  const record: Record<string, unknown> = {};
+  for (const name of names) {
+    record[name] = values[name];
+  }
+  return JSON.stringify(record);
+}
+
+/**
+ * Parses a serialized field state against the declared `names` list
+ * (defaulting to `PHASE_FIELD_NAMES`). Never throws: any JSON parse
+ * failure, any non-record top level, any entry present in the string but
+ * absent from `names` (or vice versa), or any field whose shape does not
+ * match `FieldValues` exactly (including a `requirements` entry that is not
+ * a string, a `wave` that is neither a number nor `null`, or an
+ * `autonomous` that is not a boolean) yields `{ kind: 'unknown' }` wholesale
+ * rather than a partial result.
+ */
+export function parseFieldState(serialized: string, names: readonly FieldName[] = PHASE_FIELD_NAMES): ParsedFieldState {
   let parsed: unknown;
   try {
     parsed = JSON.parse(serialized);
@@ -472,32 +525,47 @@ export function parseFieldState(serialized: string): ParsedFieldState {
     return { kind: 'unknown' };
   }
   if (!isPlainRecord(parsed)) return { kind: 'unknown' };
-  const { gsdId, phaseId, requirements, status } = parsed;
-  if (typeof gsdId !== 'string' || typeof phaseId !== 'string' || typeof status !== 'string') {
-    return { kind: 'unknown' };
-  }
-  if (!Array.isArray(requirements) || !requirements.every((entry) => typeof entry === 'string')) {
-    return { kind: 'unknown' };
-  }
-  return { kind: 'known', values: { gsdId, phaseId, requirements, status } };
-}
 
-function sameRequirements(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((entry, index) => entry === right[index]);
+  const parsedKeys = Object.keys(parsed);
+  if (parsedKeys.length !== names.length || !names.every((name) => parsedKeys.includes(name))) {
+    return { kind: 'unknown' };
+  }
+
+  const values: Record<string, unknown> = {};
+  for (const name of names) {
+    const value = parsed[name];
+    if (!isValidFieldValue(name, value)) return { kind: 'unknown' };
+    values[name] = value;
+  }
+  return { kind: 'known', values: values as unknown as FieldValues };
 }
 
 /**
- * D-12's predicate: the subset of the four field names whose values differ
- * between `previous` and `desired`, treating an unknown previous state as
- * all four differing. Kept beside `renderFieldState`/`parseFieldState` so
- * the write decision and the state format cannot disagree.
+ * D-12's predicate: the subset of the declared field names whose values
+ * differ between `previous` and `desired`, treating an unknown previous
+ * state as all of them differing. `names` defaults to `PHASE_FIELD_NAMES`,
+ * so no phase call site changes. Kept beside `renderFieldState`/
+ * `parseFieldState` so the write decision and the state format cannot
+ * disagree. `wave: null` and `wave: 0` are never conflated — comparison is
+ * strict equality, and `null !== 0`.
  */
-export function changedFields(previous: ParsedFieldState, desired: FieldValues): FieldName[] {
-  if (previous.kind === 'unknown') return [...FIELD_NAMES];
+export function changedFields(
+  previous: ParsedFieldState,
+  desired: FieldValues,
+  names: readonly FieldName[] = PHASE_FIELD_NAMES,
+): FieldName[] {
+  if (previous.kind === 'unknown') return [...names];
+  const previousValues = previous.values as Record<FieldName, unknown>;
+  const desiredValues = desired as Record<FieldName, unknown>;
   const changed: FieldName[] = [];
-  if (previous.values.gsdId !== desired.gsdId) changed.push('gsdId');
-  if (previous.values.phaseId !== desired.phaseId) changed.push('phaseId');
-  if (!sameRequirements(previous.values.requirements, desired.requirements)) changed.push('requirements');
-  if (previous.values.status !== desired.status) changed.push('status');
+  for (const name of names) {
+    if (name === 'requirements') {
+      const prev = (previousValues.requirements as string[] | undefined) ?? [];
+      const next = (desiredValues.requirements as string[] | undefined) ?? [];
+      if (!sameRequirements(prev, next)) changed.push(name);
+      continue;
+    }
+    if (previousValues[name] !== desiredValues[name]) changed.push(name);
+  }
   return changed;
 }

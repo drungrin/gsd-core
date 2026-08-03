@@ -26,6 +26,8 @@ const {
   DEPENDENCY_REF_SENTINEL,
   countDependencyRefSlots,
   substituteDependencyRefs,
+  PHASE_FIELD_NAMES,
+  PLAN_FIELD_NAMES,
 } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
 const PHASE = { id: '04', title: 'Phase → Issue Sync', goal: 'Sync roadmap phases as GitHub issues.' };
@@ -689,4 +691,105 @@ test('contentHash: computed over the plan-id substituted region is unaffected by
   assert.equal(hash, contentHash({ title: 'T', region: preResolution.text, milestoneNumber: 1 }));
   assert.notEqual(hash, contentHash({ title: 'T', region: dispatchRun1.text, milestoneNumber: 1 }));
   assert.notEqual(hash, contentHash({ title: 'T', region: dispatchRun2.text, milestoneNumber: 1 }));
+});
+
+/* --- Phase 5 (05-03 Task 3): one field-state trio over a declared field list --- */
+
+test('PHASE_FIELD_NAMES and PLAN_FIELD_NAMES: declared in the fixed orders the render/parse/compare trio reports them in', () => {
+  assert.deepEqual([...PHASE_FIELD_NAMES], ['gsdId', 'phaseId', 'requirements', 'status']);
+  assert.deepEqual([...PLAN_FIELD_NAMES], ['gsdId', 'phaseId', 'requirements', 'status', 'wave', 'autonomous']);
+});
+
+test('renderFieldState with no explicit names argument produces the identical four-key-in-order byte shape the pre-generalization implementation always produced (the upgrade-compatibility control)', () => {
+  const values = { gsdId: 'issue:phase:03', phaseId: '03', requirements: ['PHASE-01', 'PHASE-02'], status: 'Done' };
+  const serialized = renderFieldState(values);
+  assert.equal(serialized, JSON.stringify({ gsdId: values.gsdId, phaseId: values.phaseId, requirements: values.requirements, status: values.status }));
+});
+
+test('a verbatim phase fieldState string recorded before this upgrade still parses as known and yields zero changed fields against its own re-rendered value', () => {
+  // A real recorded shape: JSON.stringify({gsdId, phaseId, requirements, status}) in that exact key order.
+  const recorded = '{"gsdId":"issue:phase:03","phaseId":"03","requirements":["PHASE-01"],"status":"Done"}';
+  const parsed = parseFieldState(recorded);
+  assert.equal(parsed.kind, 'known', 'a fieldState string recorded before this change must still parse as known');
+
+  const rerendered = renderFieldState(parsed.values);
+  assert.equal(rerendered, recorded, 'the phase variant re-renders byte-identically to what was recorded');
+  assert.deepEqual(changedFields(parsed, parsed.values), [], 'no already-synced phase rewrites its field values on the first run after this upgrade');
+});
+
+test('the render-parse-compare round trip is closed for both declared variants, iterated in one loop', () => {
+  const fixtures = [
+    { names: PHASE_FIELD_NAMES, values: { gsdId: 'issue:phase:03', phaseId: '03', requirements: ['PHASE-01'], status: 'Done' } },
+    { names: PLAN_FIELD_NAMES, values: { gsdId: 'issue:plan:05-03', phaseId: '05', requirements: ['PLAN-05'], status: 'In Progress', wave: 2, autonomous: true } },
+  ];
+  for (const { names, values } of fixtures) {
+    const serialized = renderFieldState(values, names);
+    const parsed = parseFieldState(serialized, names);
+    assert.equal(parsed.kind, 'known', `round trip must decode for names ${JSON.stringify(names)}`);
+    assert.deepEqual(changedFields(parsed, values, names), [], `round trip must report zero changed fields for names ${JSON.stringify(names)}`);
+  }
+});
+
+test('changedFields: an unknown previous state under PLAN_FIELD_NAMES reports all six plan fields as changed, and under PHASE_FIELD_NAMES reports all four', () => {
+  const planValues = { gsdId: 'a', phaseId: '05', requirements: [], status: 'Todo', wave: 1, autonomous: false };
+  assert.deepEqual([...changedFields({ kind: 'unknown' }, planValues, PLAN_FIELD_NAMES)].sort(), [...PLAN_FIELD_NAMES].sort());
+
+  const phaseValues = { gsdId: 'a', phaseId: '04', requirements: [], status: 'Todo' };
+  assert.deepEqual([...changedFields({ kind: 'unknown' }, phaseValues)].sort(), [...PHASE_FIELD_NAMES].sort());
+});
+
+test('changedFields: changing only wave between two plan values yields exactly ["wave"]', () => {
+  const base = { gsdId: 'a', phaseId: '05', requirements: [], status: 'Todo', wave: 1, autonomous: false };
+  const previous = { kind: 'known', values: base };
+  const desired = { ...base, wave: 2 };
+  assert.deepEqual(changedFields(previous, desired, PLAN_FIELD_NAMES), ['wave']);
+});
+
+test('changedFields: changing only autonomous between two plan values yields exactly ["autonomous"]', () => {
+  const base = { gsdId: 'a', phaseId: '05', requirements: [], status: 'Todo', wave: 1, autonomous: false };
+  const previous = { kind: 'known', values: base };
+  const desired = { ...base, autonomous: true };
+  assert.deepEqual(changedFields(previous, desired, PLAN_FIELD_NAMES), ['autonomous']);
+});
+
+test('parseFieldState: a plan-variant string whose wave is neither a number nor null returns unknown', () => {
+  const malformed = JSON.stringify({ gsdId: 'a', phaseId: '05', requirements: [], status: 'Todo', wave: 'two', autonomous: false });
+  assert.equal(parseFieldState(malformed, PLAN_FIELD_NAMES).kind, 'unknown');
+});
+
+test('parseFieldState: a plan-variant string whose autonomous is not a boolean returns unknown', () => {
+  const malformed = JSON.stringify({ gsdId: 'a', phaseId: '05', requirements: [], status: 'Todo', wave: 1, autonomous: 'yes' });
+  assert.equal(parseFieldState(malformed, PLAN_FIELD_NAMES).kind, 'unknown');
+});
+
+test('parseFieldState: a plan-variant string carrying an entry outside the declared list (e.g. an extra key) returns unknown wholesale, not a partial parse', () => {
+  const withExtra = JSON.stringify({ gsdId: 'a', phaseId: '05', requirements: [], status: 'Todo', wave: 1, autonomous: false, extra: 'nope' });
+  assert.equal(parseFieldState(withExtra, PLAN_FIELD_NAMES).kind, 'unknown');
+});
+
+test('parseFieldState: a phase-variant string missing a declared key (e.g. only three of four present) returns unknown', () => {
+  const missingStatus = JSON.stringify({ gsdId: 'a', phaseId: '04', requirements: [] });
+  assert.equal(parseFieldState(missingStatus).kind, 'unknown');
+});
+
+test('a wave of null round-trips as null and is never conflated with 0 — different serialized strings and different changedFields results', () => {
+  const withNull = { gsdId: 'a', phaseId: '05', requirements: [], status: 'Todo', wave: null, autonomous: false };
+  const withZero = { gsdId: 'a', phaseId: '05', requirements: [], status: 'Todo', wave: 0, autonomous: false };
+
+  const serializedNull = renderFieldState(withNull, PLAN_FIELD_NAMES);
+  const serializedZero = renderFieldState(withZero, PLAN_FIELD_NAMES);
+  assert.notEqual(serializedNull, serializedZero);
+
+  const parsedNull = parseFieldState(serializedNull, PLAN_FIELD_NAMES);
+  assert.equal(parsedNull.kind, 'known');
+  assert.equal(parsedNull.values.wave, null);
+
+  const changed = changedFields(parsedNull, withZero, PLAN_FIELD_NAMES);
+  assert.deepEqual(changed, ['wave']);
+});
+
+test('renderFieldState/parseFieldState: no call site in github-sync-reconcile.cts passes a names argument for the phase path, and its own field-state tests remain green (compile-time contract, exercised by the suite run alongside this file)', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'github-sync-reconcile.cts'), 'utf8');
+  assert.doesNotMatch(source, /renderFieldState\([^)]*,\s*(PHASE|PLAN)_FIELD_NAMES/, 'the phase path must keep relying on the default PHASE_FIELD_NAMES argument');
+  assert.doesNotMatch(source, /changedFields\([^)]*,\s*(PHASE|PLAN)_FIELD_NAMES/, 'the phase path must keep relying on the default PHASE_FIELD_NAMES argument');
 });
