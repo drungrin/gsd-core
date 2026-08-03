@@ -668,11 +668,16 @@ function planAutonomousOptions(remote: BootstrapRemoteForMerge, strictMap: Stric
     action: OPERATION_ACTION.UPDATE,
     hasPointsBudget: false,
     contentCreation: mintsNewOption,
-    // A single node capture under the field's own key — not yet an
-    // each-capture; Task 2 widens this to also fan the response's options
-    // list out to the two option-level completions above (plan 05-04
-    // Task 1 scope stops at the converged branch).
-    captures: [{ kind: 'node', logicalKey: fieldKey, nodeIdPath: 'updateProjectV2Field.projectV2Field.id' }],
+    // Two captures ride this one operation, mirroring
+    // planStatusOptionMerge's mutation-branch shape exactly: the node
+    // capture keeps the field's own reserved key resolvable for a later
+    // rename or type check, and the each-capture's per-option ids are what
+    // a single-select field VALUE write resolves against (Phase 5 Pitfall
+    // 1) — the field id alone cannot answer "which option is Yes".
+    captures: [
+      { kind: 'node', logicalKey: fieldKey, nodeIdPath: 'updateProjectV2Field.projectV2Field.id' },
+      { kind: 'each', listPath: 'updateProjectV2Field.projectV2Field.options', matchPath: 'name', nodeIdPath: 'id', keyMap },
+    ],
     // Produced by the AUTONOMOUS stage even though its logical key carries
     // the field: prefix — the case that breaks prefix-inferred reporting
     // (plan 03-04 Task 3 / plan 03-06's per-stage counts).

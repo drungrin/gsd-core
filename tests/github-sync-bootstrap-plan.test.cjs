@@ -974,14 +974,58 @@ describe('planAutonomousOptions', () => {
     assert.equal(result.checkpoints.length, 0);
   });
 
-  test("the emitted operation's logical key is the Autonomous field's reserved key, it declares a single NODE capture, and the mutation branch itself emits zero checkpoints (checkpoints are the converged branch's own shape)", () => {
+  test("the emitted operation's logical key is the Autonomous field's reserved key, it carries exactly two captures (one node under field:autonomous, one each whose keyMap has the two option keys), and the mutation branch itself emits zero checkpoints (checkpoints are the converged branch's own shape)", () => {
     const remote = remoteWithFields([autonomousField('F_auto', [opt('id-yes', 'Yes', 'GREEN', '')])]);
     const result = planAutonomousOptions(remote, { kind: 'absent' }, CONTEXT);
     const operation = result.operations[0];
     assert.equal(operation.logicalKey, BOOTSTRAP_LOGICAL_KEY.field('Autonomous'));
-    assert.equal(operation.captures.length, 1);
-    assert.equal(operation.captures[0].kind, 'node');
+    assert.equal(operation.captures.length, 2);
+    const nodeCapture = operation.captures.find((c) => c.kind === 'node');
+    const eachCapture = operation.captures.find((c) => c.kind === 'each');
+    assert.equal(nodeCapture.logicalKey, BOOTSTRAP_LOGICAL_KEY.field('Autonomous'));
+    assert.deepEqual(eachCapture.keyMap, {
+      Yes: BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'),
+      No: BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'),
+    });
+    assert.equal(eachCapture.listPath, 'updateProjectV2Field.projectV2Field.options');
+    assert.equal(eachCapture.matchPath, 'name');
+    assert.equal(eachCapture.nodeIdPath, 'id');
     assert.equal(result.checkpoints.length, 0);
+  });
+
+  test('a response option whose name is not a declared GSD option contributes no completion — the each-capture keyMap is closed (GSD checkpoints only what GSD declares)', () => {
+    const remote = remoteWithFields([autonomousField('F_auto', [
+      opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', ''), opt('id-maybe', 'Maybe', 'PURPLE', ''),
+    ])]);
+    const result = planAutonomousOptions(remote, { kind: 'absent' }, CONTEXT);
+    const operation = result.operations[0];
+    const eachCapture = operation.captures.find((c) => c.kind === 'each');
+    // Maybe is pruned from the outgoing merged array (D-22) and is also
+    // absent from the capture's own keyMap — a doubly-closed control: even
+    // if a remote somehow still echoed it back, the keyMap alone would
+    // refuse to mint a completion for it.
+    assert.equal(eachCapture.keyMap.Maybe, undefined);
+    const response = { data: { updateProjectV2Field: { projectV2Field: { id: 'F_auto', options: [
+      { id: 'id-yes', name: 'Yes' }, { id: 'id-no', name: 'No' }, { id: 'id-maybe', name: 'Maybe' },
+    ] } } } };
+    const decoded = decodeCompletions(operation, response.data, '2026-01-01T00:00:00.000Z');
+    assert.equal(decoded.length, 3); // one node completion (field:autonomous) + two option completions (Maybe skipped)
+    assert.equal(decoded.some((d) => d.nodeId === 'id-maybe'), false);
+  });
+
+  test('applying the mutation-branch operation against a mocked response containing both options records two option completions plus the field completion', () => {
+    const remote = remoteWithFields([autonomousField('F_auto', [opt('id-yes', 'Yes', 'GREEN', '')])]);
+    const result = planAutonomousOptions(remote, { kind: 'absent' }, CONTEXT);
+    const operation = result.operations[0];
+    const response = { updateProjectV2Field: { projectV2Field: { id: 'F_auto', options: [
+      { id: 'id-yes', name: 'Yes' }, { id: 'id-no', name: 'No' },
+    ] } } };
+    const decoded = decodeCompletions(operation, response, '2026-01-01T00:00:00.000Z');
+    assert.equal(decoded.length, 3);
+    const byKey = Object.fromEntries(decoded.map((d) => [d.logicalKey, d.nodeId]));
+    assert.equal(byKey[BOOTSTRAP_LOGICAL_KEY.field('Autonomous')], 'F_auto');
+    assert.equal(byKey[BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')], 'id-yes');
+    assert.equal(byKey[BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')], 'id-no');
   });
 
   test('the operation declares its producing stage explicitly (the autonomous/options stage), even though its logical key carries the field prefix', () => {

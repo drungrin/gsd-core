@@ -446,6 +446,12 @@ describe('fresh-board sequence', () => {
       BOOTSTRAP_LOGICAL_KEY.statusOption('Blocked'),
       BOOTSTRAP_LOGICAL_KEY.statusOption('Done'),
       BOOTSTRAP_LOGICAL_KEY.statusOption('Deferred'),
+      // The freshly created Autonomous field already carries exactly
+      // Yes/No (its own create call supplied both options), so the options
+      // pass's re-read sees a converged field and records both option
+      // completions — plan 05-04's fix (Phase 5 Pitfall 1).
+      BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'),
+      BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'),
     ];
     assert.deepEqual(Object.keys(onDisk.map.completions).sort(), expectedKeys.sort());
 
@@ -542,6 +548,11 @@ describe('adopted-board case (BOOT-06 on the path where nothing is created)', ()
       BOOTSTRAP_LOGICAL_KEY.statusOption('Blocked'),
       BOOTSTRAP_LOGICAL_KEY.statusOption('Done'),
       BOOTSTRAP_LOGICAL_KEY.statusOption('Deferred'),
+      // adoptedBoardWorld's Autonomous field is already exactly Yes/No —
+      // the converged branch now records both option completions instead
+      // of nothing (plan 05-04, Phase 5 Pitfall 1).
+      BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'),
+      BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'),
     ];
     assert.deepEqual(Object.keys(onDisk.map.completions).sort(), expectedKeys.sort());
 
@@ -569,6 +580,85 @@ describe('adopted-board case (BOOT-06 on the path where nothing is created)', ()
 
     const afterBytes = fs.readFileSync(syncMapPath(cwd), 'utf8');
     assert.equal(afterBytes, beforeBytes);
+  });
+
+  // ─── Phase 5 Pitfall 1 backfill proof (plan 05-04 Task 2) ────────────────
+  //
+  // Simulates the precise state a board bootstrapped BEFORE this fix is left
+  // in: `field:autonomous` recorded (the old planAutonomousOptions's single
+  // node capture), but no `option:autonomous:*` completions — the exact
+  // shape UAT boards #9 and #10 are in after Phase 3 (05-RESEARCH.md
+  // Pitfall 1 step 4). A plain `init` re-run must backfill both option
+  // completions with zero mutations, and a second re-run must be a true
+  // no-op.
+
+  function seedLegacyAdoptedMap(cwd, world, repository) {
+    const nowIso = '2026-08-01T00:00:00.000Z';
+    const statusField = world.fields.find((f) => f.name === 'Status');
+    const legacyEntries = [
+      { logicalKey: BOOTSTRAP_LOGICAL_KEY.project(), nodeId: world.project.id, issueNumber: world.project.number },
+      { logicalKey: BOOTSTRAP_LOGICAL_KEY.projectLink(), nodeId: world.repoNodeId },
+      ...world.fields.filter((f) => f.name !== 'Status').map((f) => ({ logicalKey: BOOTSTRAP_LOGICAL_KEY.field(f.name), nodeId: f.id })),
+      { logicalKey: BOOTSTRAP_LOGICAL_KEY.field('Status'), nodeId: statusField.id },
+      ...world.labels.map((l) => ({ logicalKey: BOOTSTRAP_LOGICAL_KEY.label(l.name), nodeId: l.nodeId })),
+      { logicalKey: BOOTSTRAP_LOGICAL_KEY.milestone('v0.9'), nodeId: world.milestones[0].nodeId, issueNumber: world.milestones[0].number },
+      { logicalKey: BOOTSTRAP_LOGICAL_KEY.milestone('v1.0'), nodeId: world.milestones[1].nodeId, issueNumber: world.milestones[1].number },
+      ...statusField.options.map((o) => ({ logicalKey: BOOTSTRAP_LOGICAL_KEY.statusOption(o.name), nodeId: o.id })),
+      // Deliberately NO option:autonomous:* entries — the exact pre-fix gap.
+    ];
+    let seededMap = null;
+    for (const entry of legacyEntries) {
+      seededMap = recordCompletion(seededMap, {
+        ...entry, completedAt: nowIso, owner: repository.owner, repo: repository.repo, repositoryNumber: repository.number,
+      });
+    }
+    writeSyncMapAtomically(cwd, seededMap);
+    return seededMap;
+  }
+
+  test('backfill: a board whose sync map holds field:autonomous but no option:autonomous:* completions records both option keys on a plain re-run, dispatching zero mutations', (t) => {
+    const cwd = createTempProject('bootstrap-composition-adopted-backfill-');
+    t.after(() => cleanup(cwd));
+    const world = adoptedBoardWorld();
+    const repository = repositoryIdentity(adoptedTarget());
+    const seededMap = seedLegacyAdoptedMap(cwd, world, repository);
+    assert.equal(seededMap.completions[BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')], undefined);
+    assert.equal(seededMap.completions[BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')], undefined);
+    assert.ok(seededMap.completions[BOOTSTRAP_LOGICAL_KEY.field('Autonomous')]);
+
+    const round1 = runInitRound({ cwd, desired: desiredFixture(), world, target: adoptedTarget(), execGh: forbiddenExecGh() });
+
+    assert.equal(round1.structurePlan.operations.length, 0);
+    assert.equal(round1.optionsPlan.operations.length, 0);
+    assert.equal(world.calls.length, 0, 'the backfill must dispatch zero mutations');
+
+    const onDisk = readSyncMapStrict(cwd, repository);
+    assert.equal(onDisk.kind, 'valid');
+    assert.equal(onDisk.map.completions[BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')].nodeId, 'OPT_yes_h');
+    assert.equal(onDisk.map.completions[BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')].nodeId, 'OPT_no_h');
+    // No existing Autonomous option's identity changed across the backfill.
+    assert.equal(onDisk.map.completions[BOOTSTRAP_LOGICAL_KEY.field('Autonomous')].nodeId, seededMap.completions[BOOTSTRAP_LOGICAL_KEY.field('Autonomous')].nodeId);
+  });
+
+  test('a second init immediately after the backfill also dispatches zero mutations and records the same keys — BOOT-07 unbroken by the widening', (t) => {
+    const cwd = createTempProject('bootstrap-composition-adopted-backfill-round2-');
+    t.after(() => cleanup(cwd));
+    const world = adoptedBoardWorld();
+    const repository = repositoryIdentity(adoptedTarget());
+    seedLegacyAdoptedMap(cwd, world, repository);
+
+    runInitRound({ cwd, desired: desiredFixture(), world, target: adoptedTarget(), execGh: forbiddenExecGh() });
+    const afterBackfillKeys = Object.keys(readSyncMapStrict(cwd, repository).map.completions).sort();
+
+    const round2 = runInitRound({ cwd, desired: desiredFixture(), world, target: adoptedTarget(), execGh: forbiddenExecGh() });
+
+    assert.equal(round2.structurePlan.operations.length, 0);
+    assert.equal(round2.optionsPlan.operations.length, 0);
+    assert.equal(world.calls.length, 0);
+    const onDiskRound2 = readSyncMapStrict(cwd, repository);
+    assert.deepEqual(Object.keys(onDiskRound2.map.completions).sort(), afterBackfillKeys);
+    assert.ok(afterBackfillKeys.includes(BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')));
+    assert.ok(afterBackfillKeys.includes(BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')));
   });
 });
 
