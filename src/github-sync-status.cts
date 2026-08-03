@@ -29,6 +29,18 @@ interface ReconciliationPlan {
   uncertain: Array<{ reason: string }>;
   /** Plan 04-04 Task 3: optional so a pre-04-04-shaped plan fixture still type-checks and renders as empty. */
   pendingIssueUpdates?: Array<{ logicalKey: string }>;
+  /**
+   * CR-02 (05-REVIEW re-review): a plan whose only changed field is one
+   * `buildPlanFieldValueOperations` deliberately skips (today, only a
+   * cleared `wave:`, since GSD has no `clearProjectV2ItemFieldValue` call)
+   * produces zero operations for that field and is not a content/state
+   * no-op either, so it used to be invisible to every StatusV1 bucket —
+   * contradicting SYNC-07's "every planned create, update, no-op, orphan,
+   * and pending update is named" contract. Mirrors `pendingIssueUpdates`:
+   * optional so a pre-CR-02-shaped plan fixture still type-checks and
+   * renders as empty.
+   */
+  pendingFieldChanges?: Array<{ logicalKey: string }>;
   orphans?: Array<{ logicalKey: string; issueNumber?: number }>;
   /** Plan 05-07: optional so a pre-05-07-shaped plan fixture still type-checks and renders as empty. */
   subIssueCeilingWarnings?: SubIssueCeilingWarning[];
@@ -47,6 +59,8 @@ interface StatusV1 {
   orphans: Array<{ logicalKey: string; issueNumber?: number }>;
   /** Plan 04-04 Task 3: pending issue-content updates, by logical key only — `status` never reads the issue to learn more than the plan already named. */
   pendingIssueUpdates: string[];
+  /** CR-02: pending field changes with zero operations (today, only a cleared `wave:`), by logical key only — always present, empty when nothing applies, matching every other group. */
+  pendingFieldChanges: string[];
   /** Plan 05-07 (D-14): always present, empty when nothing applies — matches every other group; never gates. */
   subIssueCeilingWarnings: SubIssueCeilingWarning[];
   limitations: string[];
@@ -67,18 +81,18 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
         creates: [], updates: [], noops: [],
         blocked: [remote.field === undefined ? { reason: remote.reason } : { reason: remote.reason, detail: remote.field }],
         uncertain: [],
-        orphans: [], pendingIssueUpdates: [], subIssueCeilingWarnings: [],
+        orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
         limitations: ['The local github_sync.target configuration is invalid; no remote read was attempted.'],
       };
     }
     return {
       version: STATUS_SCHEMA_VERSION, available: false, message: UNAVAILABLE_MESSAGE,
       creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
-      orphans: [], pendingIssueUpdates: [], subIssueCeilingWarnings: [],
+      orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
       limitations: ['Remote data is currently unavailable; no changes were made.'],
     };
   }
-  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], orphans: [], subIssueCeilingWarnings: [] };
+  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], pendingFieldChanges: [], orphans: [], subIssueCeilingWarnings: [] };
   return {
     version: STATUS_SCHEMA_VERSION, available: true,
     creates: safePlan.operations.filter((operation) => operation.kind === 'create').map((operation) => operation.logicalKey),
@@ -88,6 +102,7 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
     uncertain: safePlan.uncertain.map(({ reason }) => ({ reason })),
     orphans: (safePlan.orphans ?? []).map(({ logicalKey, issueNumber }) => (issueNumber === undefined ? { logicalKey } : { logicalKey, issueNumber })),
     pendingIssueUpdates: (safePlan.pendingIssueUpdates ?? []).map(({ logicalKey }) => logicalKey),
+    pendingFieldChanges: (safePlan.pendingFieldChanges ?? []).map(({ logicalKey }) => logicalKey),
     subIssueCeilingWarnings: (safePlan.subIssueCeilingWarnings ?? []).map(({ phaseId, issueNumber, count, limit }) => ({ phaseId, issueNumber, count, limit })),
     limitations: [],
   };
@@ -103,8 +118,11 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
  * parentheses when known) and `updates-pending` (a pending issue-content
  * update's logical key). Plan 05-07 (D-14) adds an eighth,
  * `sub-issue-ceiling-warnings` (a phase's id, with its count against the
- * limit in parentheses). All eight groups always render their count line,
- * even at zero.
+ * limit in parentheses). CR-02 (05-REVIEW re-review) adds a ninth,
+ * `field-changes-pending` (a plan's logical key whose only changed field is
+ * one `buildPlanFieldValueOperations` deliberately skips — e.g. a cleared
+ * `wave:` — so it would otherwise never appear in any group). All nine
+ * groups always render their count line, even at zero.
  *
  * Kept pure and total: reads only `status` fields, never the filesystem,
  * config, or a caught error (SAFE-04) — the raw branch stays the first
@@ -129,6 +147,11 @@ function renderStatusV1(status: StatusV1, raw: boolean): string {
   // blocked group already uses for its detail.
   appendGroup('orphans', status.orphans.map(({ logicalKey, issueNumber }) => (issueNumber === undefined ? logicalKey : `${logicalKey} (${issueNumber})`)));
   appendGroup('updates-pending', status.pendingIssueUpdates);
+  // CR-02 (05-REVIEW re-review): the same shape as `updates-pending`, a
+  // plan's own logical key — this group exists so a field change with zero
+  // dispatched operations (today, only a cleared `wave:`) is still named
+  // somewhere in the report instead of vanishing from every bucket.
+  appendGroup('field-changes-pending', status.pendingFieldChanges);
   // Plan 05-07 (D-14): a warning renders as the phase's own identifier
   // followed by its count against the limit, in the same parenthesized-
   // detail shape the `orphans` group already uses.

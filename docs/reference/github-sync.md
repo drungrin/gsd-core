@@ -352,7 +352,9 @@ enforces the ceiling server-side and this capability has no override for it.
 Clearing a plan's `wave:` frontmatter key leaves the board's `Wave` cell at its **previous**
 value — it is not blanked. Clearing a `NUMBER` field to empty needs a GraphQL mutation this
 capability does not call; a plan that no longer declares a wave keeps showing its last-synced one
-until the field is set to a new number.
+until the field is set to a new number. `status` still names the plan under its own
+`field-changes-pending` group (CR-02, 05-REVIEW re-review), so this pending, un-appliable change
+is visible even though no `Wave` field write is ever dispatched for it.
 
 ### Before your first plan sync
 

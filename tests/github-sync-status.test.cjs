@@ -15,6 +15,7 @@ test('buildStatusV1 groups a complete reconciliation plan into the documented co
     uncertain: [{ reason: 'remote_unavailable' }],
     orphans: [{ logicalKey: 'phase:09', issueNumber: 77 }],
     pendingIssueUpdates: [{ logicalKey: 'phase:03' }],
+    pendingFieldChanges: [{ logicalKey: 'plan:04-01' }],
     subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
   });
 
@@ -26,18 +27,20 @@ test('buildStatusV1 groups a complete reconciliation plan into the documented co
     uncertain: [{ reason: 'remote_unavailable' }],
     orphans: [{ logicalKey: 'phase:09', issueNumber: 77 }],
     pendingIssueUpdates: ['phase:03'],
+    pendingFieldChanges: ['plan:04-01'],
     subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
     limitations: [],
   });
   assert.equal(JSON.parse(renderStatusV1(result, true)).version, 1);
 });
 
-test('buildStatusV1 derives orphans/pendingIssueUpdates/subIssueCeilingWarnings from the plan with an empty default when the plan omits them (pre-04-04/pre-05-07-shaped fixture)', () => {
+test('buildStatusV1 derives orphans/pendingIssueUpdates/pendingFieldChanges/subIssueCeilingWarnings from the plan with an empty default when the plan omits them (pre-04-04/pre-05-07/pre-CR-02-shaped fixture)', () => {
   const result = buildStatusV1({ available: true, reason: 'ok' }, {
     operations: [], noops: [], blocked: [], uncertain: [],
   });
   assert.deepEqual(result.orphans, []);
   assert.deepEqual(result.pendingIssueUpdates, []);
+  assert.deepEqual(result.pendingFieldChanges, []);
   assert.deepEqual(result.subIssueCeilingWarnings, []);
 });
 
@@ -62,7 +65,7 @@ test('buildStatusV1 produces an actionable fixed unavailable state without raw t
     available: false,
     message: 'github-sync status is unavailable because GitHub could not be read. Retry shortly.',
     creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
-    orphans: [], pendingIssueUpdates: [], subIssueCeilingWarnings: [],
+    orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
     limitations: ['Remote data is currently unavailable; no changes were made.'],
   });
   assert.doesNotMatch(JSON.stringify(result), /secret transport output/);
@@ -77,7 +80,7 @@ test('buildStatusV1 returns an empty subIssueCeilingWarnings array on both unava
 
 test('status schema documentation pins every exported DTO field', () => {
   const documentation = fs.readFileSync(path.join(__dirname, '..', 'docs', 'github-sync-status-schema-v1.md'), 'utf8');
-  for (const field of ['version', 'available', 'creates', 'updates', 'noops', 'blocked', 'uncertain', 'orphans', 'pendingIssueUpdates', 'subIssueCeilingWarnings', 'limitations', 'message']) {
+  for (const field of ['version', 'available', 'creates', 'updates', 'noops', 'blocked', 'uncertain', 'orphans', 'pendingIssueUpdates', 'pendingFieldChanges', 'subIssueCeilingWarnings', 'limitations', 'message']) {
     assert.match(documentation, new RegExp('`' + field + '`'));
   }
 });
@@ -88,7 +91,7 @@ test('status schema documentation pins every exported DTO field', () => {
 // the default output to list what would actually change, and D-14 requires
 // all five groups to always appear (even at zero) plus any limitations.
 
-test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), uncertain, orphans, updates-pending, and sub-issue-ceiling-warnings by name, plus limitations (D-13/D-14)', () => {
+test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), uncertain, orphans, updates-pending, field-changes-pending, and sub-issue-ceiling-warnings by name, plus limitations (D-13/D-14)', () => {
   const dto = {
     version: 1, available: true,
     creates: ['phase:02'], updates: ['phase:01'], noops: ['phase:00'],
@@ -96,6 +99,7 @@ test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), unce
     uncertain: [{ reason: 'remote_unavailable' }],
     orphans: [{ logicalKey: 'phase:09', issueNumber: 77 }],
     pendingIssueUpdates: ['phase:03'],
+    pendingFieldChanges: ['plan:04-01'],
     subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
     limitations: ['Remote data is currently unavailable; no changes were made.'],
   };
@@ -116,6 +120,8 @@ test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), unce
     '  - phase:09 (77)',
     'updates-pending: 1',
     '  - phase:03',
+    'field-changes-pending: 1',
+    '  - plan:04-01',
     'sub-issue-ceiling-warnings: 1',
     '  - 05 (91/100)',
     'limitations:',
@@ -132,6 +138,7 @@ test('renderStatusV1 renders a blocked entry without a detail as the bare reason
     uncertain: [],
     orphans: [{ logicalKey: 'phase:11' }],
     pendingIssueUpdates: [],
+    pendingFieldChanges: [],
     subIssueCeilingWarnings: [],
     limitations: [],
   };
@@ -141,11 +148,11 @@ test('renderStatusV1 renders a blocked entry without a detail as the bare reason
   assert.doesNotMatch(out, /\(/);
 });
 
-test('renderStatusV1 still shows all eight count lines at zero when every group is empty, with no limitations line (D-14) — including sub-issue-ceiling-warnings', () => {
+test('renderStatusV1 still shows all nine count lines at zero when every group is empty, with no limitations line (D-14) — including field-changes-pending and sub-issue-ceiling-warnings', () => {
   const dto = {
     version: 1, available: true,
     creates: [], updates: [], noops: [], blocked: [], uncertain: [],
-    orphans: [], pendingIssueUpdates: [], subIssueCeilingWarnings: [], limitations: [],
+    orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [], limitations: [],
   };
   const out = renderStatusV1(dto, false);
   assert.equal(out, [
@@ -157,6 +164,7 @@ test('renderStatusV1 still shows all eight count lines at zero when every group 
     'uncertain: 0',
     'orphans: 0',
     'updates-pending: 0',
+    'field-changes-pending: 0',
     'sub-issue-ceiling-warnings: 0',
     '',
   ].join('\n'));

@@ -1498,6 +1498,46 @@ test('planReconciliation: a matching content hash but a differing field state pr
   assert.deepEqual(result.pendingFieldChanges, [{ logicalKey: PLAN_STEADY_LOGICAL_KEY, changed: ['wave'] }]);
 });
 
+test('planReconciliation: CR-02 pin — a plan whose only changed field is wave cleared to null (the deliberate null-skip case, NOT the FIELD_UNRESOLVED case the test above covers) is reported in pendingFieldChanges and appears in none of operations, blocked, or noops', () => {
+  const plan = steadyPlan({ wave: null });
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  // The stored field state still carries a non-null wave (999) — clearing
+  // wave: to nothing on disk is exactly the "wave: removed from frontmatter"
+  // scenario docs/reference/github-sync.md documents. field:wave (and the
+  // rest of the plan-field bootstrap) IS resolvable here, unlike the
+  // preceding test, so buildPlanFieldValueOperations reaches its deliberate
+  // null-wave skip (reconcile.cts's null-wave `continue`) rather than a
+  // FIELD_UNRESOLVED blocked entry.
+  const staleFieldState = renderFieldState({ ...steadyPlanFieldValues(plan), wave: 999 }, PLAN_FIELD_NAMES);
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: PLAN_STEADY_MILESTONE_NUMBER },
+        [PLAN_STEADY_LOGICAL_KEY]: { nodeId: 'item-plan-0403', issueNumber: 88, fieldState: staleFieldState },
+        [PLAN_STEADY_ISSUE_KEY]: { nodeId: 'ISSUE_NODE_PLAN_0403', issueNumber: 88, contentHash: hash, issueState: 'open' },
+        ...planFieldBootstrapCompletions(),
+      },
+    },
+  };
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+
+  assert.deepEqual(result.operations, [], 'the deliberate null-wave skip means zero operations for this plan — GSD has no clearProjectV2ItemFieldValue call');
+  assert.deepEqual(result.blocked, [], 'field:wave IS resolvable this time — this is NOT the FIELD_UNRESOLVED case, so nothing is blocked either');
+  assert.deepEqual(
+    result.noops,
+    [],
+    'CR-02: planChanged.length is 1 ([\'wave\']), so the plan is correctly excluded from noops even though its content and state units both already converge — before this finding this plan existed in none of operations, noops, or blocked',
+  );
+  assert.deepEqual(
+    result.pendingFieldChanges,
+    [{ logicalKey: PLAN_STEADY_LOGICAL_KEY, changed: ['wave'] }],
+    'CR-02: pendingFieldChanges is the one bucket that names this plan — github-sync-status.cts now reads this field (it previously had no pendingFieldChanges member on ReconciliationPlan/StatusV1 at all), so `status`/`sync` finally report it instead of it vanishing from every group',
+  );
+});
+
 test('planReconciliation: a plan bound on the board with no issue:plan:<id> completion is a plain no-op, mirroring the phase loop\'s pre-migration case', () => {
   const plan = steadyPlan();
   const map = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: PLAN_STEADY_MILESTONE_NUMBER }, [PLAN_STEADY_LOGICAL_KEY]: { nodeId: 'item-plan-0403', issueNumber: 88 } } } };
