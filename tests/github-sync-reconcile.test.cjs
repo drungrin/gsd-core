@@ -1710,6 +1710,34 @@ test('planReconciliation: a dependency created earlier in this same run (no prio
   assert.deepEqual(refPart, { from: 'issue:plan:04-01', part: 'number', prefix: '#' });
 });
 
+test('planReconciliation: WR-02 pin — a dependency on a numerically-higher plan id cannot resolve same-run and self-heals on the next run once the dependency\'s completion exists', () => {
+  // Ascending-id pass processes 04-01 before 04-05, so when 04-01's own
+  // dependency check runs, 04-05's create hasn't been pushed yet — unlike
+  // the lower-id case covered above, this is NOT resolvable same-run.
+  const forwardDependent = { id: '04-01', phaseId: '04', title: 'Depends on a later plan', tasks: ['Task 1'], status: 'Todo', dependsOn: ['04-05'] };
+  const laterPlan = { id: '04-05', phaseId: '04', title: 'Sorts later, no deps', tasks: ['Task 1'], status: 'Todo' };
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions());
+
+  const runOne = planReconciliation(desiredWithPlans([forwardDependent, laterPlan]), remoteForPlans(), map);
+  assert.ok(
+    runOne.blocked.some((entry) => entry.reason === OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH && entry.detail === 'issue:plan:04-05'),
+    'the forward-pointing dependent is blocked on its first run, even though its dependency is present in the very same desired set',
+  );
+  assert.equal(runOne.operations.some((op) => op.logicalKey === 'issue:plan:04-01' || op.logicalKey === 'plan:04-01'), false);
+  assert.ok(runOne.operations.some((op) => op.logicalKey === 'issue:plan:04-05'), 'the independent later-sorting plan still creates in the same run');
+
+  // Next run: 04-05's completion now exists (as it would after run one's
+  // create dispatches), so the forward dependency resolves and 04-01
+  // converges — the self-heal the finding describes.
+  const mapAfterRunOne = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    'issue:plan:04-05': { nodeId: 'ISSUE_NODE_0405', issueNumber: 305 },
+    ...planFieldBootstrapCompletions(),
+  });
+  const runTwo = planReconciliation(desiredWithPlans([forwardDependent, laterPlan]), remoteForPlans(), mapAfterRunOne);
+  assert.deepEqual(runTwo.blocked.filter((entry) => entry.detail === 'issue:plan:04-05'), []);
+  assert.ok(runTwo.operations.some((op) => op.logicalKey === 'issue:plan:04-01'), 'the forward dependent resolves and creates on the next run');
+});
+
 test('planReconciliation: the content hash for a plan is unchanged by which issue numbers its dependencies resolve to', () => {
   const plan = { id: '04-05', phaseId: '04', title: 'Depends on two', tasks: ['Task 1: First'], status: 'Todo', dependsOn: ['04-01', '04-02'] };
   const mapA = mapWithPhaseIssue('04', 'I_node_phase_parent', {

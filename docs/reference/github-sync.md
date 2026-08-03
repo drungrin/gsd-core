@@ -277,6 +277,19 @@ them holds a dependency list. Instead, a plan's `depends_on` entries render as a
 line inside the fenced region, one native GitHub cross-issue reference per dependency (e.g. `#83`)
 that GitHub itself auto-links to the right plan sub-issue.
 
+**Same-run resolution requires the dependency to sort earlier.** Plans are processed in ascending
+`localeCompare` id order. A dependency on a plan that sorts *earlier* (e.g. `04-02` depending on
+`04-01`) resolves in the same `sync` run — either from a prior run's completion or from the
+create operation this run already pushed for it. A dependency on a plan that sorts *later* (e.g.
+`04-01` depending on `04-05`, or a forward/cross-phase reference such as a phase-N plan depending
+on a phase-(N+1) plan) cannot resolve same-run: the dependent plan is reported as blocked with a
+`DEPENDENCY_SLOT_MISMATCH` entry for that run, and converges automatically on the next run once
+the dependency's own completion exists. This is self-healing — nothing is corrupted or lost — but
+it means a genuinely forward-pointing `depends_on` costs one extra `sync` run before it converges.
+Unlike a plan's implicit dependency on its own parent phase (which is guaranteed to resolve
+same-run because the phase loop always completes before the plan loop starts), a plan-to-plan
+dependency has no such guarantee once the dependency id sorts after the dependent's own id.
+
 ### Status: closed/Done, open/Todo, open/In Progress — and who owns it
 
 A plan's `Status` is derived from disk truth, never read back from the board:
