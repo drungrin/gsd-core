@@ -234,6 +234,141 @@ alternative.
 
 ---
 
+## Plan Sub-Issues
+
+`sync` mirrors every `<NN>-<PP>-PLAN.md` into a repository Issue too — one per plan, attached to
+its phase issue through GitHub's own **sub-issue** relation (`addSubIssue`), not a link or a list
+of checkboxes in the phase issue's body. Opening a phase issue on GitHub shows a native
+**Sub-issues** section listing its plans with their own progress bar; this is GitHub's own
+hierarchy feature, the same one a developer would get building the tree by hand.
+
+### Identity marker and fenced region
+
+A plan sub-issue's first line is its own identity marker, parallel to the phase marker above but
+in the plan namespace:
+
+```
+<!-- gsd:plan id="05-08" -->
+```
+
+Everything GSD generates lives inside the same two fence tokens phase issues use —
+`<!-- gsd:begin -->` / `<!-- gsd:end -->` — with the identical contract: text outside the fences
+survives byte-for-byte across every future `sync`, in its exact position. **An edit made inside
+the fenced region is lost on the next content-changing sync, and GSD cannot detect that it
+happened** — the same tradeoff [phase issues](#the-fenced-region) carry, extended to plans without
+exception. Treat the region as read-only; write commentary outside the fences instead.
+
+### The five custom fields
+
+A plan item carries the same five custom fields `init` creates, populated from the plan's own
+PLAN.md frontmatter (read through the capability's own `readPlans()`/`parsePlanMetadata()`
+projection — see [Standing exposure](#standing-exposure-two-frontmatter-parsers) below):
+
+| Field | Source |
+|---|---|
+| `GSD ID` | The plan's logical key, e.g. `plan:05-08` |
+| `Phase` | The owning phase id |
+| `Requirements` | The plan's comma-joined requirement-id list |
+| `Wave` | The plan's `wave:` frontmatter value, written as a real `NUMBER` field value |
+| `Autonomous` | `Yes`/`No`, from the plan's `autonomous:` frontmatter value |
+
+Dependencies are **not** a sixth field — Phase 3 created exactly five custom fields and none of
+them holds a dependency list. Instead, a plan's `depends_on` entries render as a `## Depends On`
+line inside the fenced region, one native GitHub cross-issue reference per dependency (e.g. `#83`)
+that GitHub itself auto-links to the right plan sub-issue.
+
+### Status: closed/Done, open/Todo, open/In Progress — and who owns it
+
+A plan's `Status` is derived from disk truth, never read back from the board:
+
+- A plan with a sibling `<NN>-<PP>-SUMMARY.md` is **closed**, with Status `Done` — regardless of
+  its position relative to `STATE.md`'s current plan.
+- The plan named by `STATE.md`'s current position (and not yet complete) is **open**, with Status
+  `In Progress`.
+- Every other incomplete plan is **open**, with Status `Todo`.
+
+**`Status` is owned by GSD.** A value set by hand on the board — including `Blocked` or
+`Deferred` — is reverted to the disk-derived value on the next sync; this is deliberate, not a
+bug, so a developer who hand-sets a plan to `Blocked` should expect to see it revert.
+
+**A plan issue closes when its SUMMARY.md appears and reopens when it disappears.** Deleting a
+SUMMARY.md by accident reopens its plan's issue on the next sync — that is the mirror working
+correctly, not a defect to guard against.
+
+### Task rendering
+
+Inside the fenced region, under a `## Tasks` heading, each task from the plan's `<tasks>` renders
+as one line — a status glyph, a single space, then the task name verbatim — never as a markdown
+checkbox:
+
+```
+✓ Done · ▶ In Progress · ○ Todo
+✓ Task 1: The live run — backfill, sync, measure, re-sync to zero
+✓ Task 2: Confirm on the real board what the offline tests can only assert
+▶ Task 3: Document the plan sub-issue contract, ship a changeset, and flip nine requirements
+```
+
+The glyph is a **plan-level rollup**, not per-task: every task line takes the same glyph, driven
+by the plan's own derived `Status` — a task list has no independent completion state on disk to
+render otherwise. This is deliberately non-interactive: a one-way mirror that rendered a real
+checkbox would silently discard a developer's own hand-checked box on the next sync, so GSD never
+gives them one to check. The rendering itself — glyph selection and line assembly from plan status
+and task names alone — is a pure function with no network dependency, unit-tested directly against
+its input/output pairs.
+
+### Orphaned plan sub-issues
+
+A plan sub-issue left behind by a deleted or renumbered PLAN.md — one whose `plan:<id>` no longer
+matches anything on disk — is **reported by name in the run's output and never closed, unlinked,
+commented on, or deleted.** It still counts against the 100-sub-issues-per-parent ceiling below
+until a developer removes it by hand.
+
+### The sub-issue ceiling
+
+GitHub caps a parent issue at **100 sub-issues**. `status` and `sync` both warn once a phase
+reaches **90** sub-issues under its own phase issue, naming the phase, the parent issue number,
+the count, and the limit — a ten-plan runway before the ceiling, not a refusal. **The warning
+never blocks a dispatch**; nothing about it changes what `sync` does. Past 100 the `addSubIssue`
+create for the 101st plan simply fails and surfaces as an ordinary failed-sync outcome, the same
+as any other rejected mutation. A developer approaching the warning has one practical remedy:
+split the phase so fewer plans share one phase issue — there is no other lever, since GitHub
+enforces the ceiling server-side and this capability has no override for it.
+
+### `wave:` removed from frontmatter
+
+Clearing a plan's `wave:` frontmatter key leaves the board's `Wave` cell at its **previous**
+value — it is not blanked. Clearing a `NUMBER` field to empty needs a GraphQL mutation this
+capability does not call; a plan that no longer declares a wave keeps showing its last-synced one
+until the field is set to a new number.
+
+### Before your first plan sync
+
+Two operational facts a developer needs before running `sync` against plan sub-issues for the
+first time:
+
+1. **A board bootstrapped before this release needs one `init` re-run** to backfill the
+   `Autonomous` single-select option completions its sync map is missing — without it, the first
+   plan sync's `Autonomous` field write reports `field_unresolved` rather than writing `Yes`/`No`.
+   Re-running `init` against an already-bootstrapped board is safe and dispatches zero mutations
+   for everything it already has; it only fills in the missing option completions.
+2. **A first `sync` on an established repository dispatches three content-creating mutations per
+   plan** (issue create, `addSubIssue`, add-to-project) against GitHub's 80-per-minute secondary
+   rate ceiling, so a repository with dozens of plans **takes minutes**, prints nothing while it
+   runs, and is **safe to kill at any point** — every individual mutation is checkpointed to the
+   local sync map as it completes, so a killed run resumes from exactly where it stopped rather
+   than duplicating anything already created.
+
+### Standing exposure: two frontmatter parsers
+
+This repository now parses `<NN>-<PP>-PLAN.md` frontmatter in two independent places —
+`src/phase.cts`'s `cmdPhasePlanIndex` and this capability's own `parsePlanMetadata` — and no guard
+prevents the two from drifting apart. This is an accepted exposure, not an oversight: Phase 3
+established that `gsd-tools phase list-plans` returns file paths only (no wave, no dependencies,
+no requirements), so it cannot satisfy what plan sub-issue sync needs, and the capability reads
+its own projection instead.
+
+---
+
 ## `preflight`
 
 **Synopsis**

@@ -1,0 +1,5 @@
+---
+type: Added
+pr: 2763
+---
+**`github-sync` now mirrors plans, not just phases** — every `<NN>-<PP>-PLAN.md` becomes a native GitHub sub-issue of its phase issue (`addSubIssue`, GitHub's own hierarchy, never a body-text link), carrying `Wave`, `Autonomous`, `GSD ID`, `Phase`, and `Requirements` board fields read from PLAN.md frontmatter, a Status derived from disk truth (`Done` when a SUMMARY.md exists, `In Progress` at `STATE.md`'s current position, `Todo` otherwise — reverted on the next sync if hand-edited), dependency references as native cross-issue links, and a non-interactive, glyph-prefixed task list rendered inside the same fenced region phase issues use. A phase approaching GitHub's 100-sub-issues-per-parent ceiling now warns at 90 from both `status` and `sync`, and an orphaned plan sub-issue is reported by name rather than silently left invisible. Proven against a live board (58 objects, full create-to-convergence cycle, close/reopen state transitions) — see the reference documentation for the destructive edges this introduces. (#2763)
