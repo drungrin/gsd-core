@@ -16,6 +16,11 @@ const {
   renderFieldState,
   parseFieldState,
   changedFields,
+  planMarker,
+  TASK_GLYPH,
+  renderTaskList,
+  renderPlanRegion,
+  renderNewPlanIssueBody,
 } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
 const PHASE = { id: '04', title: 'Phase → Issue Sync', goal: 'Sync roadmap phases as GitHub issues.' };
@@ -396,4 +401,118 @@ test('changedFields: an identical previous and desired state reports no fields a
   const values = { gsdId: 'a', phaseId: '04', requirements: ['R1', 'R2'], status: 'Todo' };
   const previous = { kind: 'known', values: { ...values, requirements: [...values.requirements] } };
   assert.deepEqual(changedFields(previous, values), []);
+});
+
+/* --- Phase 5 (05-01 Task 1): plan marker, task list, plan region, plan body --- */
+
+const PLAN = { id: '04-03', title: '04-03 — Splice a region by severity', status: 'Todo', tasks: ['Task 1: First task', 'Task 2: Second task'] };
+
+test('planMarker: mirrors phaseMarker\'s shape, and a plan marker never equals or contains a phase marker for the same id', () => {
+  assert.equal(planMarker('04'), '<!-- gsd:plan id="04" -->');
+  assert.notEqual(planMarker('04'), phaseMarker('04'));
+  assert.equal(planMarker('04').includes(phaseMarker('04')), false);
+});
+
+test('planMarker: takes an already-normalized id and does not normalize it itself — "04-03" and "4-3" produce different markers', () => {
+  assert.notEqual(planMarker('04-03'), planMarker('4-3'));
+});
+
+test('TASK_GLYPH: exposes exactly the three PlanStatus members, each mapped to a distinct single glyph', () => {
+  assert.deepEqual(Object.keys(TASK_GLYPH).sort(), ['Done', 'In Progress', 'Todo'].sort());
+  const glyphs = Object.values(TASK_GLYPH);
+  assert.equal(new Set(glyphs).size, glyphs.length, 'every glyph must be distinct');
+});
+
+test('renderTaskList: renders one line per task, glyph + a single space + the name verbatim, preserving document order', () => {
+  const rendered = renderTaskList('Todo', PLAN.tasks);
+  const lines = rendered.split('\n');
+  assert.equal(lines.length, PLAN.tasks.length);
+  PLAN.tasks.forEach((name, index) => {
+    assert.equal(lines[index], `${TASK_GLYPH.Todo} ${name}`);
+  });
+});
+
+test('renderTaskList: two tasks whose name text is byte-identical both render as their own separate line — no deduplication', () => {
+  const rendered = renderTaskList('Done', ['Repeated name', 'Repeated name']);
+  const lines = rendered.split('\n');
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0], lines[1]);
+  assert.equal(lines[0], `${TASK_GLYPH.Done} Repeated name`);
+});
+
+test('renderTaskList: the glyph rolls up from the plan\'s own status — Done, In Progress, and Todo each render their own distinct glyph for the same task name', () => {
+  const rendered = { Done: renderTaskList('Done', ['X']), 'In Progress': renderTaskList('In Progress', ['X']), Todo: renderTaskList('Todo', ['X']) };
+  assert.equal(rendered.Done, `${TASK_GLYPH.Done} X`);
+  assert.equal(rendered['In Progress'], `${TASK_GLYPH['In Progress']} X`);
+  assert.equal(rendered.Todo, `${TASK_GLYPH.Todo} X`);
+  assert.notEqual(rendered.Done, rendered.Todo);
+});
+
+test('renderPlanRegion: no markdown checkbox appears anywhere, even when a task name itself contains bracket characters', () => {
+  const bracketPlan = { ...PLAN, tasks: ['Task with [brackets] and (parens)', 'Handle the [edge case] cleanly'] };
+  const region = renderPlanRegion(bracketPlan);
+  assert.doesNotMatch(region, /\[[ xX]\]/, 'no unchecked/checked markdown checkbox may appear');
+  assert.doesNotMatch(region, /^\s*-\s*\[/m, 'no list item may open a bracketed control');
+  assert.ok(region.includes('[brackets]'), 'the hostile bracket text itself must still render verbatim');
+});
+
+test('renderPlanRegion: task lines render in PLAN.md document order', () => {
+  const region = renderPlanRegion(PLAN);
+  const indexes = PLAN.tasks.map((name) => region.indexOf(name));
+  assert.ok(indexes.every((index) => index >= 0), 'every task name must appear');
+  assert.deepEqual(indexes, [...indexes].sort((a, b) => a - b), 'tasks must appear in source order');
+});
+
+test('renderPlanRegion: never repeats Wave, Autonomous, or Requirements as body text, even when the input object carries those properties', () => {
+  const hostilePlan = { ...PLAN, wave: 3, autonomous: true, requirements: ['PLAN-01'] };
+  const region = renderPlanRegion(hostilePlan);
+  assert.doesNotMatch(region, /Wave/i);
+  assert.doesNotMatch(region, /Autonomous/i);
+  assert.doesNotMatch(region, /Requirements/i);
+});
+
+test('renderPlanRegion: the provenance line names the plan\'s own PLAN.md path and states the issue is a regenerated projection', () => {
+  const region = renderPlanRegion(PLAN);
+  assert.ok(region.includes(`${PLAN.id}-PLAN.md`));
+  assert.match(region, /projection/i);
+  assert.match(region, /regenerat/i);
+});
+
+test('renderNewPlanIssueBody: first line is the plan marker, second line opens the region fence, closed by the end fence, then one trailing newline and nothing else — the same five-part shape renderNewIssueBody produces for a phase', () => {
+  const body = renderNewPlanIssueBody(PLAN);
+  const lines = body.split('\n');
+
+  assert.equal(lines[0], planMarker(PLAN.id));
+  assert.equal(lines[1], FENCE_BEGIN);
+  assert.equal(lines[lines.length - 2], FENCE_END);
+  assert.equal(lines[lines.length - 1], '', 'body must end with exactly one trailing newline');
+  assert.equal(body.endsWith(`${FENCE_END}\n`), true);
+  assert.equal(body.endsWith(`${FENCE_END}\n\n`), false, 'must not carry a second trailing newline');
+});
+
+test('renderNewPlanIssueBody: contains no interactive markdown checkbox in any form', () => {
+  const body = renderNewPlanIssueBody(PLAN);
+  assert.doesNotMatch(body, /\[ \]/, 'unchecked checkbox must never appear');
+  assert.doesNotMatch(body, /\[x\]/i, 'checked checkbox must never appear (case-insensitive)');
+});
+
+test('renderPlanRegion: rendering is deterministic — the same plan renders byte-identically twice', () => {
+  assert.equal(renderPlanRegion(PLAN), renderPlanRegion(PLAN));
+  assert.equal(renderPlanRegion({ ...PLAN }), renderPlanRegion({ ...PLAN }));
+});
+
+test('spliceRegion: splicing a freshly rendered plan region into an existing plan-issue body preserves every byte outside the fence pair and does not move the region\'s position', () => {
+  const above = 'A human added this note above the fence.';
+  const below = 'And this one below the fence.';
+  const oldRegion = renderPlanRegion({ ...PLAN, tasks: ['Old task'] });
+  const body = `${planMarker(PLAN.id)}\n${above}\n${FENCE_BEGIN}\n${oldRegion}\n${FENCE_END}\n${below}\n`;
+
+  const newRegion = renderPlanRegion({ ...PLAN, tasks: ['New task'] });
+  const result = spliceRegion(body, newRegion);
+
+  assert.equal(result.kind, SPLICE_RESULT.SPLICED);
+  assert.ok(result.body.startsWith(`${planMarker(PLAN.id)}\n${above}\n${FENCE_BEGIN}`));
+  assert.ok(result.body.endsWith(`${FENCE_END}\n${below}\n`));
+  assert.ok(result.body.includes('New task'));
+  assert.ok(!result.body.includes('Old task'));
 });

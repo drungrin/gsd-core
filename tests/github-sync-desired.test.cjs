@@ -7,7 +7,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createTempDir, cleanup } = require('./helpers.cjs');
 
-const { readDesiredState, DESIRED_REASON, dedupeMilestonesByVersion, PHASE_STATUS } = require('../gsd-core/bin/lib/github-sync-desired.cjs');
+const {
+  readDesiredState, DESIRED_REASON, dedupeMilestonesByVersion, PHASE_STATUS,
+  planTitleFor, parsePlanTaskNames, parseRoadmapPlanDescriptions,
+} = require('../gsd-core/bin/lib/github-sync-desired.cjs');
 
 function write(repoDir, relativePath, content) {
   const target = path.join(repoDir, relativePath);
@@ -33,7 +36,14 @@ test('readDesiredState projects roadmap phases and plan metadata in stable order
   assert.equal(result.available, true);
   assert.equal(result.reason, DESIRED_REASON.OK);
   assert.deepEqual(result.phases.map((phase) => phase.id), ['02', '10']);
-  assert.deepEqual(result.plans, [{ id: '02-01', phaseId: '02', wave: 2, autonomous: true, requirements: ['SYNC-05'], complete: true }]);
+  assert.deepEqual(result.plans, [{
+    id: '02-01', phaseId: '02', wave: 2, autonomous: true, requirements: ['SYNC-05'], complete: true,
+    // Plan 05-01 (D-04/D-01/D-05): no ROADMAP plan-list row for 02-01, so the
+    // title falls back to its phase's own title ("Sync"); the plan body
+    // carries no <task> blocks, so tasks is empty; complete: true derives
+    // Done under this tracer's two-state form.
+    title: '02-01 — Sync', tasks: [], status: PHASE_STATUS.DONE,
+  }]);
   assert.equal(result.currentPhase, '02');
 });
 
@@ -578,4 +588,110 @@ test('every fixture in this suite produces a milestone array with no two entries
   const result = readDesiredState(repoDir);
   const versions = result.milestones.map((m) => m.version);
   assert.equal(new Set(versions).size, versions.length);
+});
+
+// ─── Phase 5 (05-01 Task 1): plan title, task list, plan status ───────────
+
+test('planTitleFor: description present yields "<id> — <description>", regardless of whether a phase title is also supplied', () => {
+  assert.equal(planTitleFor('04-03', 'Splice a region by severity', 'Phase Four'), '04-03 — Splice a region by severity');
+  assert.equal(planTitleFor('04-03', 'Splice a region by severity', undefined), '04-03 — Splice a region by severity');
+});
+
+test('planTitleFor: description absent but a phase title is supplied yields "<id> — <phaseTitle>"', () => {
+  assert.equal(planTitleFor('04-03', undefined, 'Phase Four'), '04-03 — Phase Four');
+});
+
+test('planTitleFor: neither description nor phase title supplied yields the bare id, never empty', () => {
+  assert.equal(planTitleFor('04-03', undefined, undefined), '04-03');
+});
+
+test('parseRoadmapPlanDescriptions: extracts an em-dash-separated description keyed by the normalized plan id, and a bare row (no description) contributes no entry', () => {
+  const roadmap = [
+    '- [x] 04-01-PLAN.md — Tracer: the whole path, one plan only',
+    '- [x] 04-16-PLAN.md',
+    '- [ ] 4-02-PLAN.md — Unnormalized phase digit',
+  ].join('\n');
+
+  const descriptions = parseRoadmapPlanDescriptions(roadmap);
+
+  assert.equal(descriptions.get('04-01'), 'Tracer: the whole path, one plan only');
+  assert.equal(descriptions.has('04-16'), false);
+  assert.equal(descriptions.get('04-02'), 'Unnormalized phase digit');
+});
+
+test('parsePlanTaskNames: reads <task>/<name> blocks from the PLAN.md body in document order, ignoring the frontmatter entirely', () => {
+  const raw = [
+    '---',
+    'phase: 04',
+    'plan: 01',
+    '---',
+    '',
+    '<tasks>',
+    '<task type="auto">',
+    '  <name>Task 1: First task</name>',
+    '</task>',
+    '<task type="auto">',
+    '  <name>Task 2: Second task</name>',
+    '</task>',
+    '</tasks>',
+    '',
+  ].join('\n');
+
+  assert.deepEqual(parsePlanTaskNames(raw), ['Task 1: First task', 'Task 2: Second task']);
+});
+
+test('parsePlanTaskNames: two task blocks with byte-identical <name> text both contribute their own entry — no deduplication', () => {
+  const raw = [
+    '---\nphase: 04\nplan: 01\n---',
+    '<task type="auto"><name>Repeated name</name></task>',
+    '<task type="auto"><name>Repeated name</name></task>',
+  ].join('\n');
+
+  assert.deepEqual(parsePlanTaskNames(raw), ['Repeated name', 'Repeated name']);
+});
+
+test('parsePlanTaskNames: a plan file with zero <task> blocks yields an empty array, not a failure', () => {
+  const raw = '---\nphase: 04\nplan: 01\n---\n<objective>No tasks here.</objective>\n';
+  assert.deepEqual(parsePlanTaskNames(raw), []);
+});
+
+test('readPlans (via readDesiredState): title populates through all three planTitleFor tiers, and tasks reflects the PLAN.md body task/name blocks in document order', (t) => {
+  const repoDir = createTempDir('github-sync-desired-plan-title-tiers-');
+  t.after(() => cleanup(repoDir));
+  write(
+    repoDir,
+    '.planning/ROADMAP.md',
+    [
+      '# Roadmap',
+      '',
+      '- [x] 01-01-PLAN.md — Curated one-liner',
+      '- [x] 01-02-PLAN.md',
+      '',
+      '### Phase 01: One',
+      '',
+      '**Goal**: one',
+      '',
+      '### Phase 02: Two',
+      '',
+      '**Goal**: two',
+      '',
+    ].join('\n'),
+  );
+  write(repoDir, '.planning/STATE.md', '---\ncurrent_phase: 01\nmilestone: v1.0\nmilestone_name: m\n---\n');
+  // Tier 1: description present.
+  write(repoDir, '.planning/phases/01-one/01-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n<task type="auto"><name>First</name></task>\n<task type="auto"><name>Second</name></task>\n');
+  // Tier 2: no description, but the phase (01) is present in ROADMAP.md.
+  write(repoDir, '.planning/phases/01-one/01-02-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+  // Tier 3: no description and the phase (03) has no ROADMAP.md detail section at all.
+  write(repoDir, '.planning/phases/03-three/03-01-PLAN.md', '---\nwave: 1\nautonomous: true\nrequirements: []\n---\n');
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  const byId = (id) => result.plans.find((plan) => plan.id === id);
+  assert.equal(byId('01-01').title, '01-01 — Curated one-liner');
+  assert.deepEqual(byId('01-01').tasks, ['First', 'Second']);
+  assert.equal(byId('01-02').title, '01-02 — One');
+  assert.deepEqual(byId('01-02').tasks, []);
+  assert.equal(byId('03-01').title, '03-01');
 });

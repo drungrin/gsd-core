@@ -52,6 +52,12 @@ interface DesiredPlan {
   autonomous: boolean;
   requirements: string[];
   complete: boolean;
+  /** D-04: the sub-issue title, via `planTitleFor`'s three-tier fallback chain — total by construction, never empty. */
+  title: string;
+  /** D-01: the PLAN.md body's `<task>`/`<name>` blocks, in document order, no deduplication. */
+  tasks: string[];
+  /** Plan 05-01's tracer scope: the two-state form `plan.complete ? DONE : TODO`. Plan 05-02 replaces this with D-09's three-state `derivePlanStatus`. */
+  status: PhaseStatus;
 }
 
 /**
@@ -237,10 +243,63 @@ function parsePlanMetadata(raw: string): Pick<DesiredPlan, 'wave' | 'autonomous'
   };
 }
 
-function readPlans(planningDir: string): DesiredPlan[] | null {
+/**
+ * D-04: `.planning/ROADMAP.md`'s per-phase plan-list rows —
+ * `- [x] 04-03-PLAN.md — <description>` (a hyphen-en-dash-space, then free
+ * text) or a bare `- [x] 04-03-PLAN.md` with no description at all. A row
+ * carrying no description contributes no map entry — `planTitleFor`'s second
+ * fallback tier handles that case, not this parser.
+ */
+function parseRoadmapPlanDescriptions(roadmapRaw: string): Map<string, string> {
+  const descriptions = new Map<string, string>();
+  const pattern = /^-\s*\[[ xX]\]\s*(\d+(?:\.\d+)?)-(\d+)-PLAN\.md(?:\s*—\s*(.+))?\s*$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(roadmapRaw)) !== null) {
+    const description = match[3]?.trim();
+    if (!description) continue;
+    descriptions.set(`${normalizeId(match[1])}-${match[2]}`, description);
+  }
+  return descriptions;
+}
+
+/**
+ * D-04's mandatory fallback chain, total by construction and never empty:
+ * description present -> `<id> — <description>`; description absent but the
+ * phase is present in ROADMAP.md -> `<id> — <phaseTitle>`; phase absent ->
+ * `<id>` alone.
+ */
+function planTitleFor(id: string, description: string | undefined, phaseTitle: string | undefined): string {
+  if (description) return `${id} ${EM_DASH} ${description}`;
+  if (phaseTitle) return `${id} ${EM_DASH} ${phaseTitle}`;
+  return id;
+}
+
+/**
+ * D-01: PLAN.md's `<task>` blocks read from the file's **body** (never the
+ * frontmatter — `parsePlanMetadata`'s job stops at the closing `---`), in
+ * document order, each contributing its `<name>` element text, trimmed. No
+ * deduplication: two blocks whose `<name>` text is byte-identical both
+ * contribute their own entry.
+ */
+function parsePlanTaskNames(raw: string): string[] {
+  const afterFrontmatter = /^---\n[\s\S]*?\n---(?:\n|$)([\s\S]*)$/.exec(raw);
+  const body = afterFrontmatter ? afterFrontmatter[1] : raw;
+  const names: string[] = [];
+  const taskPattern = /<task\b[^>]*>([\s\S]*?)<\/task>/g;
+  let taskMatch: RegExpExecArray | null;
+  while ((taskMatch = taskPattern.exec(body)) !== null) {
+    const nameMatch = /<name>([\s\S]*?)<\/name>/.exec(taskMatch[1]);
+    if (nameMatch) names.push(nameMatch[1].trim());
+  }
+  return names;
+}
+
+function readPlans(planningDir: string, roadmapRaw: string, phases: DesiredPhase[] | null): DesiredPlan[] | null {
   const phaseRoot = path.join(planningDir, 'phases');
   let phaseDirs: string[];
   try { phaseDirs = fs.readdirSync(phaseRoot); } catch { return []; }
+  const planDescriptions = parseRoadmapPlanDescriptions(roadmapRaw);
+  const phaseTitles = new Map<string, string>((phases ?? []).map((phase) => [phase.id, phase.title]));
   const plans: DesiredPlan[] = [];
   for (const phaseDir of phaseDirs.sort()) {
     const directory = path.join(phaseRoot, phaseDir);
@@ -249,11 +308,22 @@ function readPlans(planningDir: string): DesiredPlan[] | null {
     for (const entry of entries.sort()) {
       const match = /^(\d+(?:\.\d+)?)-(\d+)-PLAN\.md$/.exec(entry);
       if (!match) continue;
-      let metadata: Pick<DesiredPlan, 'wave' | 'autonomous' | 'requirements'> | null;
-      try { metadata = parsePlanMetadata(fs.readFileSync(path.join(directory, entry), 'utf8')); } catch { return null; }
+      let raw: string;
+      try { raw = fs.readFileSync(path.join(directory, entry), 'utf8'); } catch { return null; }
+      const metadata = parsePlanMetadata(raw);
       if (!metadata) return null;
       const id = `${normalizeId(match[1])}-${match[2]}`;
-      plans.push({ ...metadata, id, phaseId: normalizeId(match[1]), complete: fs.existsSync(path.join(directory, `${match[1]}-${match[2]}-SUMMARY.md`)) });
+      const phaseId = normalizeId(match[1]);
+      const complete = fs.existsSync(path.join(directory, `${match[1]}-${match[2]}-SUMMARY.md`));
+      plans.push({
+        ...metadata,
+        id,
+        phaseId,
+        complete,
+        title: planTitleFor(id, planDescriptions.get(id), phaseTitles.get(phaseId)),
+        tasks: parsePlanTaskNames(raw),
+        status: complete ? PHASE_STATUS.DONE : PHASE_STATUS.TODO,
+      });
     }
   }
   return plans.sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
@@ -435,7 +505,7 @@ function readDesiredState(cwd: string): DesiredState {
     const currentPhase = parseCurrentPhase(stateRaw);
     const checklist = parsePhaseChecklist(roadmapRaw);
     const phases = parseRoadmap(roadmapRaw, checklist, currentPhase);
-    const plans = readPlans(planningDir);
+    const plans = readPlans(planningDir, roadmapRaw, phases);
     const milestonesResult = parseMilestones(roadmapRaw, stateRaw, planningDir);
     if (!phases || !currentPhase || !plans || !milestonesResult) return unavailable();
     return {
@@ -452,4 +522,13 @@ function readDesiredState(cwd: string): DesiredState {
   }
 }
 
-export = { readDesiredState, DESIRED_REASON, dedupeMilestonesByVersion, PHASE_STATUS, parsePhaseChecklist };
+export = {
+  readDesiredState,
+  DESIRED_REASON,
+  dedupeMilestonesByVersion,
+  PHASE_STATUS,
+  parsePhaseChecklist,
+  planTitleFor,
+  parsePlanTaskNames,
+  parseRoadmapPlanDescriptions,
+};

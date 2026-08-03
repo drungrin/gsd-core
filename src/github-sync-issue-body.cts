@@ -119,6 +119,92 @@ export function renderNewIssueBody(phase: RenderablePhase): string {
 }
 
 /**
+ * Phase 5 (D-01): the plan sub-issue's identity marker — an HTML comment
+ * naming the plan id. Mirrors `phaseMarker` exactly and normalizes nothing:
+ * the same already-normalized-id contract applies (normalization is
+ * `github-sync-desired.cts`'s job).
+ */
+export function planMarker(id: string): string {
+  return `<!-- gsd:plan id="${id}" -->`;
+}
+
+/**
+ * Phase 5 (D-05): this tracer's two-state form. Plan 05-02 replaces this with
+ * D-09's three-state `derivePlanStatus`, which is a fill on this skeleton,
+ * not a reshape of it.
+ */
+export type PlanStatus = 'Todo' | 'In Progress' | 'Done';
+
+/**
+ * D-05: the status glyph is a plan-level rollup — every task inherits its
+ * plan's own derived Status, because GSD stores no per-task completion state
+ * on disk. Frozen so no caller can add a fourth glyph without touching this
+ * one declaration.
+ */
+export const TASK_GLYPH: Readonly<Record<PlanStatus, string>> = Object.freeze({
+  Todo: '○',
+  'In Progress': '▶',
+  Done: '✓',
+});
+
+/**
+ * D-06: one line per task — a glyph, a single space, then the `<name>` text
+ * verbatim, nothing else (no file list, no behavior summary, no numbering).
+ * Document order is preserved and two byte-identical `<name>` texts both
+ * render as their own line — this function never deduplicates.
+ */
+export function renderTaskList(status: PlanStatus, taskNames: string[]): string {
+  const glyph = TASK_GLYPH[status];
+  return taskNames.map((name) => `${glyph} ${name}`).join('\n');
+}
+
+export interface RenderablePlan {
+  id: string;
+  title: string;
+  status: PlanStatus;
+  tasks: string[];
+}
+
+/**
+ * The literal path template every rendered plan provenance line names.
+ * `RenderablePlan` carries only the plan's own id, not the phase-directory
+ * slug (`05-plan-sub-issues-task-rendering`), so the directory segment
+ * renders as a literal ellipsis rather than a guessed or silently omitted
+ * directory name.
+ */
+const PLAN_PATH_PREFIX = '.planning/phases/.../';
+const PLAN_PATH_SUFFIX = '-PLAN.md';
+
+/**
+ * D-07/D-12: the plan sub-issue's region — a `## Tasks` heading, the task
+ * list (D-05/D-06), and a provenance line naming the plan's own PLAN.md path
+ * and stating the issue is a one-way projection regenerated on every sync.
+ * Per D-12's coupling constraint, the region **never** repeats `Wave`,
+ * `Autonomous`, or `Requirements` as body text — those belong to the other
+ * convergence unit (the item fields), and a field change must not rewrite a
+ * body. Emits no markdown checkbox anywhere, under any condition (D-04's
+ * transparency rule, carried over unchanged from the phase renderer).
+ */
+export function renderPlanRegion(plan: RenderablePlan): string {
+  const lines: string[] = ['## Tasks', '', renderTaskList(plan.status, plan.tasks)];
+  lines.push(
+    '',
+    '---',
+    `_This issue is generated from \`${PLAN_PATH_PREFIX}${plan.id}${PLAN_PATH_SUFFIX}\`. It is a one-way projection, regenerated on every sync — edits made here are never synced back; update the plan file instead._`,
+  );
+  return lines.join('\n');
+}
+
+/**
+ * D-07: the marker, a newline, the begin fence, the region, the end fence,
+ * and one trailing newline — the same five-part shape `renderNewIssueBody`
+ * produces for a phase.
+ */
+export function renderNewPlanIssueBody(plan: RenderablePlan): string {
+  return `${planMarker(plan.id)}\n${FENCE_BEGIN}\n${renderPlanRegion(plan)}\n${FENCE_END}\n`;
+}
+
+/**
  * D-03's three-way severity catalog for splicing a fresh region into an
  * existing body. Mirrors the frozen-catalog style of
  * `github-sync-reconcile.cts`'s `OPERATION_REASON`.

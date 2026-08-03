@@ -8,11 +8,14 @@ import type { MutationOperation, ArgvEntry, CompletionContext } from './github-s
 import bootstrapPlanMod = require('./github-sync-bootstrap-plan.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import issueBodyMod = require('./github-sync-issue-body.cjs');
-import type { FieldValues, FieldName, ParsedFieldState } from './github-sync-issue-body.cts';
+import type { FieldValues, FieldName, ParsedFieldState, PlanStatus } from './github-sync-issue-body.cts';
 
 const { OPERATION_TRANSPORT, OPERATION_ACTION, ARGV_REF_PART } = operationMod;
 const { BOOTSTRAP_LOGICAL_KEY, GSD_LABELS, STATUS_FIELD_NAME } = bootstrapPlanMod;
-const { renderNewIssueBody, renderPhaseRegion, contentHash, renderFieldState, parseFieldState, changedFields } = issueBodyMod;
+const {
+  renderNewIssueBody, renderPhaseRegion, contentHash, renderFieldState, parseFieldState, changedFields,
+  renderNewPlanIssueBody, renderPlanRegion,
+} = issueBodyMod;
 
 const OPERATION_KIND = Object.freeze({ CREATE: 'create', UPDATE: 'update' } as const);
 const OPERATION_REASON = Object.freeze({
@@ -49,6 +52,8 @@ const OPERATION_REASON = Object.freeze({
 
 /** The `gsd:phase` label's own name, as declared in `GSD_LABELS` (github-sync-bootstrap-plan.cts) — never re-spelled. */
 const PHASE_LABEL_NAME = 'gsd:phase';
+/** Phase 5: the `gsd:plan` label's own name, as declared in `GSD_LABELS` — never re-spelled. */
+const PLAN_LABEL_NAME = 'gsd:plan';
 
 /**
  * T-04-02: mirrors `PATH_SAFE_TARGET`/`assertPathSafeTarget` in
@@ -83,7 +88,21 @@ interface DesiredPhase {
 }
 /** Mirrors `github-sync-desired.cts`'s `DesiredMilestone` shape — only the two fields this module needs. */
 interface DesiredMilestone { version: string; archived: boolean; }
-interface DesiredState { available: boolean; reason: string; phases: DesiredPhase[]; milestones?: DesiredMilestone[]; }
+/**
+ * Phase 5 (05-01 tracer scope): mirrors `github-sync-desired.cts`'s
+ * `DesiredPlan` shape, limited to the fields this module's create branch
+ * needs today. `wave`/`autonomous`/`dependsOn` arrive with plan 05-05's
+ * field-value writer and dependency references — this tracer never reads
+ * them, so they are deliberately absent here rather than declared unused.
+ */
+interface DesiredPlan {
+  id: string;
+  phaseId: string;
+  title: string;
+  tasks: string[];
+  status: PlanStatus;
+}
+interface DesiredState { available: boolean; reason: string; phases: DesiredPhase[]; plans?: DesiredPlan[]; milestones?: DesiredMilestone[]; }
 interface RemoteItem { id?: unknown; content?: { id?: unknown; number?: unknown } | null; }
 interface RemoteSnapshot {
   available: boolean;
@@ -158,6 +177,16 @@ function isNonEmptyString(value: unknown): value is string {
 /** `issue:phase:<id>` — the phase issue's own identity, distinct from `phase:<id>` (its project item, per the assumption-delta decision promoting the issue to a first-class mapped object). */
 function issueKeyFor(id: string): string {
   return `issue:phase:${id}`;
+}
+
+/** Phase 5: `plan:<id>` — the plan sub-issue's own project-item identity, mirroring `phase:<id>`. */
+function planKeyFor(id: string): string {
+  return `plan:${id}`;
+}
+
+/** Phase 5: `issue:plan:<id>` — the plan sub-issue's own identity, mirroring `issue:phase:<id>`. */
+function planIssueKeyFor(id: string): string {
+  return `issue:plan:${id}`;
 }
 
 const PHASE_KEY_PREFIX = 'phase:';
@@ -476,6 +505,111 @@ function buildCreateIssueOperation(
   };
 }
 
+/**
+ * Phase 5 (05-CONTEXT.md D-13, 05-RESEARCH.md Code Examples): the one
+ * GraphQL surface with no prior call site in this codebase
+ * (05-RESEARCH.md "No Analog Found"). Plan 05-01 Task 2 settles the live
+ * schema and corrects this document text and the capture paths below in
+ * place if the live shape disagrees — see
+ * `.planning/phases/05-plan-sub-issues-task-rendering/05-ADDSUBISSUE-PROBE.md`.
+ * Deliberately NOT registered in
+ * `tests/fixtures/github-sync/graphql-documents-contract.json` (05-CONTEXT.md
+ * research-correction note): that fixture's guard asserts two-way equality
+ * with the documents `readRemoteSnapshot` dispatches, and this is a
+ * reconcile-side mutation, never dispatched by the remote reader. Pinned
+ * instead by an inline assertion in `tests/github-sync-reconcile.test.cjs`,
+ * following the `addProjectV2ItemById` precedent.
+ */
+const ADD_SUB_ISSUE_DOCUMENT =
+  'mutation($issueId:ID!,$subIssueId:ID!) { # github-sync:addSubIssue\n' +
+  'addSubIssue(input:{issueId:$issueId,subIssueId:$subIssueId}) { issue { id } subIssue { id number } } }';
+
+/**
+ * Phase 5: the plan-issue equivalent of `buildCreateIssueOperation` — REST
+ * create with the `gsd:plan` label, the rendered plan body
+ * (`renderNewPlanIssueBody`), and the milestone number late-bound from the
+ * milestone completion (D-15). `plannerFields` carries the freshly computed
+ * content hash so an immediate re-plan sees the create's own hash already
+ * equal to the recomputed one.
+ */
+function buildCreatePlanIssueOperation(
+  plan: DesiredPlan,
+  issueKey: string,
+  milestoneKey: string,
+  restApiPath: string,
+  context: CompletionContext,
+  plannerFields?: Record<string, string>,
+): MutationOperation {
+  const planLabel = GSD_LABELS.find((label) => label.name === PLAN_LABEL_NAME);
+  const labelName = planLabel ? planLabel.name : PLAN_LABEL_NAME;
+  const args: ArgvEntry[] = [
+    'api', restApiPath, '-X', 'POST',
+    // SECURITY: every plan-sourced string (title, rendered body) rides the
+    // raw -f flag — never the typed -F flag, which performs @-file and
+    // {owner}/{repo} substitution on the value.
+    '-f', `title=${plan.title}`,
+    '-f', `body=${renderNewPlanIssueBody({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks })}`,
+    '-f', `labels[]=${labelName}`,
+    '-F', { from: milestoneKey, part: ARGV_REF_PART.NUMBER, prefix: 'milestone=' },
+  ];
+  return {
+    kind: 'create-plan-issue',
+    logicalKey: issueKey,
+    args,
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.REST,
+    action: OPERATION_ACTION.CREATE,
+    hasPointsBudget: false,
+    contentCreation: true,
+    captures: [{
+      kind: 'node',
+      logicalKey: issueKey,
+      nodeIdPath: 'node_id',
+      numberPath: 'number',
+      ...(plannerFields === undefined ? {} : { plannerFields }),
+    }],
+  };
+}
+
+/**
+ * Phase 5 (D-13): attaches a just-created (or already-existing) plan issue to
+ * its parent phase issue as a native GitHub sub-issue. `issueId` late-binds
+ * to the parent's `issue:phase:<phaseId>` completion; `subIssueId` late-binds
+ * to this plan's own `issue:plan:<planId>` completion — resolved from a
+ * prior run, or (the common case) from the create operation immediately
+ * preceding this one within the same plan, mirroring `operationFor`'s own
+ * late-binding idiom (line ~401-403). Both ride the raw `-f` flag: both are
+ * opaque GitHub-minted node ids GSD is echoing back, per
+ * `github-sync-operation.cts`'s SECURITY rule ("new code puts node ids on
+ * the raw flag").
+ */
+function buildAddSubIssueOperation(planId: string, phaseId: string, context: CompletionContext): MutationOperation {
+  const planIssueKey = planIssueKeyFor(planId);
+  const phaseIssueKey = issueKeyFor(phaseId);
+  const args: ArgvEntry[] = [
+    'api', 'graphql',
+    '-f', `query=${ADD_SUB_ISSUE_DOCUMENT}`,
+    '-f', { from: phaseIssueKey, part: ARGV_REF_PART.NODE_ID, prefix: 'issueId=' },
+    '-f', { from: planIssueKey, part: ARGV_REF_PART.NODE_ID, prefix: 'subIssueId=' },
+  ];
+  return {
+    kind: 'add-sub-issue',
+    logicalKey: planIssueKey,
+    args,
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.LINK,
+    hasPointsBudget: false,
+    contentCreation: true,
+    captures: [{
+      kind: 'node',
+      logicalKey: planIssueKey,
+      nodeIdPath: 'addSubIssue.subIssue.id',
+      numberPath: 'addSubIssue.subIssue.number',
+    }],
+  };
+}
+
 function bindingOnBoard(completion: { nodeId: string; issueNumber?: number } | undefined, remote: RemoteSnapshot): boolean {
   if (!completion) return false;
   for (const item of remote.items ?? []) {
@@ -667,6 +801,43 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
     blocked.push(...fieldResult.blocked);
   }
 
+  // Plan 05-01 Task 1: a second pass over `desired.plans`, appended after the
+  // phase loop above rather than interleaved with it — this is what makes
+  // D-13's ordering constraint (phase creates before any plan create) hold
+  // structurally, not by convention. This tracer implements exactly one
+  // branch: no `issue:plan:<id>` completion, a resolvable
+  // `issue:phase:<phaseId>` completion, and a resolvable milestone
+  // completion push the three content-creating operations, in order (REST
+  // create, addSubIssue, add-to-project), carrying the freshly computed
+  // content hash on the create's planner fields. Every other case — an
+  // existing `issue:plan:<id>` completion, an unresolvable parent, or an
+  // unresolvable milestone — `continue`s with no operation and no blocked
+  // entry: plan 05-05 supplies the real convergence/bind branches and the
+  // typed PARENT_UNRESOLVED refusal this tracer deliberately leaves unbuilt
+  // (noted here, not silently assumed complete).
+  const milestoneCompletionForPlans = milestoneKey ? completions[milestoneKey] : undefined;
+  for (const plan of [...(desired.plans ?? [])].sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))) {
+    const planLogicalKey = planKeyFor(plan.id);
+    const planIssueKey = planIssueKeyFor(plan.id);
+    if (completions[planIssueKey]) continue;
+
+    const phaseIssueCompletion = completions[issueKeyFor(plan.phaseId)];
+    if (!phaseIssueCompletion || !isNonEmptyString(phaseIssueCompletion.nodeId)) continue;
+
+    if (!milestoneCompletionForPlans || milestoneCompletionForPlans.issueNumber === undefined) continue;
+
+    const restApiPath = phaseIssueRestPath(remote.target.owner, remote.target.repo, '/issues');
+    if (!restApiPath) continue;
+
+    const planRegion = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+    const milestoneNumber = milestoneCompletionForPlans.issueNumber;
+    const desiredPlanHash = contentHash({ title: plan.title, region: planRegion, milestoneNumber });
+
+    operations.push(buildCreatePlanIssueOperation(plan, planIssueKey, milestoneKey as string, restApiPath, context, { contentHash: desiredPlanHash }));
+    operations.push(buildAddSubIssueOperation(plan.id, plan.phaseId, context));
+    operations.push(operationFor(planLogicalKey, remote.target.projectNodeId, { from: planIssueKey }, remote.target));
+  }
+
   // Plan 04-04 Task 1 (D-11): a post-loop pass, scoped to the two phase
   // namespaces by prefix — a bootstrap-namespace key (`project`, `field:*`,
   // `option:status:*`, `label:*`, `milestone:*`) never starts with either
@@ -694,9 +865,14 @@ export = {
   OPERATION_KIND,
   OPERATION_REASON,
   issueKeyFor,
+  planKeyFor,
+  planIssueKeyFor,
   phaseIssueRestPath,
   PATH_SAFE_TARGET,
   buildCreateIssueOperation,
+  buildCreatePlanIssueOperation,
+  buildAddSubIssueOperation,
+  ADD_SUB_ISSUE_DOCUMENT,
   buildFieldValueOperations,
   documentForFieldType,
   UPDATE_FIELD_VALUE_TEXT_DOCUMENT,
