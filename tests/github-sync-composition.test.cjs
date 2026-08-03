@@ -42,9 +42,13 @@ const ID_ALLOWLIST = new Set([
   // addSubIssue link to a pre-existing parent phase issue, and the project
   // item id addProjectV2ItemById mints for it in the same run.
   'I_node_phase_plan_parent', 'I_node_plan_0403', 'PVTI_item_plan_0403',
+  // plan 05-05: the plan-only Wave/Autonomous field and option node ids a
+  // bootstrapped board records, resolved through the same reserved-key
+  // catalog as the four shared fields above.
+  'FIELD_WAVE', 'FIELD_AUTONOMOUS', 'OPTION_AUTONOMOUS_YES', 'OPTION_AUTONOMOUS_NO',
 ]);
 const { BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
-const { phaseMarker, planMarker, FENCE_BEGIN, FENCE_END, renderPhaseRegion, contentHash, renderFieldState } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const { phaseMarker, planMarker, FENCE_BEGIN, FENCE_END, renderPhaseRegion, contentHash, renderFieldState, PLAN_FIELD_NAMES } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 const { prepareIssueUpdates } = require('../gsd-core/bin/lib/github-sync-issue-update.cjs');
 
 const FIELD_KEY = {
@@ -64,6 +68,17 @@ function fieldBootstrapCompletions() {
     [BOOTSTRAP_LOGICAL_KEY.statusOption('Todo')]: { nodeId: 'OPTION_TODO' },
     [BOOTSTRAP_LOGICAL_KEY.statusOption('In Progress')]: { nodeId: 'OPTION_IN_PROGRESS' },
     [BOOTSTRAP_LOGICAL_KEY.statusOption('Done')]: { nodeId: 'OPTION_DONE' },
+  };
+}
+
+/** Plan 05-05: the plan item's two extra fields (Wave, Autonomous) and the Autonomous field's two options, alongside the four fields every phase already shares. */
+function planFieldBootstrapCompletions() {
+  return {
+    ...fieldBootstrapCompletions(),
+    [BOOTSTRAP_LOGICAL_KEY.field('Wave')]: { nodeId: 'FIELD_WAVE' },
+    [BOOTSTRAP_LOGICAL_KEY.field('Autonomous')]: { nodeId: 'FIELD_AUTONOMOUS' },
+    [BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')]: { nodeId: 'OPTION_AUTONOMOUS_YES' },
+    [BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')]: { nodeId: 'OPTION_AUTONOMOUS_NO' },
   };
 }
 
@@ -807,11 +822,15 @@ function desiredWithOnePlan(plan) {
   };
 }
 
-/** Plan 05-01: the milestone completion plus the parent phase issue's own `issue:phase:<phaseId>` completion — the shape a prior Phase 4 sync run would already have recorded. */
+/** Plan 05-01, extended by 05-05: the milestone completion, the parent phase issue's own `issue:phase:<phaseId>` completion, the `project` completion, and the plan item's six field/option completions — the shape a prior Phase 3/4 `init` run would already have recorded. */
 function seedPhaseIssueAndMilestoneMap(cwd, phaseId, phaseIssueNodeId) {
   let map = null;
   map = recordCompletion(map, makeSeedCompletion(PLAN_MILESTONE_KEY, 'MI_node_plan', PLAN_MILESTONE_NUMBER));
   map = recordCompletion(map, makeSeedCompletion(`issue:phase:${phaseId}`, phaseIssueNodeId, 40));
+  map = recordCompletion(map, makeSeedCompletion(BOOTSTRAP_LOGICAL_KEY.project(), TARGET.projectNodeId, undefined));
+  for (const [logicalKey, completion] of Object.entries(planFieldBootstrapCompletions())) {
+    map = recordCompletion(map, makeSeedCompletion(logicalKey, completion.nodeId, undefined));
+  }
   writeSyncMapAtomically(cwd, map);
   const reopened = readSyncMapStrict(cwd, REPOSITORY);
   assert.equal(reopened.kind, 'valid');
@@ -831,7 +850,7 @@ function addSubIssueResponse(issueNodeId, subIssueNodeId, subIssueNumber) {
   };
 }
 
-test('one PLAN.md on disk, given a phase issue already in the map, produces a native sub-issue of its phase issue and an item on the board, tasks rendered inside the fenced region, checkpointed under issue:plan and plan', (t) => {
+test('one PLAN.md on disk, given a phase issue already in the map, produces a native sub-issue of its phase issue and an item on the board, plus its five field writes (Wave omitted, unset), tasks rendered inside the fenced region, checkpointed under issue:plan and plan', (t) => {
   const cwd = createTempProject('github-sync-composition-plan-tracer-');
   t.after(() => cleanup(cwd));
 
@@ -849,8 +868,16 @@ test('one PLAN.md on disk, given a phase issue already in the map, produces a na
 
   const reconPlan = planReconciliation(singleDesired, remote([]), seeded);
   assert.deepEqual(reconPlan.blocked, []);
-  assert.deepEqual(reconPlan.operations.map((op) => op.logicalKey), ['issue:plan:04-03', 'issue:plan:04-03', 'plan:04-03']);
-  assert.deepEqual(reconPlan.operations.map((op) => op.transport), ['rest', 'graphql', 'graphql']);
+  // Plan 05-05: the create branch now also emits the plan's field writes —
+  // gsdId, phaseId, requirements, status, autonomous (Wave omitted since
+  // this fixture's plan declares no `wave`, which is `null` by default).
+  assert.deepEqual(reconPlan.operations.map((op) => op.logicalKey), [
+    'issue:plan:04-03', 'issue:plan:04-03',
+    'plan:04-03', 'plan:04-03', 'plan:04-03', 'plan:04-03', 'plan:04-03', 'plan:04-03',
+  ]);
+  assert.deepEqual(reconPlan.operations.map((op) => op.transport), [
+    'rest', 'graphql', 'graphql', 'graphql', 'graphql', 'graphql', 'graphql', 'graphql',
+  ]);
 
   const run = applyMutationPlan(reconPlan, {
     cwd,
@@ -868,21 +895,33 @@ test('one PLAN.md on disk, given a phase issue already in the map, produces a na
         assert.ok(args.includes('subIssueId=I_node_plan_0403'), 'addSubIssue must late-bind this run\'s own create capture');
         return addSubIssueResponse('I_node_phase_plan_parent', 'I_node_plan_0403', 88);
       }
-      assert.ok(args.includes('contentId=I_node_plan_0403'), 'add-to-project must late-bind the create capture within the same run');
-      return response('PVTI_item_plan_0403', 88);
+      if (callIndex === 3) {
+        assert.ok(args.includes('contentId=I_node_plan_0403'), 'add-to-project must late-bind the create capture within the same run');
+        return response('PVTI_item_plan_0403', 88);
+      }
+      // The five field-value calls: each late-binds its item id to the
+      // add-to-project operation's own capture, recorded earlier in this
+      // same run under the same `plan:04-03` logical key.
+      assert.ok(args.includes('itemId=PVTI_item_plan_0403'), 'a field write must late-bind to the add-to-project operation\'s own capture within the same run');
+      return fieldValueResponse('PVTI_item_plan_0403', 88);
     },
     recordCompletion,
     writeSyncMapAtomically,
   });
   assert.equal(run.kind, 'completed');
   assertOpaqueIdPairs(dispatchedArgv);
-  assert.equal(dispatchedArgv.length, 3, 'exactly three content-creating operations for one plan');
+  assert.equal(dispatchedArgv.length, 8, 'three content-creating operations plus five field writes for one plan');
 
   const reopened = readSyncMapStrict(cwd, REPOSITORY);
   assert.equal(reopened.kind, 'valid');
   assert.equal(reopened.map.completions['issue:plan:04-03'].nodeId, 'I_node_plan_0403');
   assert.equal(reopened.map.completions['issue:plan:04-03'].issueNumber, 88);
   assert.equal(reopened.map.completions['plan:04-03'].nodeId, 'PVTI_item_plan_0403');
+  const expectedFieldState = renderFieldState(
+    { gsdId: 'plan:04-03', phaseId: '04', requirements: [], status: 'Todo', wave: null, autonomous: false },
+    PLAN_FIELD_NAMES,
+  );
+  assert.equal(reopened.map.completions['plan:04-03'].fieldState, expectedFieldState);
 
   // The created body's five-part shape: marker, begin fence, region, end
   // fence, one trailing newline — the same shape renderNewIssueBody produces
@@ -898,9 +937,12 @@ test('one PLAN.md on disk, given a phase issue already in the map, produces a na
   assert.doesNotMatch(restBody, /\[ \]/);
   assert.doesNotMatch(restBody, /\[x\]/i);
 
-  // Re-running against the resulting map emits zero further operations.
-  const secondPlan = planReconciliation(singleDesired, remote([]), reopened);
+  // Re-running against the resulting (now-bound) map emits zero further operations.
+  const boundRemote = remote([{ id: 'PVTI_item_plan_0403', content: { id: 'I_node_plan_0403', number: 88 } }]);
+  const secondPlan = planReconciliation(singleDesired, boundRemote, reopened);
   assert.deepEqual(secondPlan.operations, []);
+  assert.deepEqual(secondPlan.blocked, []);
+  assert.deepEqual(secondPlan.noops, [{ logicalKey: 'plan:04-03' }]);
 
   let secondRunDispatched = 0;
   const secondRun = applyMutationPlan(secondPlan, {
@@ -916,4 +958,135 @@ test('one PLAN.md on disk, given a phase issue already in the map, produces a na
   });
   assert.equal(secondRun.kind, 'completed');
   assert.equal(secondRunDispatched, 0);
+});
+
+// ─── Plan 05-05 Task 3: the four-run offline convergence proof for plans ──
+
+const PLAN_FOUR_RUN_MILESTONE_VERSION = 'v3.0';
+const PLAN_FOUR_RUN_MILESTONE_KEY = BOOTSTRAP_LOGICAL_KEY.milestone(PLAN_FOUR_RUN_MILESTONE_VERSION);
+const PLAN_FOUR_RUN_MILESTONE_NUMBER = 12;
+
+function fourRunPlansDesired(planA, planB) {
+  return {
+    available: true,
+    reason: 'ok',
+    phases: [],
+    plans: [planA, planB],
+    milestones: [{ version: PLAN_FOUR_RUN_MILESTONE_VERSION, name: 'Three', title: `${PLAN_FOUR_RUN_MILESTONE_VERSION} — Three`, description: 'd', archived: false }],
+  };
+}
+
+/** The milestone completion, the parent phase issue's own completion, the `project` completion, and the plan item's six field/option completions — a fully bootstrapped board plus one prior phase sync. */
+function seedPlanFourRunMap(cwd) {
+  let map = null;
+  map = recordCompletion(map, makeSeedCompletion(PLAN_FOUR_RUN_MILESTONE_KEY, 'MI_node_four_run', PLAN_FOUR_RUN_MILESTONE_NUMBER));
+  map = recordCompletion(map, makeSeedCompletion(BOOTSTRAP_LOGICAL_KEY.project(), TARGET.projectNodeId, undefined));
+  map = recordCompletion(map, makeSeedCompletion('issue:phase:08', 'I_node_phase_four_run_parent', 200));
+  for (const [logicalKey, completion] of Object.entries(planFieldBootstrapCompletions())) {
+    map = recordCompletion(map, makeSeedCompletion(logicalKey, completion.nodeId, undefined));
+  }
+  writeSyncMapAtomically(cwd, map);
+  const reopened = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(reopened.kind, 'valid');
+  return reopened;
+}
+
+test('four-run offline convergence: a phase issue already in the map plus two plans — run one dispatches the full create-and-field-write set, runs two through four dispatch nothing', (t) => {
+  const cwd = createTempProject('github-sync-composition-plan-four-run-');
+  t.after(() => cleanup(cwd));
+
+  const planA = { id: '08-01', phaseId: '08', title: '08-01 — Plan A', tasks: ['Task 1: A1'], status: 'Todo', wave: 1, autonomous: true, requirements: ['PLAN-01'] };
+  const planB = { id: '08-02', phaseId: '08', title: '08-02 — Plan B', tasks: ['Task 1: B1'], status: 'Todo', wave: 1, autonomous: false, requirements: [] };
+  const desiredPlans = fourRunPlansDesired(planA, planB);
+  const seeded = seedPlanFourRunMap(cwd);
+  const clock = fixedClock();
+
+  // ─── Run 1: create everything (2 plans x [3 create ops + 6 field writes]) ─
+  const firstPlan = planReconciliation(desiredPlans, remote([]), seeded);
+  assert.deepEqual(firstPlan.blocked, []);
+  assert.equal(firstPlan.operations.length, 18);
+
+  let currentPlanNodeId = null;
+  let currentPlanNumber = null;
+  let currentPlanItemId = null;
+  let callCount = 0;
+  const firstDispatched = [];
+  function fourRunExecGh(args) {
+    firstDispatched.push(args);
+    callCount += 1;
+    if (args[0] === 'api' && args[2] === '-X' && args[3] === 'POST') {
+      currentPlanNodeId = `I_node_plan_run1_${callCount}`;
+      currentPlanNumber = 900 + callCount;
+      return restIssueCreateResponse(currentPlanNodeId, currentPlanNumber);
+    }
+    const queryArg = args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
+    if (queryArg && queryArg.includes('addSubIssue')) {
+      return addSubIssueResponse('I_node_phase_four_run_parent', currentPlanNodeId, currentPlanNumber);
+    }
+    if (queryArg && queryArg.includes('addProjectV2ItemById')) {
+      currentPlanItemId = `PVTI_item_plan_run1_${callCount}`;
+      return response(currentPlanItemId, currentPlanNumber);
+    }
+    return fieldValueResponse(currentPlanItemId, currentPlanNumber);
+  }
+
+  const firstRun = applyMutationPlan(firstPlan, {
+    cwd, map: seeded.map, clock, execGh: fourRunExecGh, recordCompletion, writeSyncMapAtomically,
+  });
+  assert.equal(firstRun.kind, 'completed');
+  assert.equal(firstDispatched.length, 18);
+
+  const afterFirst = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterFirst.kind, 'valid');
+
+  // The bound remote every subsequent run reads: one project item per plan,
+  // matching the `plan:<id>` completion's own recorded node id.
+  const boundItems = Object.entries(afterFirst.map.completions)
+    .filter(([key]) => key.startsWith('plan:'))
+    .map(([, completion]) => ({ id: completion.nodeId, content: { id: 'ignored', number: completion.issueNumber } }));
+  assert.equal(boundItems.length, 2);
+
+  // ─── Run 2: zero operations, zero dispatches ───────────────────────────
+  const secondReconPlan = planReconciliation(desiredPlans, remote(boundItems), afterFirst);
+  assert.deepEqual(secondReconPlan.operations, []);
+  assert.deepEqual(secondReconPlan.blocked, []);
+
+  let secondDispatched = 0;
+  const secondRun = applyMutationPlan(secondReconPlan, {
+    cwd, map: afterFirst.map, clock,
+    execGh() { secondDispatched += 1; throw new Error('run two must not dispatch'); },
+    recordCompletion, writeSyncMapAtomically,
+  });
+  assert.equal(secondRun.kind, 'completed');
+  assert.equal(secondDispatched, 0);
+  const afterSecond = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterSecond.kind, 'valid');
+
+  // ─── Run 3: zero operations, zero dispatches ───────────────────────────
+  const thirdReconPlan = planReconciliation(desiredPlans, remote(boundItems), afterSecond);
+  assert.deepEqual(thirdReconPlan.operations, []);
+  let thirdDispatched = 0;
+  const thirdRun = applyMutationPlan(thirdReconPlan, {
+    cwd, map: afterSecond.map, clock,
+    execGh() { thirdDispatched += 1; throw new Error('run three must not dispatch'); },
+    recordCompletion, writeSyncMapAtomically,
+  });
+  assert.equal(thirdRun.kind, 'completed');
+  assert.equal(thirdDispatched, 0);
+  const afterThird = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterThird.kind, 'valid');
+
+  // ─── Run 4: zero operations, zero dispatches ───────────────────────────
+  const fourthReconPlan = planReconciliation(desiredPlans, remote(boundItems), afterThird);
+  assert.deepEqual(fourthReconPlan.operations, []);
+  let fourthDispatched = 0;
+  const fourthRun = applyMutationPlan(fourthReconPlan, {
+    cwd, map: afterThird.map, clock,
+    execGh() { fourthDispatched += 1; throw new Error('run four must not dispatch'); },
+    recordCompletion, writeSyncMapAtomically,
+  });
+  assert.equal(fourthRun.kind, 'completed');
+  assert.equal(fourthDispatched, 0);
+
+  assert.deepEqual([firstDispatched.length, secondDispatched, thirdDispatched, fourthDispatched], [18, 0, 0, 0]);
 });

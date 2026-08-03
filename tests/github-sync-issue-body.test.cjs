@@ -788,8 +788,18 @@ test('a wave of null round-trips as null and is never conflated with 0 — diffe
   assert.deepEqual(changed, ['wave']);
 });
 
-test('renderFieldState/parseFieldState: no call site in github-sync-reconcile.cts passes a names argument for the phase path, and its own field-state tests remain green (compile-time contract, exercised by the suite run alongside this file)', () => {
+test('renderFieldState/parseFieldState/changedFields: the phase path in github-sync-reconcile.cts keeps relying on the default PHASE_FIELD_NAMES argument; plan 05-05\'s plan call sites pass an explicit names argument, and it is always PLAN_FIELD_NAMES, never PHASE_FIELD_NAMES spelled out', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'github-sync-reconcile.cts'), 'utf8');
-  assert.doesNotMatch(source, /renderFieldState\([^)]*,\s*(PHASE|PLAN)_FIELD_NAMES/, 'the phase path must keep relying on the default PHASE_FIELD_NAMES argument');
-  assert.doesNotMatch(source, /changedFields\([^)]*,\s*(PHASE|PLAN)_FIELD_NAMES/, 'the phase path must keep relying on the default PHASE_FIELD_NAMES argument');
+  // No call site ever spells out PHASE_FIELD_NAMES explicitly — the phase
+  // path keeps relying on the implicit default, exactly as plan 05-03 pinned.
+  assert.doesNotMatch(source, /renderFieldState\([^)]*,\s*PHASE_FIELD_NAMES/, 'the phase path must keep relying on the default PHASE_FIELD_NAMES argument');
+  assert.doesNotMatch(source, /parseFieldState\([^)]*,\s*PHASE_FIELD_NAMES/, 'the phase path must keep relying on the default PHASE_FIELD_NAMES argument');
+  assert.doesNotMatch(source, /changedFields\([^)]*,\s*PHASE_FIELD_NAMES/, 'the phase path must keep relying on the default PHASE_FIELD_NAMES argument');
+  // Plan 05-05: every explicit names argument that DOES appear (the plan
+  // call sites `buildPlanFieldValueOperations` and the plan branch of
+  // `planReconciliation` introduce) is the six-name plan variant — proof the
+  // phase and plan paths never cross-contaminate.
+  const explicitNamesCalls = source.match(/(?:renderFieldState|parseFieldState|changedFields)\([^)]*,\s*\w+_FIELD_NAMES/g) ?? [];
+  assert.ok(explicitNamesCalls.length > 0, 'expected at least one plan call site with an explicit names argument');
+  assert.ok(explicitNamesCalls.every((call) => call.includes('PLAN_FIELD_NAMES')), 'every explicit names argument must be PLAN_FIELD_NAMES');
 });
