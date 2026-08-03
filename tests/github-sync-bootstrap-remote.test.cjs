@@ -518,16 +518,47 @@ function captureDispatchedBootstrapDocuments() {
   }
 
   // plan 06-01 Task 2: createViewWithFields/updateViewShapeWithFilter are
-  // captured from planViews' own create-path plan (an empty views list and a
-  // resolvable Status field, so Backlog's create+update pair both emit).
+  // captured from planViews' own create-path plan against every D-08 view
+  // present (fields carrying Phase/Wave/Status so Table-by-Phase/By-Wave
+  // resolve too, not just Backlog) — an empty views list, so every view
+  // creates.
+  //
+  // plan 06-02 Task 1: createView/updateViewShape (the configuration-free
+  // pair) are captured the same way — createView from THIS SAME create-path
+  // plan (Roadmap/Board have no filter/fields, so their create routes
+  // through the bare document), updateShape from a second, repair-path plan
+  // holding a matched-but-diverged Roadmap (the D-01 resolve-by-id-restore
+  // branch, with no filter/fields to trigger the WITH_FILTER document).
   const viewsCreatePathPlan = planViews(
-    { available: true, projectOutcome: 'resolved', statusField: null, fields: [{ id: 'PVTSSF_1', name: 'Status', dataType: 'SINGLE_SELECT', options: [] }], views: [] },
+    {
+      available: true, projectOutcome: 'resolved', statusField: null,
+      fields: [
+        { id: 'PVTF_phase_1', name: 'Phase', dataType: 'TEXT', options: null },
+        { id: 'PVTF_wave_1', name: 'Wave', dataType: 'NUMBER', options: null },
+        { id: 'PVTSSF_1', name: 'Status', dataType: 'SINGLE_SELECT', options: [] },
+      ],
+      views: [],
+    },
     { kind: 'absent' },
     { owner: 'octo', repo: 'example', repositoryNumber: 1 },
   );
-  for (const operation of viewsCreatePathPlan.operations) {
+  const viewsRepairPathPlan = planViews(
+    {
+      available: true, projectOutcome: 'resolved', statusField: null,
+      fields: [{ id: 'PVTSSF_1', name: 'Status', dataType: 'SINGLE_SELECT', options: [] }],
+      views: [{ id: 'PVTV_roadmap_h', name: 'Roadmap', layout: 'BOARD_LAYOUT', filter: null }],
+    },
+    { kind: 'absent' },
+    { owner: 'octo', repo: 'example', repositoryNumber: 1 },
+  );
+  // Longer names first: 'createView'/'updateViewShape' are prefixes of
+  // 'createViewWithFields'/'updateViewShapeWithFilter', so a shorter
+  // candidate checked first would false-positive-match the longer query via
+  // `.includes`.
+  const viewDocumentNames = ['createViewWithFields', 'createView', 'updateViewShapeWithFilter', 'updateViewShape'];
+  for (const operation of [...viewsCreatePathPlan.operations, ...viewsRepairPathPlan.operations]) {
     const query = operation.args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
-    const name = ['createViewWithFields', 'updateViewShapeWithFilter'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
+    const name = viewDocumentNames.find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
     if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
   }
 

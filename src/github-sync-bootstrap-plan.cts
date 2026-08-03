@@ -915,12 +915,19 @@ interface GsdViewDeclaration {
 }
 
 /**
- * D-08's five concrete view specifications — this plan (06-01) ships exactly
- * ONE, Backlog, to prove the whole path end to end before the remaining four
- * are declared (D-07). Plan 06-02 adds the other four rows; the table is the
- * extension point and adding a row requires no shape change.
+ * D-08's five concrete view specifications, in declaration order. Plan 06-01
+ * proved the path end to end with exactly one row (Backlog); plan 06-02 adds
+ * the other four — Roadmap and Board declare neither a filter nor a visible
+ * field (D-05/D-08: grouping is read-only, so the "by-X" intent rides the
+ * name plus, for Table-by-Phase/By-Wave, the visible field alone), while
+ * Table-by-Phase, By-Wave, and Backlog each pair a label or status filter
+ * with the fields a developer would group by once they do it by hand.
  */
 const GSD_VIEWS: readonly GsdViewDeclaration[] = Object.freeze([
+  Object.freeze({ name: 'Roadmap', layout: VIEW_LAYOUT.ROADMAP, filter: null, visibleFieldNames: Object.freeze([]) }),
+  Object.freeze({ name: 'Board', layout: VIEW_LAYOUT.BOARD, filter: null, visibleFieldNames: Object.freeze([]) }),
+  Object.freeze({ name: 'Table-by-Phase', layout: VIEW_LAYOUT.TABLE, filter: 'label:gsd:phase', visibleFieldNames: Object.freeze(['Phase', 'Status']) }),
+  Object.freeze({ name: 'By-Wave', layout: VIEW_LAYOUT.TABLE, filter: 'label:gsd:plan', visibleFieldNames: Object.freeze(['Wave', 'Phase', 'Status']) }),
   Object.freeze({ name: 'Backlog', layout: VIEW_LAYOUT.TABLE, filter: '-status:Done', visibleFieldNames: Object.freeze(['Status']) }),
 ]);
 
@@ -937,6 +944,18 @@ const CREATE_VIEW_WITH_FIELDS_DOCUMENT =
 const UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT =
   'mutation($viewId:ID!,$name:String!,$layout:ProjectV2ViewLayout!,$filter:String!,$fieldIds:[ID!]) { # github-sync-bootstrap:updateViewShapeWithFilter\n' +
   ' updateProjectV2View(input:{viewId:$viewId,name:$name,layout:$layout,filter:$filter,configuration:{visibleFieldIds:$fieldIds}}) { projectV2View { id name layout filter } } }';
+
+// Plan 06-02 Task 1: the configuration-free pair — Roadmap and Board declare
+// neither a filter nor a visible field, so these two documents carry no
+// `configuration` input at all. That is why the null-`visibleFieldIds`
+// question never has to be answered for them: `ProjectV2ViewConfigurationInput`
+// is simply absent from the request, not sent with an empty/null value.
+const CREATE_VIEW_DOCUMENT =
+  'mutation($projectId:ID!,$name:String!,$layout:ProjectV2ViewLayout!) { # github-sync-bootstrap:createView\n' +
+  ' createProjectV2View(input:{projectId:$projectId,name:$name,layout:$layout}) { projectV2View { id } } }';
+const UPDATE_VIEW_SHAPE_DOCUMENT =
+  'mutation($viewId:ID!,$name:String!,$layout:ProjectV2ViewLayout!) { # github-sync-bootstrap:updateViewShape\n' +
+  ' updateProjectV2View(input:{viewId:$viewId,name:$name,layout:$layout}) { projectV2View { id name layout } } }';
 
 /**
  * Encodes `configuration.visibleFieldIds` (a plain `[ID!]` array of node
@@ -992,24 +1011,63 @@ function buildCreateViewOperation(spec: GsdViewDeclaration, viewKey: string, fie
 }
 
 /**
- * D-02/D-06's converge-all-three-owned-properties-together update:
- * `name`/`layout`/`filter`/`configuration.visibleFieldIds` in one call —
- * used both as the second half of a fresh create (D-06's two-operation
- * handoff, `viewIdArg` an `ArgvRef` late-bound to the create's own
- * `NodeCapture`) and, independently, to restore a matched-but-diverged
- * view's shape in one run (`viewIdArg` the observed literal id — the D-01
- * repair path, e.g. a view found by stored id under a different name).
+ * The configuration-free create half (plan 06-02 Task 1), for a
+ * specification whose `visibleFieldNames` is empty — Roadmap and Board.
+ * Otherwise identical in shape to `buildCreateViewOperation`: the project id
+ * rides an `ArgvRef` the same way, and its own `NodeCapture` records the new
+ * view id under `view:<slug>`. Carries no `fieldIds` argv at all — the
+ * document it dispatches (`CREATE_VIEW_DOCUMENT`) declares no such variable.
  */
-function buildUpdateViewShapeOperation(spec: GsdViewDeclaration, viewKey: string, viewIdArg: ArgvEntry, fieldIds: string[], context: CompletionContext): StageTaggedOperation {
+function buildCreateViewBareOperation(spec: GsdViewDeclaration, viewKey: string, context: CompletionContext): StageTaggedOperation {
+  const projectRef: ArgvEntry = { from: BOOTSTRAP_LOGICAL_KEY.project(), part: ARGV_REF_PART.NODE_ID, prefix: 'projectId=' };
   const args: ArgvEntry[] = [
     'api', 'graphql',
-    '-f', `query=${UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT}`,
+    '-f', `query=${CREATE_VIEW_DOCUMENT}`,
+    '-f', projectRef,
+    '-f', `name=${spec.name}`,
+    '-f', `layout=${spec.layout}`,
+  ];
+  return {
+    kind: 'create-view',
+    logicalKey: viewKey,
+    args,
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.CREATE,
+    hasPointsBudget: false,
+    contentCreation: true,
+    captures: [{ kind: 'node', logicalKey: viewKey, nodeIdPath: 'createProjectV2View.projectV2View.id' }],
+    stage: BOOTSTRAP_STAGE.VIEWS,
+  };
+}
+
+/**
+ * D-02/D-06's converge-all-owned-properties-together update. Used both as
+ * the second half of a fresh create (D-06's two-operation handoff,
+ * `viewIdArg` an `ArgvRef` late-bound to the create's own `NodeCapture`) and,
+ * independently, to restore a matched-but-diverged view's shape in one run
+ * (`viewIdArg` the observed literal id — the D-01 repair path, e.g. a view
+ * found by stored id under a different name).
+ *
+ * Selects `UPDATE_VIEW_SHAPE_DOCUMENT` (name/layout only) when the
+ * specification has no filter and no visible fields — Roadmap and Board's
+ * repair path — and `UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT` otherwise, so a
+ * bare view's repair never carries a `filter=` argv entry the document has
+ * no variable for.
+ */
+function buildUpdateViewShapeOperation(spec: GsdViewDeclaration, viewKey: string, viewIdArg: ArgvEntry, fieldIds: string[], context: CompletionContext): StageTaggedOperation {
+  const hasFilterOrFields = spec.filter !== null || spec.visibleFieldNames.length > 0;
+  const args: ArgvEntry[] = [
+    'api', 'graphql',
+    '-f', `query=${hasFilterOrFields ? UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT : UPDATE_VIEW_SHAPE_DOCUMENT}`,
     '-f', viewIdArg,
     '-f', `name=${spec.name}`,
     '-f', `layout=${spec.layout}`,
-    '-f', `filter=${spec.filter ?? ''}`,
-    ...viewFieldIdsArgv('fieldIds', fieldIds),
   ];
+  if (hasFilterOrFields) {
+    args.push('-f', `filter=${spec.filter ?? ''}`);
+    args.push(...viewFieldIdsArgv('fieldIds', fieldIds));
+  }
   return {
     kind: 'update-view',
     logicalKey: viewKey,
@@ -1058,16 +1116,25 @@ interface ViewPlanResult {
  * adopt/converge pattern `planFields`/`planLabels`/`planMilestones` already
  * establish — but with D-02's three-way branch instead of `planFields`'
  * four-way one, because `name`/`layout`/`filter` converge together as one
- * update rather than per-attribute: no match -> create then update; matched
- * and every owned property already correct -> zero operations and one
- * checkpoint carrying the observed node id; matched and any owned property
- * wrong -> one update restoring all of them (D-03's adopt-then-converge, and
- * D-01's resolve-by-id-restore-name repair, are both this same branch).
+ * update rather than per-attribute: no match -> create (bare, or create then
+ * update — see below); matched and every owned property already correct ->
+ * zero operations and one checkpoint carrying the observed node id; matched
+ * and any owned property wrong -> one update restoring all of them (D-03's
+ * adopt-then-converge, and D-01's resolve-by-id-restore-name repair, are
+ * both this same branch).
+ *
+ * A specification with no filter and no visible fields (Roadmap, Board)
+ * needs no follow-up update at create time — `CreateProjectV2ViewInput`
+ * already carries everything such a view owns — so the no-match branch emits
+ * a single bare create. Every other specification still rides D-06's
+ * two-operation create -> capture -> late-bound-update handoff.
  *
  * `visibleFieldNames` is resolved to node ids from `remote.fields` by exact
  * name BEFORE identity resolution — a name missing from the snapshot pushes
  * one blocked entry (RESEARCH Pitfall 3) and skips both the create and the
  * update path for that view, never a create that silently omits the field.
+ * A blocked view is a per-view skip: it does not suppress any other view's
+ * plan (unlike `validateFatalConditions`' run-fatal suppression).
  */
 function planViews(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, context: CompletionContext): ViewPlanResult {
   // Mirrors planStatusOptionMerge's own unset short-circuit: there is no
@@ -1102,13 +1169,19 @@ function planViews(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, co
       continue;
     }
 
+    const hasFilterOrFields = gsdView.filter !== null || gsdView.visibleFieldNames.length > 0;
+
     const match = resolveViewIdentity(gsdView, remoteViews, strictMap, claimedRemoteIds);
     if (!match) {
-      const viewIdRef: ArgvEntry = { from: viewKey, part: ARGV_REF_PART.NODE_ID, prefix: 'viewId=' };
-      operations.push(
-        buildCreateViewOperation(gsdView, viewKey, fieldIds, context),
-        buildUpdateViewShapeOperation(gsdView, viewKey, viewIdRef, fieldIds, context),
-      );
+      if (!hasFilterOrFields) {
+        operations.push(buildCreateViewBareOperation(gsdView, viewKey, context));
+      } else {
+        const viewIdRef: ArgvEntry = { from: viewKey, part: ARGV_REF_PART.NODE_ID, prefix: 'viewId=' };
+        operations.push(
+          buildCreateViewOperation(gsdView, viewKey, fieldIds, context),
+          buildUpdateViewShapeOperation(gsdView, viewKey, viewIdRef, fieldIds, context),
+        );
+      }
       continue;
     }
     claimedRemoteIds.add(match.view.id);
@@ -1495,4 +1568,6 @@ export = {
   RENAME_FIELD_DOCUMENT,
   CREATE_VIEW_WITH_FIELDS_DOCUMENT,
   UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT,
+  CREATE_VIEW_DOCUMENT,
+  UPDATE_VIEW_SHAPE_DOCUMENT,
 };

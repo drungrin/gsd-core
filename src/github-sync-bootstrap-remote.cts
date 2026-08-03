@@ -150,6 +150,20 @@ const BOOTSTRAP_DOCUMENTS = Object.freeze({
   // `buildAddSubIssueOperation` already proves) or, independently, to a
   // matched-but-diverged view's observed literal id.
   updateViewShapeWithFilter: 'mutation($viewId:ID!,$name:String!,$layout:ProjectV2ViewLayout!,$filter:String!,$fieldIds:[ID!]) { # github-sync-bootstrap:updateViewShapeWithFilter\n updateProjectV2View(input:{viewId:$viewId,name:$name,layout:$layout,filter:$filter,configuration:{visibleFieldIds:$fieldIds}}) { projectV2View { id name layout filter } } }',
+  // Plan 06-02 Task 1: the configuration-free pair, for Roadmap and Board —
+  // D-08's two views declaring neither a filter nor a visible field. Both
+  // carry no `configuration` input at all, so the null-`visibleFieldIds`
+  // question this pair would otherwise raise never has to be answered.
+  // Dispatched by github-sync-bootstrap-plan.cts's planViews, not this
+  // module — pinned byte-identical to that module's local copy by a
+  // differential test, the same pattern createViewWithFields establishes.
+  createView: 'mutation($projectId:ID!,$name:String!,$layout:ProjectV2ViewLayout!) { # github-sync-bootstrap:createView\n createProjectV2View(input:{projectId:$projectId,name:$name,layout:$layout}) { projectV2View { id } } }',
+  // The bare update half — restores `name`/`layout` alone, for a
+  // matched-but-diverged Roadmap or Board (D-01's repair path). No `filter`,
+  // no `configuration` — the same document-selection branch
+  // `buildUpdateViewShapeOperation` uses to pick between this and
+  // `updateViewShapeWithFilter`.
+  updateViewShape: 'mutation($viewId:ID!,$name:String!,$layout:ProjectV2ViewLayout!) { # github-sync-bootstrap:updateViewShape\n updateProjectV2View(input:{viewId:$viewId,name:$name,layout:$layout}) { projectV2View { id name layout } } }',
 });
 
 const STATUS_FIELD_NAME = 'Status';
