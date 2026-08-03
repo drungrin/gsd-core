@@ -134,6 +134,8 @@ interface ConfigWriteResultLike { ok: boolean; reason: string; }
 interface BootstrapConfigModule {
   resolveTarget(cwd: string, options?: { execGh?: unknown }): ResolveTargetResultLike;
   readProjectTitle(cwd: string): string | null;
+  /** Plan 06-04: the already-validated `github_sync.view.layout` GraphQL enum member — read once per `init` run, threaded to both `planBootstrap` passes. */
+  readViewLayout(cwd: string): string;
   writeProjectNumber(cwd: string, target: { owner: string; repo: string; repositoryNumber: number }, projectNumber: number): ConfigWriteResultLike;
   RESOLVE_TARGET_REASON: { CONFIGURED: string; RESOLVED: string; UNRESOLVABLE: string };
 }
@@ -484,9 +486,13 @@ function routeGithubSyncCommandRouter({
             repositoryNumber: resolvedTarget.repositoryNumber,
           };
           const projectTitle = bootstrapConfig.readProjectTitle(cwd);
+          // Plan 06-04: read once per run, beside projectTitle — the same
+          // one-read-two-consumers pattern, so the structure and options
+          // passes can never disagree about the configured layout.
+          const viewLayout = bootstrapConfig.readViewLayout(cwd);
 
           const structurePlan = bootstrapPlan.planBootstrap(
-            { desired: desiredState, remote: remoteSnapshot, strictMap, target: { ...baseTarget, projectNumber: resolvedTarget.projectNumber }, projectTitle },
+            { desired: desiredState, remote: remoteSnapshot, strictMap, target: { ...baseTarget, projectNumber: resolvedTarget.projectNumber }, projectTitle, viewLayout },
             { pass: bootstrapPlan.BOOTSTRAP_PASS.STRUCTURE },
           );
           const reportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: resolvedTarget.projectNumber };
@@ -527,7 +533,7 @@ function routeGithubSyncCommandRouter({
 
           const optionsStrictMap = structureApply.map ? { kind: 'valid', map: structureApply.map } : { kind: 'absent' };
           const optionsPlan = bootstrapPlan.planBootstrap(
-            { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber }, projectTitle },
+            { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber }, projectTitle, viewLayout },
             { pass: bootstrapPlan.BOOTSTRAP_PASS.OPTIONS },
           );
           if (optionsPlan.blocked.length > 0 || optionsPlan.uncertain.length > 0) {
