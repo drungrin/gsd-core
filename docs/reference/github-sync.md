@@ -83,9 +83,9 @@ field — GSD has no deadline concept to mirror.
 
 Separately, `init` retypes the layout of whichever view happens to sit **leftmost** on the
 board — the tab a developer sees first, since the API has no other way to express "default view"
-(see [API ceiling](#api-ceiling)). This is governed by
-[`github_sync.view.layout`](#configuration) (default `board`) and is the only one of the eight
-behaviors above that touches a view GSD did not itself create.
+(see [API ceiling](#api-ceiling)). This is governed by the configurable layout key in
+[Configuration](#configuration) (default `board`) and is the only one of the eight behaviors
+above that touches a view GSD did not itself create.
 
 ### Manual setup in the GitHub UI
 
@@ -103,8 +103,8 @@ tracks or ever will.
   is nothing an API client, including `init`, could ever call to create one.
 - **Making a chosen view the one the board opens on.** There is no view-reordering mutation and
   no `isDefault` field on `ProjectV2View`, so "default view" means whichever view sits leftmost.
-  `init` retypes that view's layout (governed by [`github_sync.view.layout`](#configuration)) but
-  can never move a view into that position.
+  `init` retypes that view's layout (governed by the layout key in [Configuration](#configuration))
+  but can never move a view into that position.
 
 ### What `init` records without creating
 
@@ -505,6 +505,7 @@ cannot reach Projects v2 under any permissions configuration.
 | `github_sync.target.repository_number` | number | `0` | The repository's numeric database id. |
 | `github_sync.target.project_number` | number | `0` | The target Project v2's number. **Written by `init`** the first time it creates or recovers a board, if it was not already configured — the one exception to this capability's one-way direction (see [What `init` deliberately does not do](#what-init-deliberately-does-not-do)). |
 | `github_sync.project_title` | string | `""` | Title used when `init` creates a board. Empty means `<repo> Roadmap`. |
+| `github_sync.view.layout` | enum: `board` \| `table` \| `roadmap` | `board` | Layout `init` applies to the project's pre-existing leftmost view on every run. Does not choose *which* view is leftmost — GSD cannot; see [The five views](#the-five-views). |
 
 ## `.planning/.github-sync.json`
 
@@ -513,3 +514,25 @@ repository-scoped GitHub node ids only, **never a token** — and its format is 
 surface across capability upgrades**: a future version of `github-sync` may add new reserved
 logical keys, but it will not change the meaning of an existing one, so an installed map keeps
 working after `gsd-core` is updated.
+
+### Reserved logical-key prefixes
+
+Every completion recorded in the map is keyed by one of these reserved prefixes:
+
+| Prefix | What it identifies |
+|---|---|
+| `project` | The Project v2 board itself. |
+| `project-link` | The board's link to its repository (`linkProjectV2ToRepository`), tracked as its own independently-retryable completion. |
+| `field:<slug>` | One of the five custom fields (`GSD ID`, `Phase`, `Requirements`, `Wave`, `Autonomous`). |
+| `option:status:<slug>` | A GSD-reconciled option on the built-in `Status` field. |
+| `option:autonomous:<slug>` | A `Yes`/`No` option on the `Autonomous` single-select field. |
+| `label:<slug>` | One of the two repository labels (`gsd:phase`, `gsd:plan`). |
+| `milestone:<slug>` | One GitHub Milestone per GSD milestone. |
+| `view:<slug>` | One of the [five GSD-owned views](#the-five-views), one key per view. |
+| `view:leftmost` | The adopted leftmost view — a nullary key distinct from `view:<slug>`, since identity here is positional, never a name (see [The five views](#the-five-views)). |
+
+The stability promise stated above, concretely: a future version may add new reserved keys; the
+meaning of an existing key never changes; and the map's `version` stays `1` (`SYNC_MAP_VERSION`)
+for as long as that promise holds. Enumerating the keyspace here means a reader can tell whether
+the file in front of them is current, rather than the documented keyspace silently falling behind
+the code.
