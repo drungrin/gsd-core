@@ -1710,6 +1710,71 @@ test('planReconciliation: a dependency created earlier in this same run (no prio
   assert.deepEqual(refPart, { from: 'issue:plan:04-01', part: 'number', prefix: '#' });
 });
 
+// ─── CR-01 pin (05-REVIEW re-review): the already-bound branch's own
+// dependency-resolvability pre-check, mirroring the create branch's ────────
+
+test('planReconciliation: CR-01 pin — an already-bound plan whose dependsOn names an unresolvable id is blocked with a scoped DEPENDENCY_SLOT_MISMATCH entry, contributes zero operations, is never reported as a no-op, and never suppresses a sibling plan\'s own create', () => {
+  const blockedPlan = steadyPlan({ dependsOn: ['04-99'] });
+  const siblingPlan = { id: '04-06', phaseId: '04', title: 'Sibling, no deps', tasks: ['Task 1'], status: 'Todo' };
+  const desired = {
+    available: true, reason: 'ok', currentPhase: null,
+    phases: [], plans: [blockedPlan, siblingPlan],
+    milestones: [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }],
+  };
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    [PLAN_STEADY_LOGICAL_KEY]: { nodeId: 'item-plan-0403', issueNumber: 88 },
+    [PLAN_STEADY_ISSUE_KEY]: { nodeId: 'ISSUE_NODE_PLAN_0403', issueNumber: 88 },
+    ...planFieldBootstrapCompletions(),
+  });
+
+  const result = planReconciliation(desired, steadyPlanRemote(), map);
+
+  assert.ok(
+    result.blocked.some((entry) => entry.reason === OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH && entry.detail === 'issue:plan:04-99'),
+    'the already-bound branch now reports the exact same typed, scoped blocker the create branch already reports for an unresolvable dependency',
+  );
+  assert.equal(
+    result.operations.some((op) => op.logicalKey === PLAN_STEADY_LOGICAL_KEY || op.logicalKey === PLAN_STEADY_ISSUE_KEY),
+    false,
+    'the blocked plan emits no operation at all — no state PATCH, no field write, no board bind',
+  );
+  assert.deepEqual(
+    result.pendingIssueUpdates,
+    [],
+    'CR-01: before this fix, the plan would have reached pendingIssueUpdates carrying dependsOn: ["04-99"] as an unresolved ArgvRef, only to be caught later by resolveArgv at dispatch time — aborting every other queued operation in the run, not just this plan\'s',
+  );
+  assert.equal(result.noops.some((entry) => entry.logicalKey === PLAN_STEADY_LOGICAL_KEY), false, 'a blocked plan is never also reported as a no-op');
+  assert.ok(
+    result.operations.some((op) => op.logicalKey === 'issue:plan:04-06'),
+    'the sibling plan still creates in the same run — one plan\'s bad dependency never suppresses another\'s unrelated operations',
+  );
+});
+
+test('planReconciliation: CR-01 pin — once the dependency resolves (its own completion now exists), the previously blocked already-bound plan proceeds to its normal convergence path', () => {
+  const plan = steadyPlan({ dependsOn: ['04-99'] });
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    [PLAN_STEADY_LOGICAL_KEY]: { nodeId: 'item-plan-0403', issueNumber: 88 },
+    [PLAN_STEADY_ISSUE_KEY]: { nodeId: 'ISSUE_NODE_PLAN_0403', issueNumber: 88 },
+    'issue:plan:04-99': { nodeId: 'ISSUE_NODE_0499', issueNumber: 99 },
+    ...planFieldBootstrapCompletions(),
+  });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+
+  assert.deepEqual(
+    result.blocked.filter((entry) => entry.detail === 'issue:plan:04-99'),
+    [],
+    'the dependency now resolves — no DEPENDENCY_SLOT_MISMATCH for it',
+  );
+  assert.equal(
+    result.pendingIssueUpdates.length,
+    1,
+    'the plan proceeds past the dependency check into its normal already-bound convergence path (a pending content update, since the stored completion carries no contentHash)',
+  );
+  assert.equal(result.pendingIssueUpdates[0].logicalKey, PLAN_STEADY_LOGICAL_KEY);
+  assert.deepEqual(result.pendingIssueUpdates[0].dependsOn, ['04-99'], 'the resolved dependency id still rides the pending update\'s own projection, unchanged by CR-01\'s new pre-check');
+});
+
 test('planReconciliation: WR-02 pin — a dependency on a numerically-higher plan id cannot resolve same-run and self-heals on the next run once the dependency\'s completion exists', () => {
   // Ascending-id pass processes 04-01 before 04-05, so when 04-01's own
   // dependency check runs, 04-05's create hasn't been pushed yet — unlike

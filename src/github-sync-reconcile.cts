@@ -1304,6 +1304,26 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
       }
 
       const dependsOnForBound = plan.dependsOn ?? [];
+      // CR-01 (05-REVIEW re-review): the create branch below already refuses
+      // to dispatch a create whose dependsOn contains an unresolvable id
+      // (`planDependencyResolvable`, reported as a scoped
+      // DEPENDENCY_SLOT_MISMATCH). The already-bound branch had no equivalent
+      // guard — an unresolved dependency id used to survive as an
+      // unsubstituted ArgvRef into `pendingIssueUpdates`, only to be caught
+      // later, all-or-nothing, by `resolveArgv` at dispatch time — aborting
+      // every other operation in the run, not just this plan's. Mirroring the
+      // create branch's check here means an unresolvable dependency on an
+      // update is reported and skipped per-plan, exactly like a create.
+      const unresolvedDependencyForBound = dependsOnForBound.find(
+        (depId) => !planDependencyResolvable(depId, completions, operations),
+      );
+      if (unresolvedDependencyForBound !== undefined) {
+        blocked.push({
+          reason: OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH,
+          detail: planIssueKeyFor(unresolvedDependencyForBound),
+        });
+        continue;
+      }
       const planRegion = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks, dependsOn: dependsOnForBound });
       const milestoneNumberForPlan = milestoneCompletionForPlans.issueNumber;
       // D-03 (plan 05-03): the hash is computed over the plan-id form — the
