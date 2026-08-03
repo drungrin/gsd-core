@@ -74,6 +74,7 @@ const REPORT_STAGE = Object.freeze({
   MILESTONES: 'milestones',
   STATUS: 'status',
   AUTONOMOUS: 'autonomous',
+  VIEWS: 'views',
 } as const);
 type ReportStage = typeof REPORT_STAGE[keyof typeof REPORT_STAGE];
 
@@ -184,6 +185,11 @@ function resolveStage(outcome: OutcomeLike, allEntries: PlanEntryLike[]): Report
   if (key.startsWith('label:')) return REPORT_STAGE.LABELS;
   if (key.startsWith('milestone:')) return REPORT_STAGE.MILESTONES;
   if (key.startsWith('option:status:')) return REPORT_STAGE.STATUS;
+  // Phase 6 D-01: a view's own reserved key namespace — exclusively owned by
+  // the VIEWS stage, resolved directly from the key like `label:`/`milestone:`
+  // above; without this branch every view outcome resolves to `null` and is
+  // silently dropped from every stage tally.
+  if (key.startsWith('view:')) return REPORT_STAGE.VIEWS;
   if (key.startsWith('field:')) {
     const matchKey = outcome.operationKey ?? outcome.logicalKey;
     const found = allEntries.find((entry) => entry.logicalKey === matchKey);
@@ -269,7 +275,8 @@ function tallyNoops(noops: NoopLike[] | undefined, stageMap: Map<ReportStage, In
 type BootstrapOperationReason =
   | 'desired_unavailable' | 'remote_unavailable' | 'map_blocking' | 'missing_status_field'
   | 'project_unset' | 'unsafe_target' | 'project_not_found' | 'owner_unresolvable'
-  | 'field_type_mismatch' | 'rest_unavailable' | 'label_exists' | 'milestone_exists';
+  | 'field_type_mismatch' | 'rest_unavailable' | 'label_exists' | 'milestone_exists'
+  | 'view_field_unresolved';
 type GhTransportReason = 'ok' | 'gh_not_found' | 'gh_timed_out' | 'gh_exit_nonzero';
 type ReportReason = BootstrapOperationReason | GhTransportReason;
 
@@ -300,6 +307,8 @@ function reasonSentence(reason: ReportReason, detail?: string): string {
       return withDetail('The label already exists and was adopted rather than created.');
     case 'milestone_exists':
       return withDetail('The milestone already exists and was adopted rather than created.');
+    case 'view_field_unresolved':
+      return withDetail('A GSD view needs a field that does not resolve on this Project yet — it will be created once that field exists (usually after the next run\'s fields stage completes).');
     case 'ok':
       return 'The GitHub CLI call succeeded.';
     case 'gh_not_found':
@@ -417,6 +426,7 @@ function stageLabel(stage: ReportStage): string {
     case REPORT_STAGE.MILESTONES: return 'milestones';
     case REPORT_STAGE.STATUS: return 'status';
     case REPORT_STAGE.AUTONOMOUS: return 'autonomous';
+    case REPORT_STAGE.VIEWS: return 'views';
     default: return assertNeverStage(stage);
   }
 }

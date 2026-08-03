@@ -103,6 +103,7 @@ function createWorld({ owner, repo, ownerNodeId = 'O_owner_1', repoNodeId = 'R_r
     fields: [],
     labels: [],
     milestones: [],
+    views: [],
     calls: [],
   };
 }
@@ -169,6 +170,29 @@ function worldExecGh(world) {
         const fieldNode = world.fields.find((f) => f.id === fieldId);
         if (fieldNode) fieldNode.options = merged;
         return graphqlOk({ updateProjectV2Field: { projectV2Field: { id: fieldId, options: merged } } });
+      }
+      // Plan 06-01: D-06's create half — no filter (CreateProjectV2ViewInput
+      // has no such field); `filter` starts null until the following
+      // update-view call sets it, mirroring the real create->update handoff.
+      if (queryArg.includes('github-sync-bootstrap:createViewWithFields')) {
+        const name = argValue(args, 'name=');
+        const layout = argValue(args, 'layout=');
+        const viewNode = { id: `PVTV_${slugify(name)}_${seq}`, name, layout, filter: null };
+        world.views.push(viewNode);
+        return graphqlOk({ createProjectV2View: { projectV2View: { id: viewNode.id } } });
+      }
+      // D-06/D-02 update half: converges name/layout/filter together,
+      // late-bound to the create's own id via ArgvRef (already resolved to a
+      // literal `viewId=` by the time execGh sees it) or the observed
+      // literal id on the repair path.
+      if (queryArg.includes('github-sync-bootstrap:updateViewShapeWithFilter')) {
+        const viewId = argValue(args, 'viewId=');
+        const name = argValue(args, 'name=');
+        const layout = argValue(args, 'layout=');
+        const filter = argValue(args, 'filter=');
+        const viewNode = world.views.find((v) => v.id === viewId);
+        if (viewNode) { viewNode.name = name; viewNode.layout = layout; viewNode.filter = filter; }
+        return graphqlOk({ updateProjectV2View: { projectV2View: { id: viewId, name, layout, filter } } });
       }
       throw new Error(`worldExecGh: unrecognized query in test fixture: ${queryArg}`);
     }
@@ -243,14 +267,15 @@ function remoteFromWorld(world, projectNumber) {
   const labels = world.labels.map((l) => ({ nodeId: l.nodeId, name: l.name }));
   const milestones = world.milestones.map((m) => ({ nodeId: m.nodeId, name: m.name, number: m.number, state: m.state }));
   if (projectNumber === null) {
-    return { available: true, projectOutcome: 'unset', repository, projectNodeId: null, fields: [], statusField: null, labels, milestones };
+    return { available: true, projectOutcome: 'unset', repository, projectNodeId: null, fields: [], statusField: null, labels, milestones, views: [] };
   }
   if (!world.project || world.project.number !== projectNumber) {
-    return { available: true, projectOutcome: 'absent', repository, projectNodeId: null, fields: [], statusField: null, labels, milestones };
+    return { available: true, projectOutcome: 'absent', repository, projectNodeId: null, fields: [], statusField: null, labels, milestones, views: [] };
   }
   const fields = world.fields.map((f) => ({ id: f.id, name: f.name, dataType: f.dataType, options: f.options }));
   const statusField = fields.find((f) => f.name === 'Status') ?? null;
-  return { available: true, projectOutcome: 'resolved', repository, projectNodeId: world.project.id, fields, statusField, labels, milestones };
+  const views = world.views.map((v) => ({ id: v.id, name: v.name, layout: v.layout, filter: v.filter }));
+  return { available: true, projectOutcome: 'resolved', repository, projectNodeId: world.project.id, fields, statusField, labels, milestones, views };
 }
 
 function repositoryIdentity(target) {
@@ -452,6 +477,11 @@ describe('fresh-board sequence', () => {
       // completions — plan 05-04's fix (Phase 5 Pitfall 1).
       BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'),
       BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'),
+      // Plan 06-01: a fresh board has no pre-existing Backlog view, so the
+      // views stage creates one this same run — the create's NodeCapture
+      // records view:backlog immediately, and the following update-view
+      // (filter) rides that same key.
+      BOOTSTRAP_LOGICAL_KEY.view('Backlog'),
     ];
     assert.deepEqual(Object.keys(onDisk.map.completions).sort(), expectedKeys.sort());
 
@@ -465,16 +495,20 @@ describe('fresh-board sequence', () => {
     }
   });
 
-  test("run 1's options pass emits exactly one Status merge operation and zero Autonomous operations, because the create response already supplied Yes/No", (t) => {
+  test("run 1's options pass emits exactly one Status merge operation, zero Autonomous operations (the create response already supplied Yes/No), and the Backlog view's create+update (plan 06-01)", (t) => {
     const cwd = createTempProject('bootstrap-composition-options-');
     t.after(() => cleanup(cwd));
     const world = createWorld({ owner: 'octo', repo: 'roadmap' });
     const execGh = worldExecGh(world);
     const round1 = runInitRound({ cwd, desired: desiredFixture(), world, target: freshTarget(), execGh });
 
-    assert.equal(round1.optionsPlan.operations.length, 1);
-    assert.equal(round1.optionsPlan.operations[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.field('Status'));
+    const nonViewOps = round1.optionsPlan.operations.filter((o) => o.logicalKey !== BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+    assert.equal(nonViewOps.length, 1);
+    assert.equal(nonViewOps[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.field('Status'));
     assert.equal(round1.optionsPlan.operations.some((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.field('Autonomous')), false);
+
+    const viewOps = round1.optionsPlan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+    assert.deepEqual(viewOps.map((o) => o.kind), ['create-view', 'update-view']);
   });
 });
 
@@ -510,6 +544,11 @@ function adoptedBoardWorld() {
     { nodeId: 'M_archived_h', name: 'v0.9 — archived', number: 3, state: 'closed' },
     { nodeId: 'M_current_h', name: 'v1.0 — current', number: 4, state: 'open' },
   ];
+  // Plan 06-01: a Backlog view already matching D-08's spec exactly (name,
+  // TABLE_LAYOUT, -status:Done filter) — a "fully populated" board is only
+  // truly fully populated once views are part of what GSD checks, and this
+  // fixture's whole purpose is a zero-mutation adopt-everything proof.
+  world.views = [{ id: 'PVTV_backlog_h', name: 'Backlog', layout: 'TABLE_LAYOUT', filter: '-status:Done' }];
   return world;
 }
 
@@ -553,6 +592,10 @@ describe('adopted-board case (BOOT-06 on the path where nothing is created)', ()
       // of nothing (plan 05-04, Phase 5 Pitfall 1).
       BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'),
       BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'),
+      // adoptedBoardWorld's Backlog view already matches D-08's spec exactly
+      // — the converged branch checkpoints it by name, zero mutations
+      // (plan 06-01).
+      BOOTSTRAP_LOGICAL_KEY.view('Backlog'),
     ];
     assert.deepEqual(Object.keys(onDisk.map.completions).sort(), expectedKeys.sort());
 

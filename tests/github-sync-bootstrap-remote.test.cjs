@@ -36,6 +36,17 @@ function ownerFieldsResponse(nodes, hasNextPage = false, endCursor = null, proje
   });
 }
 
+/** Plan 06-01 Task 1: a decodable empty `views` connection response, the default every pre-06-01 test now implicitly exercises via readBootstrapRemoteState's new views read. */
+function ownerViewsResponse(nodes = [], hasNextPage = false, endCursor = null) {
+  return envelope({
+    repositoryOwner: {
+      projectV2: {
+        views: { nodes, pageInfo: { hasNextPage, endCursor } },
+      },
+    },
+  });
+}
+
 function repositoryResponse(id = 'R_repo', ownerId = 'O_owner', login = 'octo', linkedNumbers = [], hasNextPage = false) {
   return envelope({
     repository: {
@@ -54,9 +65,10 @@ function makeExecGh(sequence) {
       calls.push(args);
       const isRepoDoc = args.find((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:repository'));
       const isFieldsDoc = args.find((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:fieldsWithTypes'));
+      const isViewsDoc = args.find((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:views'));
       const isLabelsRest = typeof args[1] === 'string' && args[1].includes('/labels');
       const isMilestonesRest = typeof args[1] === 'string' && args[1].includes('/milestones');
-      const kind = isRepoDoc ? 'repository' : isFieldsDoc ? 'fields' : isLabelsRest ? 'labels' : isMilestonesRest ? 'milestones' : 'unknown';
+      const kind = isRepoDoc ? 'repository' : isFieldsDoc ? 'fields' : isViewsDoc ? 'views' : isLabelsRest ? 'labels' : isMilestonesRest ? 'milestones' : 'unknown';
       // Tests that never script 'labels'/'milestones' still exercise
       // readBootstrapRemoteState's now-mandatory REST reads (Task 2); default
       // both to a decodable empty list so every pre-Task-2 test keeps passing
@@ -64,6 +76,15 @@ function makeExecGh(sequence) {
       // explicitly via `sequence.labels`/`sequence.milestones`.
       if (kind === 'labels' || kind === 'milestones') {
         const next = sequence[kind]?.shift() ?? [[]];
+        return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify(next) };
+      }
+      // Plan 06-01 Task 1: tests that never script 'views' still exercise the
+      // new views read on every resolved-project call — default to a
+      // decodable empty connection so every pre-06-01 test keeps passing
+      // unchanged; a test that cares about the views shape scripts it
+      // explicitly via `sequence.views`.
+      if (kind === 'views') {
+        const next = sequence.views?.shift() ?? ownerViewsResponse();
         return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify(next) };
       }
       const next = sequence[kind]?.shift();
@@ -431,11 +452,24 @@ function captureDispatchedBootstrapDocuments() {
       // completeness over BOOTSTRAP_DOCUMENTS, not over every execGh call).
       if (!query) return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify([[]]) };
       const name = ['repository', 'fieldsWithTypes'].find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
-      if (!documents.has(name)) documents.set(name, query.slice('query='.length));
+      if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
       if (name === 'repository') {
         return {
           exitCode: 0, reason: 'ok', stderr: '',
           stdout: JSON.stringify({ data: { repository: { id: 'R_1', owner: { id: 'O_1', login: 'octo' }, projectsV2: { nodes: [{ number: 7 }], pageInfo: { hasNextPage: false, endCursor: null } } } } }),
+        };
+      }
+      // Plan 06-01 Task 1: readBootstrapRemoteState now unconditionally
+      // dispatches the views document on every resolved-project read. This
+      // harness gives it a decodable empty response WITHOUT yet capturing it
+      // into `documents` (and it is not yet registered in the contract
+      // fixture) — Task 2 extends this harness to capture and register it,
+      // alongside the two new mutation documents, per Guard 1's completeness
+      // requirement.
+      if (query.includes('github-sync-bootstrap:views')) {
+        return {
+          exitCode: 0, reason: 'ok', stderr: '',
+          stdout: JSON.stringify({ data: { repositoryOwner: { projectV2: { views: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } }),
         };
       }
       return {

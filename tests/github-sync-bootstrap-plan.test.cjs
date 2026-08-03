@@ -1618,18 +1618,24 @@ describe('planBootstrap run-fatal suppression', () => {
     return { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 9 };
   }
   function fatalRemote({ mismatch }) {
+    // Status is a member of `fields` here (not merely the separate
+    // `statusField` alias) — mirrors readBootstrapRemoteState's real shape,
+    // where `statusField` is derived by finding Status inside `fields`, and
+    // is what plan 06-01's planViews resolves its visibleFieldNames against.
+    const statusField = { id: 'F_status', name: 'Status', dataType: 'SINGLE_SELECT', options: [opt('id-todo', 'Todo', 'GRAY', '')] };
     const fields = [
       { id: 'F_id', name: 'GSD ID', dataType: 'TEXT', options: null },
       // Phase intentionally missing -> planFields would create it.
       { id: 'F_req', name: 'Requirements', dataType: 'TEXT', options: null },
       { id: 'F_wave', name: 'Wave', dataType: mismatch ? 'TEXT' : 'NUMBER', options: null },
       { id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [opt('id-yes', 'Yes', 'GREEN', ''), opt('id-no', 'No', 'RED', '')] },
+      statusField,
     ];
     return {
       available: true, projectOutcome: 'resolved',
       repository: { nodeId: 'R_1', ownerNodeId: 'O_1', ownerLogin: 'octo', linkState: 'linked' },
       projectNodeId: 'PVT_adopted', fields,
-      statusField: { id: 'F_status', name: 'Status', dataType: 'SINGLE_SELECT', options: [opt('id-todo', 'Todo', 'GRAY', '')] },
+      statusField,
     };
   }
 
@@ -1717,9 +1723,21 @@ describe('planBootstrap options pass wiring', () => {
 describe('planBootstrap options pass: views wiring (plan 06-01)', () => {
   const target = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
 
-  test('merge.kind noop (unset project), a resolvable Status field: the views create+update operations fold in after autonomous', () => {
+  test('merge.kind noop (unset project): the views stage contributes nothing yet — mirrors planStatusOptionMerge/planAutonomousOptions\' own "field/project genuinely does not exist yet" no-op, never a premature create', () => {
     const remote = {
       available: true, projectOutcome: 'unset', statusField: null,
+      fields: [{ id: 'PVTSSF_status', name: 'Status', dataType: 'SINGLE_SELECT', options: [] }],
+      views: [],
+    };
+    const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
+    const viewOps = plan.operations.filter((o) => o.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog'));
+    assert.equal(viewOps.length, 0);
+    assert.equal(plan.blocked.length, 0);
+  });
+
+  test('merge.kind operation (resolved project, Status divergent so the merge dispatches, a resolvable Status field): the views create+update operations fold in after autonomous', () => {
+    const remote = {
+      available: true, projectOutcome: 'resolved', statusField: statusField([]),
       fields: [{ id: 'PVTSSF_status', name: 'Status', dataType: 'SINGLE_SELECT', options: [] }],
       views: [],
     };
@@ -1742,8 +1760,12 @@ describe('planBootstrap options pass: views wiring (plan 06-01)', () => {
     assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog') && c.nodeId === 'PVTV_1'));
   });
 
-  test('a view whose declared field is unresolved contributes a blocked entry to the composed plan', () => {
-    const remote = { available: true, projectOutcome: 'unset', statusField: null, fields: [], views: [] };
+  test('a view whose declared field is unresolved contributes a blocked entry to the composed plan (Status merge itself dispatches fine; only the fields snapshot planViews reads from lacks Status)', () => {
+    // statusField (planStatusOptionMerge's own input) is present and
+    // divergent, so the merge dispatches an operation rather than blocking —
+    // isolating planViews' own VIEW_FIELD_UNRESOLVED contribution from
+    // planStatusOptionMerge's independent MISSING_STATUS_FIELD block.
+    const remote = { available: true, projectOutcome: 'resolved', statusField: statusField([]), fields: [], views: [] };
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.ok(plan.blocked.some((b) => b.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED));
   });

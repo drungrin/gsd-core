@@ -39,6 +39,11 @@ const BOOTSTRAP_OPERATION_REASON = Object.freeze({
   // case-variant) — the noop reason recorded alongside its adoption checkpoint.
   LABEL_EXISTS: 'label_exists',
   MILESTONE_EXISTS: 'milestone_exists',
+  // Phase 6 plan 06-01 (RESEARCH Pitfall 3): a GSD view declares a visible
+  // field name (e.g. "Status") that does not resolve against the remote's
+  // own field snapshot — never a create that silently omits the field from
+  // visibleFieldIds.
+  VIEW_FIELD_UNRESOLVED: 'view_field_unresolved',
 } as const);
 
 const BOOTSTRAP_PASS = Object.freeze({
@@ -65,6 +70,11 @@ const BOOTSTRAP_LOGICAL_KEY = Object.freeze({
   autonomousOption: (name: string): string => `option:autonomous:${slug(name)}`,
   label: (name: string): string => `label:${slug(name)}`,
   milestone: (version: string): string => `milestone:${slug(version)}`,
+  // Phase 6 D-01: a view's identity key, third object kind (after fields and
+  // Status options) to carry the ID-first / exact-name-fallback identity
+  // rule P3 D-17/D-23 established. No caller concatenates the `view:` prefix
+  // by hand.
+  view: (name: string): string => `view:${slug(name)}`,
 });
 
 /** D-19 order: Todo, In Progress, Blocked, Done, Deferred. Colours/descriptions set once, never reconciled (D-18). */
@@ -120,6 +130,8 @@ interface BootstrapRepositoryLike {
 }
 /** Mirrors github-sync-bootstrap-remote.cts's `RestListEntry` — not imported (zero I/O). One decoded REST label or milestone. */
 interface RestEntryLike { nodeId: string; name: string; number?: number; state?: string; }
+/** Mirrors github-sync-bootstrap-remote.cts's `RemoteView` — not imported (zero I/O). D-08's four owned properties GSD can observe: id, name, layout, filter. */
+interface RemoteViewLike { id: string; name: string; layout: string; filter: string | null; }
 
 interface BootstrapRemoteForMerge {
   available: boolean;
@@ -135,6 +147,8 @@ interface BootstrapRemoteForMerge {
   labels?: RestEntryLike[];
   /** BOOT-05: every repository Milestone (open and closed), from the REST list read (Task 2). */
   milestones?: RestEntryLike[];
+  /** Phase 6 D-01: every view on the project, from the paginated `views` connection read (`orderBy: POSITION`). */
+  views?: RemoteViewLike[];
 }
 interface StrictMapCompletion { nodeId: string; }
 interface StrictMapLike {
@@ -330,6 +344,7 @@ const BOOTSTRAP_STAGE = Object.freeze({
   AUTONOMOUS: 'autonomous',
   LABELS: 'labels',
   MILESTONES: 'milestones',
+  VIEWS: 'views',
 } as const);
 type BootstrapStage = typeof BOOTSTRAP_STAGE[keyof typeof BOOTSTRAP_STAGE];
 type StageTaggedOperation = MutationOperation & { stage: BootstrapStage };
@@ -883,6 +898,231 @@ function planMilestones(desired: DesiredStateLike, remote: BootstrapRemoteForMer
   return { operations, checkpoints, noops };
 }
 
+// ─── planViews ──────────────────────────────────────────────────────────────
+
+/** D-08's three live-confirmed `ProjectV2ViewLayout` enum members (06-VIEW-PROBE.md Question 1). */
+const VIEW_LAYOUT = Object.freeze({
+  BOARD: 'BOARD_LAYOUT',
+  TABLE: 'TABLE_LAYOUT',
+  ROADMAP: 'ROADMAP_LAYOUT',
+} as const);
+
+interface GsdViewDeclaration {
+  name: string;
+  layout: string;
+  filter: string | null;
+  visibleFieldNames: readonly string[];
+}
+
+/**
+ * D-08's five concrete view specifications — this plan (06-01) ships exactly
+ * ONE, Backlog, to prove the whole path end to end before the remaining four
+ * are declared (D-07). Plan 06-02 adds the other four rows; the table is the
+ * extension point and adding a row requires no shape change.
+ */
+const GSD_VIEWS: readonly GsdViewDeclaration[] = Object.freeze([
+  Object.freeze({ name: 'Backlog', layout: VIEW_LAYOUT.TABLE, filter: '-status:Done', visibleFieldNames: Object.freeze(['Status']) }),
+]);
+
+// Duplicated from src/github-sync-bootstrap-remote.cts's BOOTSTRAP_DOCUMENTS,
+// byte-for-byte — a differential test pins the copies against each other,
+// the same pattern CREATE_PROJECT_DOCUMENT/CREATE_FIELD_TEXT_DOCUMENT
+// establish above. No `rateLimit` selection, for the same live-verified
+// reason. D-06/RESEARCH Pitfall 2: the create document carries no `filter`
+// variable — `CreateProjectV2ViewInput` has no such field (06-VIEW-PROBE.md
+// Question 1); only `updateProjectV2View` can set it.
+const CREATE_VIEW_WITH_FIELDS_DOCUMENT =
+  'mutation($projectId:ID!,$name:String!,$layout:ProjectV2ViewLayout!,$fieldIds:[ID!]) { # github-sync-bootstrap:createViewWithFields\n' +
+  ' createProjectV2View(input:{projectId:$projectId,name:$name,layout:$layout,configuration:{visibleFieldIds:$fieldIds}}) { projectV2View { id } } }';
+const UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT =
+  'mutation($viewId:ID!,$name:String!,$layout:ProjectV2ViewLayout!,$filter:String!,$fieldIds:[ID!]) { # github-sync-bootstrap:updateViewShapeWithFilter\n' +
+  ' updateProjectV2View(input:{viewId:$viewId,name:$name,layout:$layout,filter:$filter,configuration:{visibleFieldIds:$fieldIds}}) { projectV2View { id name layout filter } } }';
+
+/**
+ * Encodes `configuration.visibleFieldIds` (a plain `[ID!]` array of node
+ * ids) the way `gh` 2.96.0 actually accepts it — settled live against board
+ * #10 in this plan's own tracer (06-VIEW-PROBE.md Question 2): a bare
+ * repeated bracket-suffixed raw field, `-f '<variableName>[]=<id>'` per
+ * element, no sub-key. This is a simpler shape than `optionInputArgv`'s
+ * array-of-objects encoding (no element-boundary ambiguity — each entry IS
+ * one complete element) and was proven on the first attempt, so no
+ * alternative form was tried.
+ *
+ * SECURITY: every entry rides the raw `-f` flag. These are opaque node ids
+ * GitHub itself minted (echoed back from the fields read) — new code puts
+ * node ids on the raw flag per `github-sync-operation.cts`'s SECURITY note.
+ */
+function viewFieldIdsArgv(variableName: string, fieldIds: string[]): string[] {
+  const argv: string[] = [];
+  for (const fieldId of fieldIds) argv.push('-f', `${variableName}[]=${fieldId}`);
+  return argv;
+}
+
+/**
+ * D-06's create half: `projectId`/`name`/`layout`/`configuration` only — no
+ * `filter`, which `CreateProjectV2ViewInput` has no field for. The project
+ * id rides an `ArgvRef` (the view may be planned before the project
+ * resolves in the same run, mirroring `buildCreateFieldOperation`'s
+ * late-binding). Its own `NodeCapture` records the new view id under
+ * `view:<slug>` so the following update-view operation (same plan) can
+ * late-bind it.
+ */
+function buildCreateViewOperation(spec: GsdViewDeclaration, viewKey: string, fieldIds: string[], context: CompletionContext): StageTaggedOperation {
+  const projectRef: ArgvEntry = { from: BOOTSTRAP_LOGICAL_KEY.project(), part: ARGV_REF_PART.NODE_ID, prefix: 'projectId=' };
+  const args: ArgvEntry[] = [
+    'api', 'graphql',
+    '-f', `query=${CREATE_VIEW_WITH_FIELDS_DOCUMENT}`,
+    '-f', projectRef,
+    '-f', `name=${spec.name}`,
+    '-f', `layout=${spec.layout}`,
+    ...viewFieldIdsArgv('fieldIds', fieldIds),
+  ];
+  return {
+    kind: 'create-view',
+    logicalKey: viewKey,
+    args,
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.CREATE,
+    hasPointsBudget: false,
+    contentCreation: true,
+    captures: [{ kind: 'node', logicalKey: viewKey, nodeIdPath: 'createProjectV2View.projectV2View.id' }],
+    stage: BOOTSTRAP_STAGE.VIEWS,
+  };
+}
+
+/**
+ * D-02/D-06's converge-all-three-owned-properties-together update:
+ * `name`/`layout`/`filter`/`configuration.visibleFieldIds` in one call —
+ * used both as the second half of a fresh create (D-06's two-operation
+ * handoff, `viewIdArg` an `ArgvRef` late-bound to the create's own
+ * `NodeCapture`) and, independently, to restore a matched-but-diverged
+ * view's shape in one run (`viewIdArg` the observed literal id — the D-01
+ * repair path, e.g. a view found by stored id under a different name).
+ */
+function buildUpdateViewShapeOperation(spec: GsdViewDeclaration, viewKey: string, viewIdArg: ArgvEntry, fieldIds: string[], context: CompletionContext): StageTaggedOperation {
+  const args: ArgvEntry[] = [
+    'api', 'graphql',
+    '-f', `query=${UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT}`,
+    '-f', viewIdArg,
+    '-f', `name=${spec.name}`,
+    '-f', `layout=${spec.layout}`,
+    '-f', `filter=${spec.filter ?? ''}`,
+    ...viewFieldIdsArgv('fieldIds', fieldIds),
+  ];
+  return {
+    kind: 'update-view',
+    logicalKey: viewKey,
+    args,
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.GRAPHQL,
+    action: OPERATION_ACTION.UPDATE,
+    hasPointsBudget: false,
+    contentCreation: false,
+    captures: [{ kind: 'node', logicalKey: viewKey, nodeIdPath: 'updateProjectV2View.projectV2View.id' }],
+    stage: BOOTSTRAP_STAGE.VIEWS,
+  };
+}
+
+/**
+ * D-01/D-17/D-23's shared identity rule, mirroring `resolveFieldIdentity`
+ * exactly: the sync map's stored node id first (survives a remote rename),
+ * then exact name. `claimedRemoteIds` excludes a remote view already
+ * matched to an earlier GSD view declaration in the same pass.
+ */
+function resolveViewIdentity(
+  gsdView: GsdViewDeclaration,
+  remoteViews: RemoteViewLike[],
+  strictMap: StrictMapLike,
+  claimedRemoteIds: Set<string>,
+): { view: RemoteViewLike; matchedBy: 'id' | 'name' } | undefined {
+  const completions = strictMap.kind === 'valid' ? strictMap.map?.completions ?? {} : {};
+  const storedId = completions[BOOTSTRAP_LOGICAL_KEY.view(gsdView.name)]?.nodeId;
+  if (storedId) {
+    const byId = remoteViews.find((view) => view.id === storedId && !claimedRemoteIds.has(view.id));
+    if (byId) return { view: byId, matchedBy: 'id' };
+  }
+  const byName = remoteViews.find((view) => view.name === gsdView.name && !claimedRemoteIds.has(view.id));
+  if (byName) return { view: byName, matchedBy: 'name' };
+  return undefined;
+}
+
+interface ViewPlanResult {
+  operations: StageTaggedOperation[];
+  checkpoints: StageTaggedCheckpoint[];
+  blocked: Array<{ reason: string; detail?: string }>;
+}
+
+/**
+ * D-01..D-06's view composer, a sixth instance of the list-then-create/
+ * adopt/converge pattern `planFields`/`planLabels`/`planMilestones` already
+ * establish — but with D-02's three-way branch instead of `planFields`'
+ * four-way one, because `name`/`layout`/`filter` converge together as one
+ * update rather than per-attribute: no match -> create then update; matched
+ * and every owned property already correct -> zero operations and one
+ * checkpoint carrying the observed node id; matched and any owned property
+ * wrong -> one update restoring all of them (D-03's adopt-then-converge, and
+ * D-01's resolve-by-id-restore-name repair, are both this same branch).
+ *
+ * `visibleFieldNames` is resolved to node ids from `remote.fields` by exact
+ * name BEFORE identity resolution — a name missing from the snapshot pushes
+ * one blocked entry (RESEARCH Pitfall 3) and skips both the create and the
+ * update path for that view, never a create that silently omits the field.
+ */
+function planViews(remote: BootstrapRemoteForMerge, strictMap: StrictMapLike, context: CompletionContext): ViewPlanResult {
+  // Mirrors planStatusOptionMerge's own unset short-circuit: there is no
+  // project yet to build a view against, so an unresolved visible field on
+  // a genuinely-not-yet-existing board is not a real diagnosis — it is the
+  // same "the field genuinely does not exist yet" case planAutonomousOptions
+  // silently no-ops on, never a blocked entry.
+  if (remote.projectOutcome === 'unset') return { operations: [], checkpoints: [], blocked: [] };
+
+  const remoteViews = remote.views ?? [];
+  const remoteFields = remote.fields ?? [];
+  const claimedRemoteIds = new Set<string>();
+  const operations: StageTaggedOperation[] = [];
+  const checkpoints: StageTaggedCheckpoint[] = [];
+  const blocked: Array<{ reason: string; detail?: string }> = [];
+
+  for (const gsdView of GSD_VIEWS) {
+    const viewKey = BOOTSTRAP_LOGICAL_KEY.view(gsdView.name);
+
+    const fieldIds: string[] = [];
+    let unresolvedFieldName: string | null = null;
+    for (const fieldName of gsdView.visibleFieldNames) {
+      const matchedField = remoteFields.find((candidate) => candidate.name === fieldName);
+      if (!matchedField) { unresolvedFieldName = fieldName; break; }
+      fieldIds.push(matchedField.id);
+    }
+    if (unresolvedFieldName !== null) {
+      blocked.push({
+        reason: BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED,
+        detail: `view "${gsdView.name}" needs field "${unresolvedFieldName}", not found on the remote`,
+      });
+      continue;
+    }
+
+    const match = resolveViewIdentity(gsdView, remoteViews, strictMap, claimedRemoteIds);
+    if (!match) {
+      const viewIdRef: ArgvEntry = { from: viewKey, part: ARGV_REF_PART.NODE_ID, prefix: 'viewId=' };
+      operations.push(
+        buildCreateViewOperation(gsdView, viewKey, fieldIds, context),
+        buildUpdateViewShapeOperation(gsdView, viewKey, viewIdRef, fieldIds, context),
+      );
+      continue;
+    }
+    claimedRemoteIds.add(match.view.id);
+    const converged = match.view.name === gsdView.name && match.view.layout === gsdView.layout && match.view.filter === gsdView.filter;
+    if (converged) {
+      checkpoints.push({ logicalKey: viewKey, nodeId: match.view.id, completionContext: context, stage: BOOTSTRAP_STAGE.VIEWS });
+      continue;
+    }
+    operations.push(buildUpdateViewShapeOperation(gsdView, viewKey, `viewId=${match.view.id}`, fieldIds, context));
+  }
+
+  return { operations, checkpoints, blocked };
+}
+
 // ─── remote-layer to operation-layer reason translation (cycle-2 non-HIGH #14) ──
 
 /**
@@ -1190,13 +1430,36 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
   // own checkpoints to add alongside them.
   const autonomousPlan = planAutonomousOptions(input.remote, input.strictMap, context);
 
+  // Phase 6 D-01..D-08: views run after fields (already available at this
+  // point — the OPTIONS pass is the first point at which the structure
+  // pass's field completions and the re-read snapshot are both available)
+  // and after planAutonomousOptions, folding its operations, checkpoints,
+  // and blocked entries into every return path below.
+  const viewsPlan = planViews(input.remote, input.strictMap, context);
+
   if (merge.kind === 'noop') {
-    return { ...emptyPlan(), noops: [{ reason: merge.reason }], operations: autonomousPlan.operations, checkpoints: autonomousPlan.checkpoints };
+    return {
+      ...emptyPlan(),
+      noops: [{ reason: merge.reason }],
+      operations: [...autonomousPlan.operations, ...viewsPlan.operations],
+      checkpoints: [...autonomousPlan.checkpoints, ...viewsPlan.checkpoints],
+      blocked: viewsPlan.blocked,
+    };
   }
   if (merge.kind === 'converged') {
-    return { ...emptyPlan(), checkpoints: [...merge.checkpoints, ...autonomousPlan.checkpoints], operations: autonomousPlan.operations };
+    return {
+      ...emptyPlan(),
+      checkpoints: [...merge.checkpoints, ...autonomousPlan.checkpoints, ...viewsPlan.checkpoints],
+      operations: [...autonomousPlan.operations, ...viewsPlan.operations],
+      blocked: viewsPlan.blocked,
+    };
   }
-  return { ...emptyPlan(), operations: [merge.operation, ...autonomousPlan.operations], checkpoints: autonomousPlan.checkpoints };
+  return {
+    ...emptyPlan(),
+    operations: [merge.operation, ...autonomousPlan.operations, ...viewsPlan.operations],
+    checkpoints: [...autonomousPlan.checkpoints, ...viewsPlan.checkpoints],
+    blocked: viewsPlan.blocked,
+  };
 }
 
 export = {
@@ -1207,9 +1470,11 @@ export = {
   planAutonomousOptions,
   planLabels,
   planMilestones,
+  planViews,
   parseMilestoneVersionToken,
   validateFatalConditions,
   optionInputArgv,
+  viewFieldIdsArgv,
   BOOTSTRAP_LOGICAL_KEY,
   BOOTSTRAP_OPERATION_REASON,
   BOOTSTRAP_PASS,
@@ -1218,6 +1483,8 @@ export = {
   GSD_FIELDS,
   GSD_AUTONOMOUS_OPTIONS,
   GSD_LABELS,
+  GSD_VIEWS,
+  VIEW_LAYOUT,
   STATUS_FIELD_NAME,
   DEFAULT_PROJECT_TITLE_SUFFIX,
   CREATE_PROJECT_DOCUMENT,
@@ -1226,4 +1493,6 @@ export = {
   CREATE_FIELD_NUMBER_DOCUMENT,
   CREATE_FIELD_SINGLE_SELECT_DOCUMENT,
   RENAME_FIELD_DOCUMENT,
+  CREATE_VIEW_WITH_FIELDS_DOCUMENT,
+  UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT,
 };

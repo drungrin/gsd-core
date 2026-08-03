@@ -56,12 +56,12 @@ describe('duplicated reason literals stay pinned to their canonical source', () 
 // ─── raw round-trip and human form basics ──────────────────────────────────
 
 describe('raw round-trip and target', () => {
-  test('the raw form round-trips through JSON.parse and carries a target object plus a 7-entry stages array', () => {
+  test('the raw form round-trips through JSON.parse and carries a target object plus a stages array with one entry per REPORT_STAGE member (plan 06-01 adds VIEWS, an 8th)', () => {
     const report = buildInitReportV1({ target: TARGET, structureApply: { kind: 'completed', outcomes: [] }, optionsApply: { kind: 'completed', outcomes: [] } });
     const raw = renderInitReportV1(report, true);
     const parsed = JSON.parse(raw);
     assert.deepEqual(parsed.target, TARGET);
-    assert.equal(parsed.stages.length, 7);
+    assert.equal(parsed.stages.length, Object.values(REPORT_STAGE).length);
     assert.deepEqual(parsed.stages.map((s) => s.stage).sort(), Object.values(REPORT_STAGE).sort());
   });
 

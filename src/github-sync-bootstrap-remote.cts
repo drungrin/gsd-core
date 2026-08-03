@@ -128,6 +128,28 @@ const BOOTSTRAP_DOCUMENTS = Object.freeze({
   // followed by its mapped id and restored to its canonical name, never
   // re-created as a duplicate.
   renameField: 'mutation($fieldId:ID!,$name:String!) { # github-sync-bootstrap:renameField\n updateProjectV2Field(input:{fieldId:$fieldId,name:$name}) { projectV2Field { ... on ProjectV2FieldCommon { id name dataType } } } }',
+  // Phase 6 D-01/D-09 (06-VIEW-PROBE.md Question 4): `orderBy` is mandatory,
+  // not optional — the connection's default order is not documented to
+  // equal visual tab order, and D-09's leftmost-view identification would
+  // silently retype the wrong view once a developer drags a tab (RESEARCH
+  // Pitfall 1). `ProjectV2View` is a concrete OBJECT type, not a union, so
+  // `id name layout filter` are bare scalar selections — no inline fragment
+  // needed.
+  views: 'query($owner:String!,$projectNumber:Int!,$endCursor:String) { # github-sync-bootstrap:views\n repositoryOwner(login:$owner) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { views(first:100,after:$endCursor,orderBy:{field:POSITION,direction:ASC}) { nodes { id name layout filter } pageInfo { hasNextPage endCursor } } } } } }',
+  // D-06 create half (plan 06-01 Task 1), dispatched by
+  // github-sync-bootstrap-plan.cts's planViews, not this module — pinned
+  // byte-identical to that module's local copy by a differential test, the
+  // same pattern createProject/createFieldText establish above. No `filter`
+  // variable (RESEARCH Pitfall 2: `CreateProjectV2ViewInput` has no such
+  // field, live-confirmed 06-VIEW-PROBE.md Question 1) and no `rateLimit`
+  // selection, for the same live-verified reason.
+  createViewWithFields: 'mutation($projectId:ID!,$name:String!,$layout:ProjectV2ViewLayout!,$fieldIds:[ID!]) { # github-sync-bootstrap:createViewWithFields\n createProjectV2View(input:{projectId:$projectId,name:$name,layout:$layout,configuration:{visibleFieldIds:$fieldIds}}) { projectV2View { id } } }',
+  // D-06/D-02 update half: converges name/layout/filter/visibleFieldIds
+  // together in one call, late-bound to the create's own `NodeCapture` via
+  // `ArgvRef` (create->update handoff, the same mechanism
+  // `buildAddSubIssueOperation` already proves) or, independently, to a
+  // matched-but-diverged view's observed literal id.
+  updateViewShapeWithFilter: 'mutation($viewId:ID!,$name:String!,$layout:ProjectV2ViewLayout!,$filter:String!,$fieldIds:[ID!]) { # github-sync-bootstrap:updateViewShapeWithFilter\n updateProjectV2View(input:{viewId:$viewId,name:$name,layout:$layout,filter:$filter,configuration:{visibleFieldIds:$fieldIds}}) { projectV2View { id name layout filter } } }',
 });
 
 const STATUS_FIELD_NAME = 'Status';
@@ -151,6 +173,14 @@ interface RemoteField {
   name: string;
   dataType: string;
   options: RemoteSingleSelectOption[] | null;
+}
+
+/** Phase 6 D-08: the four view properties GSD can observe — `id`, `name`, `layout`, `filter`. `visibleFieldIds` is write-only from this reader's perspective (never reconciled once set, D-02's scope). */
+interface RemoteView {
+  id: string;
+  name: string;
+  layout: string;
+  filter: string | null;
 }
 
 interface BootstrapRemoteOptions {
@@ -182,12 +212,14 @@ interface BootstrapRemoteState {
   labels: RestListEntry[];
   /** BOOT-05: every repository Milestone (open and closed), decoded from a REST list read. */
   milestones: RestListEntry[];
+  /** Phase 6 D-01: every view on the project, from the paginated `views` connection read (`orderBy: POSITION`) — read only on the project-scoped branch; empty on the `unset`/`absent` outcomes, exactly as `fields` is. */
+  views: RemoteView[];
 }
 
 function unavailable(reason: BootstrapRemoteReason = BOOTSTRAP_REMOTE_REASON.UNAVAILABLE): BootstrapRemoteState {
   return {
     available: false, reason, projectOutcome: PROJECT_OUTCOME.UNAVAILABLE, repository: null, projectNodeId: null,
-    fields: [], statusField: null, labels: [], milestones: [],
+    fields: [], statusField: null, labels: [], milestones: [], views: [],
   };
 }
 
@@ -283,6 +315,19 @@ function decodeField(raw: unknown): RemoteField | null {
     options.push(decoded);
   }
   return { id: raw.id, name: raw.name, dataType: raw.dataType, options };
+}
+
+/**
+ * Fail-closed decoder shaped exactly like `decodeField`: a malformed node
+ * returns null and collapses the whole read to the fixed unavailable result,
+ * never a partial list that would read as "no views exist" and trigger a
+ * duplicate create.
+ */
+function decodeView(raw: unknown): RemoteView | null {
+  if (!isRecord(raw)) return null;
+  if (!isNonEmptyString(raw.id) || !isNonEmptyString(raw.name) || typeof raw.layout !== 'string') return null;
+  if (raw.filter !== null && typeof raw.filter !== 'string') return null;
+  return { id: raw.id, name: raw.name, layout: raw.layout, filter: raw.filter === null ? null : raw.filter };
 }
 
 // ─── REST list reads (Task 2): labels and milestones ───────────────────────
@@ -470,6 +515,60 @@ function readProjectFields(options: BootstrapRemoteOptions): { outcome: typeof P
 }
 
 /**
+ * Reads every view on the project, paging through `views` with the same
+ * cursor-exhaustion and repeat-cursor guard `readProjectFields` uses,
+ * `orderBy: POSITION` carried on every page (06-VIEW-PROBE.md Question 4).
+ * Called only from the project-scoped branch, after `readProjectFields` has
+ * already confirmed the project resolves — a null `repositoryOwner`/
+ * `projectV2` here is therefore a malformed-payload condition (an
+ * inconsistent read between the two calls), not a legitimate absent state,
+ * and fails closed to `undefined` like every other malformed shape this
+ * reader rejects.
+ */
+function readProjectViews(options: BootstrapRemoteOptions): RemoteView[] | undefined {
+  const execGh = options.execGh ?? ghMod.execGh;
+  const views: RemoteView[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | null = null;
+
+  while (true) {
+    const result = execGh(
+      [
+        'api', 'graphql', '-f', `query=${BOOTSTRAP_DOCUMENTS.views}`,
+        '-f', `owner=${options.owner}`,
+        '-F', `projectNumber=${options.projectNumber}`,
+        '-f', `endCursor=${cursor ?? ''}`,
+      ],
+      { cwd: options.cwd },
+    );
+    const data = parseGraphqlEnvelope(result);
+    if (data === null) return undefined;
+    const repositoryOwner = data.repositoryOwner;
+    if (!isRecord(repositoryOwner)) return undefined;
+    const projectV2 = repositoryOwner.projectV2;
+    if (!isRecord(projectV2)) return undefined;
+    const connection = projectV2.views;
+    if (!isRecord(connection)) return undefined;
+    const nodes = connection.nodes;
+    const pageInfo = connection.pageInfo;
+    if (!Array.isArray(nodes) || !isRecord(pageInfo)) return undefined;
+    for (const node of nodes) {
+      const decoded = decodeView(node);
+      if (!decoded) return undefined;
+      views.push(decoded);
+    }
+    const hasNextPage = pageInfo.hasNextPage;
+    const endCursor = pageInfo.endCursor;
+    if (typeof hasNextPage !== 'boolean' || (endCursor !== null && typeof endCursor !== 'string')) return undefined;
+    if (!hasNextPage) break;
+    if (!endCursor || seenCursors.has(endCursor)) return undefined;
+    seenCursors.add(endCursor);
+    cursor = endCursor;
+  }
+  return views;
+}
+
+/**
  * Reads the repository binding and — only when `projectNumber` is a positive
  * integer — the project's fields. A `null` project number is decoded as the
  * `unset` outcome: an available read reporting "there is no board yet",
@@ -504,11 +603,22 @@ function readBootstrapRemoteState(options: BootstrapRemoteOptions): BootstrapRem
       statusField: null,
       labels: labelsRead.entries,
       milestones: milestonesRead.entries,
+      views: [],
     };
   }
 
   const projectFields = readProjectFields(options);
   if (projectFields === undefined) return unavailable();
+
+  // Phase 6 D-01: views are read only when the project itself resolved —
+  // an `absent` project has no board to read views from, and the query
+  // would only re-confirm what `readProjectFields` already established.
+  let views: RemoteView[] = [];
+  if (projectFields.outcome === PROJECT_OUTCOME.RESOLVED) {
+    const viewsRead = readProjectViews(options);
+    if (viewsRead === undefined) return unavailable();
+    views = viewsRead;
+  }
 
   const statusField = projectFields.fields.find((field) => field.name === STATUS_FIELD_NAME) ?? null;
   return {
@@ -521,6 +631,7 @@ function readBootstrapRemoteState(options: BootstrapRemoteOptions): BootstrapRem
     statusField,
     labels: labelsRead.entries,
     milestones: milestonesRead.entries,
+    views,
   };
 }
 
