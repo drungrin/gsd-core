@@ -29,6 +29,20 @@ import crypto from 'node:crypto';
 export const SYNC_MAP_FILE_NAME = '.github-sync.json';
 export const SYNC_MAP_VERSION = '1';
 
+/**
+ * D-08 (plan 05-06): the plan issue's own recorded open/closed state — the
+ * second state machine P4 D-16 deliberately refused for phases (a
+ * hand-edited roadmap checkbox is too weak a signal) and deferred here, now
+ * justified because a sibling `SUMMARY.md`'s presence is a far stronger one.
+ * A flat scalar restricted to exactly these two literals, following the same
+ * closed-schema discipline `contentHash`/`fieldState` already established.
+ */
+export const ISSUE_STATE = Object.freeze({
+  OPEN: 'open',
+  CLOSED: 'closed',
+} as const);
+export type IssueStateValue = typeof ISSUE_STATE[keyof typeof ISSUE_STATE];
+
 export interface RepositoryIdentity {
   owner: string;
   repo: string;
@@ -47,6 +61,8 @@ export interface SyncCompletion {
   contentHash?: string;
   /** D-09/D-12: the serialized per-field convergence state (`renderFieldState`). */
   fieldState?: string;
+  /** D-08 (plan 05-06): the plan issue's own recorded open/closed state — see `ISSUE_STATE`. */
+  issueState?: IssueStateValue;
 }
 
 export interface SyncMap {
@@ -81,7 +97,7 @@ function isRepositoryIdentity(value: unknown): value is RepositoryIdentity {
 function isCompletion(value: unknown): value is SyncCompletion {
   if (!isRecord(value) || !hasOnlyKeys(value, [
     'logicalKey', 'nodeId', 'issueNumber', 'completedAt', 'owner', 'repo', 'repositoryNumber',
-    'contentHash', 'fieldState',
+    'contentHash', 'fieldState', 'issueState',
   ])) return false;
   if (!isNonEmptyString(value.logicalKey) || !isNonEmptyString(value.nodeId) ||
     !isNonEmptyString(value.completedAt) || !isNonEmptyString(value.owner) || !isNonEmptyString(value.repo)) return false;
@@ -91,6 +107,7 @@ function isCompletion(value: unknown): value is SyncCompletion {
   if (issueNumber !== undefined && (typeof issueNumber !== 'number' || !Number.isSafeInteger(issueNumber) || issueNumber <= 0)) return false;
   if (value.contentHash !== undefined && !isNonEmptyString(value.contentHash)) return false;
   if (value.fieldState !== undefined && !isNonEmptyString(value.fieldState)) return false;
+  if (value.issueState !== undefined && value.issueState !== ISSUE_STATE.OPEN && value.issueState !== ISSUE_STATE.CLOSED) return false;
   return typeof repositoryNumber === 'number' && Number.isSafeInteger(repositoryNumber) && repositoryNumber > 0;
 }
 

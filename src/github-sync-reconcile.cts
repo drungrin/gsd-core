@@ -84,6 +84,19 @@ const PLAN_LABEL_NAME = 'gsd:plan';
 const PATH_SAFE_TARGET = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 /**
+ * Plan 05-06 Task 3 (D-08): mirrors `github-sync-map.cts`'s `ISSUE_STATE`
+ * byte-for-byte. Duplicated rather than imported for the same zero-I/O
+ * reason `PATH_SAFE_TARGET` above is duplicated: `github-sync-map.cts`
+ * imports `node:fs`/`node:path`/`node:crypto` for its own persistence job,
+ * and this module must stay free of any transitively fs-touching import.
+ */
+const PLAN_ISSUE_STATE = Object.freeze({
+  OPEN: 'open',
+  CLOSED: 'closed',
+} as const);
+type PlanIssueStateValue = typeof PLAN_ISSUE_STATE[keyof typeof PLAN_ISSUE_STATE];
+
+/**
  * Returns the REST endpoint path for a phase issue, or `null` when the
  * guard fails. A `null` path is a typed blocked entry for every phase in
  * the run, never a thrown error and never a `gh` invocation — callers must
@@ -131,6 +144,14 @@ interface DesiredPlan {
   requirements?: string[];
   /** Plan 05-06's own concern; declared here only so a caller passing the real `DesiredPlan` (which always carries it) still type-checks with no cast. */
   dependsOn?: string[];
+  /**
+   * Plan 05-06 Task 3 (D-08): whether a sibling SUMMARY.md exists on disk —
+   * `github-sync-desired.cts`'s own `readPlans` signal, the ONE input the
+   * open/closed state machine reads. Optional so pre-05-06 fixtures (which
+   * never set it) still type-check; treated as `false` (open) when absent,
+   * mirroring every other plan-only field's total-by-construction default.
+   */
+  complete?: boolean;
 }
 interface DesiredState { available: boolean; reason: string; phases: DesiredPhase[]; plans?: DesiredPlan[]; milestones?: DesiredMilestone[]; }
 interface RemoteItem { id?: unknown; content?: { id?: unknown; number?: unknown } | null; }
@@ -141,7 +162,7 @@ interface RemoteSnapshot {
   items?: RemoteItem[];
   issueNodeIds?: Record<string, string> | Record<number, string>;
 }
-interface StrictMapCompletion { nodeId: string; issueNumber?: number; contentHash?: string; fieldState?: string; }
+interface StrictMapCompletion { nodeId: string; issueNumber?: number; contentHash?: string; fieldState?: string; issueState?: PlanIssueStateValue; }
 interface StrictMap { kind: 'absent' | 'valid' | 'blocking'; reason?: string; map?: { completions?: Record<string, StrictMapCompletion> }; }
 
 /**
@@ -908,6 +929,80 @@ function buildAddSubIssueOperation(planId: string, phaseId: string, context: Com
   };
 }
 
+/**
+ * Plan 05-06 Task 3 (D-08): the plan issue's own open/closed state PATCH —
+ * mirrors `github-sync-issue-update.cts`'s content PATCH shape (explicit
+ * method, the raw value flag, no labels entry of any kind, one node capture
+ * carrying the just-written state as a planner field), but never touches the
+ * body: this is a distinct convergence unit from the issue-content
+ * projection above (D-12's coupling constraint, generalized a second time).
+ *
+ * The REST path is built through the SAME guarded `phaseIssueRestPath`
+ * builder every other REST operation in this module uses, re-asserting the
+ * owner/repo charset check at this call site (T-04-02) rather than trusting
+ * the whole-run gate `planReconciliation` already ran. Returns `null` on a
+ * charset failure — a typed blocked entry for the caller to report, never a
+ * `gh` invocation.
+ *
+ * `contentCreation: false`: a state PATCH creates no new content, so a
+ * reopen never consumes the content-creation pacing budget BOOT-level
+ * creates need — it can dispatch immediately, exactly like a field-value
+ * write.
+ *
+ * `existingContentHash` (Rule 1 fix, found by testing the four-step D-08
+ * cycle live): this capture shares `issueKey`'s logical key with the
+ * create/update path's own `contentHash` capture, and `recordCompletion`
+ * replaces a logical key's completion wholesale, not by merge. Dispatching
+ * a state PATCH on a run where content is otherwise converged (the common
+ * case: only the state differs) would silently wipe the already-recorded
+ * `contentHash`, making every subsequent run believe content diverged and
+ * generating an unbounded stream of pending body-updates — the exact same
+ * failure class plan 05-05 fixed for the create/addSubIssue pair. Threading
+ * the caller's already-known `contentHash` through this capture is what
+ * keeps it durable across a state-only run.
+ */
+function buildPlanIssueStateOperation(
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  issueKey: string,
+  state: PlanIssueStateValue,
+  context: CompletionContext,
+  existingContentHash?: string,
+): MutationOperation | null {
+  const restApiPath = phaseIssueRestPath(owner, repo, `/issues/${issueNumber}`);
+  if (!restApiPath) return null;
+  return {
+    kind: 'update-plan-issue-state',
+    logicalKey: issueKey,
+    args: [
+      'api', restApiPath, '-X', 'PATCH',
+      // SECURITY: the state literal is GSD's own ('open'/'closed'), but it
+      // still rides the raw -f flag, matching every other value entry in
+      // this module — never the typed -F flag.
+      '-f', `state=${state}`,
+      // Deliberately no labels[]= entry of any kind — GitHub's issue-update
+      // endpoint replaces the whole label set, and this PATCH exists only to
+      // flip open/closed (T-5-14).
+    ],
+    completionContext: context,
+    transport: OPERATION_TRANSPORT.REST,
+    action: OPERATION_ACTION.UPDATE,
+    hasPointsBudget: false,
+    contentCreation: false,
+    captures: [{
+      kind: 'node',
+      logicalKey: issueKey,
+      nodeIdPath: 'node_id',
+      numberPath: 'number',
+      plannerFields: {
+        issueState: state,
+        ...(existingContentHash === undefined ? {} : { contentHash: existingContentHash }),
+      },
+    }],
+  };
+}
+
 function bindingOnBoard(completion: { nodeId: string; issueNumber?: number } | undefined, remote: RemoteSnapshot): boolean {
   if (!completion) return false;
   for (const item of remote.items ?? []) {
@@ -1169,6 +1264,35 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
         : { kind: 'unknown' };
       const planChanged = changedFields(previousPlanFieldState, desiredPlanFieldValues, PLAN_FIELD_NAMES);
 
+      // D-08 (plan 05-06 Task 3): the plan issue's own open/closed state — a
+      // THIRD convergence unit, independent of the content and field units
+      // above (D-12's coupling discipline, generalized a second time). The
+      // desired state is closed when readPlans()'s own `complete` boolean is
+      // true, open otherwise — the same signal, not a second derivation. A
+      // completion recorded before this change (no `issueState` member) is
+      // `undefined`, which never strictly-equals either literal, so it
+      // converges with exactly one write here rather than being skipped.
+      const desiredIssueState: PlanIssueStateValue = plan.complete === true ? PLAN_ISSUE_STATE.CLOSED : PLAN_ISSUE_STATE.OPEN;
+      const stateConverged = planIssueCompletion.issueState === desiredIssueState;
+      if (!stateConverged && typeof planIssueCompletion.issueNumber === 'number') {
+        const stateOp = buildPlanIssueStateOperation(
+          remote.target.owner, remote.target.repo, planIssueCompletion.issueNumber, planIssueKey, desiredIssueState, context,
+          // Rule 1 fix: carry the freshly computed content hash forward on
+          // this capture too, so a state-only run (the common case) never
+          // wipes it under recordCompletion's wholesale-replace semantics —
+          // see buildPlanIssueStateOperation's own doc comment for why.
+          desiredPlanHash,
+        );
+        if (stateOp) {
+          operations.push(stateOp);
+        } else {
+          // Unreachable in practice — the whole-run unsafe-target gate above
+          // already rejected this owner/repo before any plan reached this
+          // point. Kept as a typed fallback rather than a non-null assertion.
+          blocked.push({ reason: OPERATION_REASON.UNSAFE_TARGET, detail: planLogicalKey });
+        }
+      }
+
       if (!planContentConverged) {
         pendingIssueUpdates.push({
           logicalKey: planLogicalKey,
@@ -1190,7 +1314,7 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
         operations.push(...planFieldResult.operations);
         blocked.push(...planFieldResult.blocked);
       }
-      if (planContentConverged && planChanged.length === 0) noops.push({ logicalKey: planLogicalKey });
+      if (planContentConverged && planChanged.length === 0 && stateConverged) noops.push({ logicalKey: planLogicalKey });
       continue;
     }
 
@@ -1264,7 +1388,16 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
     }
 
     operations.push(buildCreatePlanIssueOperation(plan, planIssueKey, milestoneKey as string, restApiPath, context, bodyResult.entry));
-    operations.push(buildAddSubIssueOperation(plan.id, plan.phaseId, context, { contentHash: desiredPlanHash }));
+    // D-08 (plan 05-06 Task 3): GitHub's REST create endpoint has no `state`
+    // parameter — every freshly created issue is open, unconditionally, no
+    // matter what `plan.complete` says at create time. Capturing that known
+    // state here (the LAST write to `issue:plan:<id>`, same "only the last
+    // write carries plannerFields" discipline `contentHash` already follows)
+    // means the very next run reads a real, non-`unknown` state and — for
+    // the common case (still incomplete) — converges with zero further
+    // operations, rather than manufacturing a needless immediate PATCH the
+    // "unknown state converges by rewriting" rule would otherwise trigger.
+    operations.push(buildAddSubIssueOperation(plan.id, plan.phaseId, context, { contentHash: desiredPlanHash, issueState: PLAN_ISSUE_STATE.OPEN }));
     operations.push(operationFor(planLogicalKey, remote.target.projectNodeId, { from: planIssueKey }, remote.target));
 
     // A brand-new plan carries no previous field state at all — every field
@@ -1323,6 +1456,8 @@ export = {
   buildCreateIssueOperation,
   buildCreatePlanIssueOperation,
   buildAddSubIssueOperation,
+  buildPlanIssueStateOperation,
+  PLAN_ISSUE_STATE,
   bodyArgvEntry,
   ADD_SUB_ISSUE_DOCUMENT,
   buildFieldValueOperations,

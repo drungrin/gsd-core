@@ -14,7 +14,7 @@ const path = require('node:path');
 const { createTempDir, cleanup } = require('./helpers.cjs');
 
 const mapMod = require('../gsd-core/bin/lib/github-sync-map.cjs');
-const { readSyncMapStrict, recordCompletion, writeSyncMapAtomically, SYNC_MAP_FILE_NAME } = mapMod;
+const { readSyncMapStrict, recordCompletion, writeSyncMapAtomically, SYNC_MAP_FILE_NAME, ISSUE_STATE } = mapMod;
 
 const REPOSITORY = { owner: 'open-gsd', repo: 'gsd-core', number: 42 };
 
@@ -253,6 +253,52 @@ test('a completion whose contentHash is present but an empty string is rejected 
   const result = readSyncMapStrict(repoDir, REPOSITORY);
 
   assert.deepEqual(result, { kind: 'blocking', reason: 'invalid_schema' });
+});
+
+// ─── plan 05-06 Task 3: issueState widened schema ──────────────────────────
+
+test('isCompletion (via readSyncMapStrict): accepts a completion carrying the closed literal and one carrying the open literal', (t) => {
+  const repoDir = createTempDir('github-sync-map-issuestate-valid-');
+  t.after(() => cleanup(repoDir));
+  writeMap(repoDir, makeMap({
+    'plan:04-01': makeCompletion({ logicalKey: 'plan:04-01', issueState: ISSUE_STATE.CLOSED }),
+  }));
+
+  const result = readSyncMapStrict(repoDir, REPOSITORY);
+  assert.equal(result.kind, 'valid');
+  assert.equal(result.map.completions['plan:04-01'].issueState, 'closed');
+
+  const repoDir2 = createTempDir('github-sync-map-issuestate-open-');
+  t.after(() => cleanup(repoDir2));
+  writeMap(repoDir2, makeMap({
+    'plan:04-01': makeCompletion({ logicalKey: 'plan:04-01', issueState: ISSUE_STATE.OPEN }),
+  }));
+  const result2 = readSyncMapStrict(repoDir2, REPOSITORY);
+  assert.equal(result2.kind, 'valid');
+  assert.equal(result2.map.completions['plan:04-01'].issueState, 'open');
+});
+
+test('isCompletion (via readSyncMapStrict): rejects an issueState carrying any string other than the two literals, a boolean, or a number', (t) => {
+  for (const badValue of ['Closed', 'OPEN', 'archived', true, false, 1, 0]) {
+    const repoDir = createTempDir('github-sync-map-issuestate-invalid-');
+    t.after(() => cleanup(repoDir));
+    writeMap(repoDir, makeMap({
+      'plan:04-01': makeCompletion({ logicalKey: 'plan:04-01', issueState: badValue }),
+    }));
+    const result = readSyncMapStrict(repoDir, REPOSITORY);
+    assert.deepEqual(result, { kind: 'blocking', reason: 'invalid_schema' }, `expected issueState ${JSON.stringify(badValue)} to be rejected`);
+  }
+});
+
+test('a completion recorded before this change, with no issueState member at all, still validates and round-trips through recordCompletion', () => {
+  const preExisting = makeCompletion();
+  assert.equal(Object.prototype.hasOwnProperty.call(preExisting, 'issueState'), false);
+  const map = recordCompletion(null, preExisting);
+  assert.deepEqual(map.completions['phase:02'], preExisting);
+});
+
+test('SYNC_MAP_VERSION is unchanged by the issueState widening', () => {
+  assert.equal(mapMod.SYNC_MAP_VERSION, '1');
 });
 
 test('writeSyncMapAtomically reports directory fsync uncertainty after installing a complete map', (t) => {

@@ -7,7 +7,7 @@ const {
   planReconciliation, OPERATION_KIND, OPERATION_REASON, issueKeyFor,
   buildFieldValueOperations, buildPlanFieldValueOperations, PLAN_FIELD_VALUE_SPEC,
   planKeyFor, planIssueKeyFor, buildCreatePlanIssueOperation, buildAddSubIssueOperation, ADD_SUB_ISSUE_DOCUMENT,
-  UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, bodyArgvEntry,
+  UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, bodyArgvEntry, buildPlanIssueStateOperation, PLAN_ISSUE_STATE,
 } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
 const { GSD_LABELS, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const {
@@ -1232,14 +1232,18 @@ function steadyPlanFieldValues(plan) {
   return { gsdId: PLAN_STEADY_LOGICAL_KEY, phaseId: plan.phaseId, requirements: plan.requirements ?? [], status: plan.status ?? '', wave: plan.wave ?? null, autonomous: plan.autonomous ?? false };
 }
 
-function steadyPlanMap({ contentHashValue, fieldStateValue, milestoneNumber = PLAN_STEADY_MILESTONE_NUMBER } = {}) {
+function steadyPlanMap({ contentHashValue, fieldStateValue, issueStateValue, milestoneNumber = PLAN_STEADY_MILESTONE_NUMBER } = {}) {
   return {
     kind: 'valid',
     map: {
       completions: {
         [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: milestoneNumber },
         [PLAN_STEADY_LOGICAL_KEY]: { nodeId: 'item-plan-0403', issueNumber: 88, ...(fieldStateValue !== undefined ? { fieldState: fieldStateValue } : {}) },
-        [PLAN_STEADY_ISSUE_KEY]: { nodeId: 'ISSUE_NODE_PLAN_0403', issueNumber: 88, ...(contentHashValue !== undefined ? { contentHash: contentHashValue } : {}) },
+        [PLAN_STEADY_ISSUE_KEY]: {
+          nodeId: 'ISSUE_NODE_PLAN_0403', issueNumber: 88,
+          ...(contentHashValue !== undefined ? { contentHash: contentHashValue } : {}),
+          ...(issueStateValue !== undefined ? { issueState: issueStateValue } : {}),
+        },
       },
     },
   };
@@ -1250,7 +1254,7 @@ test('planReconciliation: a converged plan (equal content hash, equal field stat
   const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
   const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
   const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
-  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState });
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState, issueStateValue: 'open' });
 
   const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
   assert.deepEqual(result.operations, []);
@@ -1265,7 +1269,7 @@ test('planReconciliation: a stored content hash that differs from the freshly co
   const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
   const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
   const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
-  const map = steadyPlanMap({ contentHashValue: 'stale-plan-hash', fieldStateValue: fieldState });
+  const map = steadyPlanMap({ contentHashValue: 'stale-plan-hash', fieldStateValue: fieldState, issueStateValue: 'open' });
 
   const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
   assert.deepEqual(result.operations, []);
@@ -1290,7 +1294,7 @@ test('planReconciliation: a matching content hash but a differing field state pr
   const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
   const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
   const staleFieldState = renderFieldState({ ...steadyPlanFieldValues(plan), wave: 999 }, PLAN_FIELD_NAMES);
-  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: staleFieldState });
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: staleFieldState, issueStateValue: 'open' });
 
   const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
   assert.deepEqual(result.pendingIssueUpdates, []);
@@ -1550,4 +1554,135 @@ test('bodyArgvEntry: a slot/dependency count disagreement returns a typed mismat
   assert.equal(Object.prototype.hasOwnProperty.call(result, 'entry'), false);
   assert.match(result.detail, /1/);
   assert.match(result.detail, /2/);
+});
+
+// ─── Plan 05-06 Task 3: the plan issue's own open/closed state ────────────
+
+test('PLAN_ISSUE_STATE: exposes exactly the two literal values', () => {
+  assert.deepEqual(PLAN_ISSUE_STATE, { OPEN: 'open', CLOSED: 'closed' });
+});
+
+test('buildPlanIssueStateOperation: REST PATCH carrying the state on the raw flag, no labels entry, contentCreation false, and a node capture recording the written state as a planner field', () => {
+  const op = buildPlanIssueStateOperation('octo', 'repo', 88, planIssueKeyFor('04-03'), PLAN_ISSUE_STATE.CLOSED, CONTEXT);
+  assert.equal(op.kind, 'update-plan-issue-state');
+  assert.equal(op.transport, 'rest');
+  assert.equal(op.action, 'update');
+  assert.equal(op.hasPointsBudget, false);
+  assert.equal(op.contentCreation, false, 'a state PATCH never consumes the content-creation pacing budget');
+  assert.deepEqual(op.args, ['api', 'repos/octo/repo/issues/88', '-X', 'PATCH', '-f', 'state=closed']);
+  for (const arg of op.args) {
+    if (typeof arg === 'string') assert.doesNotMatch(arg, /labels/i, 'the state PATCH must carry no labels entry of any kind');
+  }
+  assert.deepEqual(op.captures[0], {
+    kind: 'node', logicalKey: planIssueKeyFor('04-03'), nodeIdPath: 'node_id', numberPath: 'number',
+    plannerFields: { issueState: 'closed' },
+  });
+});
+
+test('buildPlanIssueStateOperation: returns null when the owner/repo fails the path-safety charset check, never dispatching gh with an unsafe path', () => {
+  const op = buildPlanIssueStateOperation('{owner}', 'repo', 88, planIssueKeyFor('04-03'), PLAN_ISSUE_STATE.OPEN, CONTEXT);
+  assert.equal(op, null);
+});
+
+test('planReconciliation: a plan whose sibling SUMMARY.md exists (complete) and whose completion records an open state emits one PATCH setting the issue closed', () => {
+  const plan = steadyPlan({ complete: true });
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState, issueStateValue: 'open' });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  const stateOps = result.operations.filter((op) => op.kind === 'update-plan-issue-state');
+  assert.equal(stateOps.length, 1);
+  assert.ok(stateOps[0].args.includes('state=closed'));
+  assert.deepEqual(result.noops, [], 'a plan with a pending state transition is never also reported as a no-op');
+});
+
+test('planReconciliation: a plan whose sibling SUMMARY.md is absent and whose completion records a closed state emits one PATCH setting the issue open', () => {
+  const plan = steadyPlan({ complete: false });
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState, issueStateValue: 'closed' });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  const stateOps = result.operations.filter((op) => op.kind === 'update-plan-issue-state');
+  assert.equal(stateOps.length, 1);
+  assert.ok(stateOps[0].args.includes('state=open'));
+});
+
+test('planReconciliation: a plan whose recorded state already matches disk emits no state operation', () => {
+  const plan = steadyPlan({ complete: true });
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState, issueStateValue: 'closed' });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  assert.deepEqual(result.operations.filter((op) => op.kind === 'update-plan-issue-state'), []);
+  assert.deepEqual(result.noops, [{ logicalKey: PLAN_STEADY_LOGICAL_KEY }]);
+});
+
+test('planReconciliation: a plan whose completion records no state at all is treated as unknown and emits one PATCH, converging on that run', () => {
+  const plan = steadyPlan({ complete: false });
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState }); // no issueStateValue at all
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  const stateOps = result.operations.filter((op) => op.kind === 'update-plan-issue-state');
+  assert.equal(stateOps.length, 1);
+  assert.ok(stateOps[0].args.includes('state=open'));
+});
+
+test("planReconciliation: the state PATCH's capture carries the newly written state as a planner field, so the following run is a no-op", () => {
+  const plan = steadyPlan({ complete: true });
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState, issueStateValue: 'open' });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  const stateOp = result.operations.find((op) => op.kind === 'update-plan-issue-state');
+  // Rule 1 fix: the capture also carries the freshly computed contentHash
+  // forward, so a state-only run never wipes it under recordCompletion's
+  // wholesale-replace semantics — see buildPlanIssueStateOperation's doc.
+  assert.equal(stateOp.captures[0].plannerFields.issueState, 'closed');
+  assert.equal(stateOp.captures[0].plannerFields.contentHash, hash);
+});
+
+test('planReconciliation: two consecutive runs over unchanged disk emit one state PATCH on the first and none on the second', () => {
+  const plan = steadyPlan({ complete: false });
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+
+  const firstMap = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState }); // unknown state
+  const firstResult = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), firstMap);
+  assert.equal(firstResult.operations.filter((op) => op.kind === 'update-plan-issue-state').length, 1);
+
+  // The second run's map reflects the first run's state PATCH already having
+  // been recorded — exactly what applyMutationPlan/recordCompletion would do.
+  const secondMap = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState, issueStateValue: 'open' });
+  const secondResult = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), secondMap);
+  assert.equal(secondResult.operations.filter((op) => op.kind === 'update-plan-issue-state').length, 0);
+  assert.deepEqual(secondResult.noops, [{ logicalKey: PLAN_STEADY_LOGICAL_KEY }]);
+});
+
+test('planReconciliation: no code path writes a value from a GitHub response back into any .planning/ file other than the sync map\'s own node ids, numbers, hashes and state', () => {
+  // The one-way-mirror control: the state PATCH's own args and captures name
+  // no filesystem path, and desired state is derived solely from `plan.complete`
+  // (github-sync-desired.cts's own disk-truth signal), never from `remote`.
+  const plan = steadyPlan({ complete: true });
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState, issueStateValue: 'open' });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  const stateOp = result.operations.find((op) => op.kind === 'update-plan-issue-state');
+  for (const arg of stateOp.args) {
+    if (typeof arg === 'string') assert.doesNotMatch(arg, /\.planning/, 'no argv value names a .planning/ path');
+  }
 });

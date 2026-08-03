@@ -1179,3 +1179,120 @@ test('two plans where the second depends on the first, both created in one run: 
   const expectedPlanBHash = contentHash({ title: planB.title, region: planBPlanIdSubstitution.text, milestoneNumber: PLAN_FOUR_RUN_MILESTONE_NUMBER });
   assert.equal(reopened.map.completions['issue:plan:08-02'].contentHash, expectedPlanBHash);
 });
+
+// ─── Plan 05-06 Task 3: the plan issue's open/closed state follows its ────
+// ─── sibling SUMMARY.md in both directions, converging to zero writes ────
+
+test('a plan issue closes when its SUMMARY.md appears and reopens when it disappears: create, close, reopen, then a fourth run over unchanged disk emits nothing', (t) => {
+  const cwd = createTempProject('github-sync-composition-issue-state-');
+  t.after(() => cleanup(cwd));
+
+  const clock = fixedClock();
+  const seeded = seedPhaseIssueAndMilestoneMap(cwd, '04', 'I_node_phase_state_parent');
+  const basePlan = { id: '04-09', phaseId: '04', title: '04-09 — State machine', tasks: ['Task 1: A'], status: 'Todo' };
+  const PLAN_NODE_ID = 'I_node_plan_state_0409';
+  const PLAN_NUMBER = 777;
+
+  // ─── Run 1: create (SUMMARY.md does not exist yet) ─────────────────────
+  const run1Desired = desiredWithOnePlan({ ...basePlan, complete: false });
+  const run1Plan = planReconciliation(run1Desired, remote([]), seeded);
+  assert.deepEqual(run1Plan.blocked, []);
+
+  const run1Dispatched = [];
+  const run1 = applyMutationPlan(run1Plan, {
+    cwd,
+    map: seeded.map,
+    clock,
+    execGh(args) {
+      run1Dispatched.push(args);
+      const callIndex = run1Dispatched.length;
+      if (callIndex === 1) return restIssueCreateResponse(PLAN_NODE_ID, PLAN_NUMBER);
+      if (callIndex === 2) return addSubIssueResponse('I_node_phase_state_parent', PLAN_NODE_ID, PLAN_NUMBER);
+      if (callIndex === 3) return response('PVTI_item_plan_state_0409', PLAN_NUMBER);
+      return fieldValueResponse('PVTI_item_plan_state_0409', PLAN_NUMBER);
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(run1.kind, 'completed');
+
+  const afterRun1 = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterRun1.kind, 'valid');
+  assert.equal(
+    afterRun1.map.completions['issue:plan:04-09'].issueState,
+    'open',
+    'a freshly created plan issue records the open state GitHub always creates it in, so the very next run does not manufacture a needless PATCH',
+  );
+
+  const boundRemote = remote([{ id: 'PVTI_item_plan_state_0409', content: { id: PLAN_NODE_ID, number: PLAN_NUMBER } }]);
+
+  // ─── Run 2: SUMMARY.md appears — closes the issue, one operation only ──
+  const run2Desired = desiredWithOnePlan({ ...basePlan, complete: true });
+  const run2Plan = planReconciliation(run2Desired, boundRemote, afterRun1);
+  assert.equal(run2Plan.operations.length, 1, 'content and field state are already converged — only the state unit differs');
+  assert.equal(run2Plan.operations[0].kind, 'update-plan-issue-state');
+  assert.ok(run2Plan.operations[0].args.includes('state=closed'));
+  assert.deepEqual(run2Plan.noops, [], 'a plan with a pending state transition is never also reported as a no-op');
+
+  const run2 = applyMutationPlan(run2Plan, {
+    cwd,
+    map: afterRun1.map,
+    clock,
+    execGh(args) {
+      assert.ok(args.includes('state=closed'));
+      assert.ok(!args.some((a) => typeof a === 'string' && /labels/i.test(a)), 'a state transition must never carry a labels entry');
+      return { exitCode: 0, stdout: JSON.stringify({ node_id: PLAN_NODE_ID, number: PLAN_NUMBER }), stderr: '' };
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(run2.kind, 'completed');
+  const afterRun2 = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterRun2.kind, 'valid');
+  assert.equal(afterRun2.map.completions['issue:plan:04-09'].issueState, 'closed');
+
+  // ─── Run 3: SUMMARY.md disappears — reopens the issue ──────────────────
+  const run3Desired = desiredWithOnePlan({ ...basePlan, complete: false });
+  const run3Plan = planReconciliation(run3Desired, boundRemote, afterRun2);
+  assert.equal(run3Plan.operations.length, 1);
+  assert.equal(run3Plan.operations[0].kind, 'update-plan-issue-state');
+  assert.ok(run3Plan.operations[0].args.includes('state=open'));
+
+  const run3 = applyMutationPlan(run3Plan, {
+    cwd,
+    map: afterRun2.map,
+    clock,
+    execGh(args) {
+      assert.ok(args.includes('state=open'));
+      return { exitCode: 0, stdout: JSON.stringify({ node_id: PLAN_NODE_ID, number: PLAN_NUMBER }), stderr: '' };
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(run3.kind, 'completed');
+  const afterRun3 = readSyncMapStrict(cwd, REPOSITORY);
+  assert.equal(afterRun3.kind, 'valid');
+  assert.equal(afterRun3.map.completions['issue:plan:04-09'].issueState, 'open');
+
+  // ─── Run 4: unchanged disk — zero operations, proving the state is ─────
+  // ─── recorded rather than recomputed-and-rewritten every time ──────────
+  const run4Desired = desiredWithOnePlan({ ...basePlan, complete: false });
+  const run4Plan = planReconciliation(run4Desired, boundRemote, afterRun3);
+  assert.deepEqual(run4Plan.operations, []);
+  assert.deepEqual(run4Plan.noops, [{ logicalKey: 'plan:04-09' }]);
+
+  let run4Dispatched = 0;
+  const run4 = applyMutationPlan(run4Plan, {
+    cwd,
+    map: afterRun3.map,
+    clock,
+    execGh() {
+      run4Dispatched += 1;
+      throw new Error('run four must not dispatch — unchanged disk state converges to zero operations');
+    },
+    recordCompletion,
+    writeSyncMapAtomically,
+  });
+  assert.equal(run4.kind, 'completed');
+  assert.equal(run4Dispatched, 0);
+});
