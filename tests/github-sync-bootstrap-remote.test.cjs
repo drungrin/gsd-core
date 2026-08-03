@@ -20,7 +20,7 @@ const {
 const repoObjectsFixture = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/bootstrap-repo-objects.json'), 'utf8'),
 );
-const { planStatusOptionMerge, planProject, planFields, planViews, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
+const { planStatusOptionMerge, planProject, planFields, planViews, planLeftmostViewLayout, VIEW_LAYOUT, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 
 const bootstrapViewsFixture = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'fixtures/github-sync/bootstrap-views.json'), 'utf8'),
@@ -560,6 +560,23 @@ function captureDispatchedBootstrapDocuments() {
     const query = operation.args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
     const name = viewDocumentNames.find((candidate) => query.includes(`github-sync-bootstrap:${candidate}`));
     if (name && !documents.has(name)) documents.set(name, query.slice('query='.length));
+  }
+
+  // plan 06-04 Task 1: updateViewLayout is captured from planLeftmostViewLayout's
+  // own divergent-layout plan (an unmapped leftmost view whose observed layout
+  // differs from the configured value) — mirroring the planViews precedent
+  // above, one operation dispatched, its document captured from the args.
+  const leftmostViewPlan = planLeftmostViewLayout(
+    { available: true, projectOutcome: 'resolved', statusField: null, fields: [], views: [{ id: 'PVTV_leftmost_h', name: 'View 1', layout: 'TABLE_LAYOUT', filter: null }] },
+    { kind: 'absent' },
+    VIEW_LAYOUT.BOARD,
+    { owner: 'octo', repo: 'example', repositoryNumber: 1 },
+  );
+  for (const operation of leftmostViewPlan.operations) {
+    const query = operation.args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
+    if (query && query.includes('github-sync-bootstrap:updateViewLayout') && !documents.has('updateViewLayout')) {
+      documents.set('updateViewLayout', query.slice('query='.length));
+    }
   }
 
   return documents;

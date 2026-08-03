@@ -13,6 +13,7 @@ const {
   planLabels,
   planMilestones,
   planViews,
+  planLeftmostViewLayout,
   parseMilestoneVersionToken,
   validateFatalConditions,
   optionInputArgv,
@@ -39,6 +40,7 @@ const {
   UPDATE_VIEW_SHAPE_WITH_FILTER_DOCUMENT,
   CREATE_VIEW_DOCUMENT,
   UPDATE_VIEW_SHAPE_DOCUMENT,
+  UPDATE_VIEW_LAYOUT_DOCUMENT,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const { applyMutationPlan } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
 const { resolveArgv, decodeCompletions, ARGV_REF_PART: TOP_ARGV_REF_PART } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
@@ -1202,6 +1204,102 @@ describe('planViews: identity cases (plan 06-02 Task 2)', () => {
   });
 });
 
+// ─── planLeftmostViewLayout (D-09/D-10/D-11, plan 06-04) ───────────────────
+
+describe('BOOTSTRAP_LOGICAL_KEY.leftmostView', () => {
+  test('returns exactly view:leftmost', () => {
+    assert.equal(BOOTSTRAP_LOGICAL_KEY.leftmostView(), 'view:leftmost');
+  });
+
+  test('is not producible by BOOTSTRAP_LOGICAL_KEY.view(name) for any of the five GSD_VIEWS names', () => {
+    assert.equal(GSD_VIEWS.some((v) => BOOTSTRAP_LOGICAL_KEY.view(v.name) === BOOTSTRAP_LOGICAL_KEY.leftmostView()), false);
+  });
+});
+
+describe('planLeftmostViewLayout', () => {
+  /** Any remote whose first view is not one of GSD_VIEWS' five declared names. */
+  function remoteWithLeftmost(views) {
+    return { available: true, projectOutcome: 'resolved', statusField: null, fields: [], views };
+  }
+
+  test('empty views list: zero operations, zero checkpoints, no blocked entry', () => {
+    const result = planLeftmostViewLayout(remoteWithLeftmost([]), { kind: 'absent' }, VIEW_LAYOUT.BOARD, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 0);
+    assert.deepEqual(Object.keys(result).sort(), ['checkpoints', 'operations']);
+  });
+
+  test('leftmost named Backlog (a GSD view): zero operations even when its layout differs from the configured value', () => {
+    const views = [remoteView('PVTV_backlog', 'Backlog', 'TABLE_LAYOUT', '-status:Done')];
+    const result = planLeftmostViewLayout(remoteWithLeftmost(views), { kind: 'absent' }, VIEW_LAYOUT.BOARD, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 0);
+  });
+
+  test('leftmost named My Board whose id equals the view:board completion\'s stored id: zero operations (a renamed GSD view is still GSD\'s)', () => {
+    const strictMap = { kind: 'valid', map: { completions: { [BOOTSTRAP_LOGICAL_KEY.view('Board')]: { nodeId: 'PVTV_renamed_board' } } } };
+    const views = [remoteView('PVTV_renamed_board', 'My Board', 'TABLE_LAYOUT', null)];
+    const result = planLeftmostViewLayout(remoteWithLeftmost(views), strictMap, VIEW_LAYOUT.BOARD, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 0);
+  });
+
+  test('leftmost named View 1 with TABLE_LAYOUT, configured board: exactly one operation whose argv carries layout=BOARD_LAYOUT and the literal viewId of that view, and no name=, filter=, or field-ids entry of any form', () => {
+    const views = [remoteView('PVTV_view1', 'View 1', 'TABLE_LAYOUT', null)];
+    const result = planLeftmostViewLayout(remoteWithLeftmost(views), { kind: 'absent' }, VIEW_LAYOUT.BOARD, CONTEXT);
+    assert.equal(result.operations.length, 1);
+    assert.equal(result.checkpoints.length, 0);
+    const op = result.operations[0];
+    assert.equal(op.kind, 'update-view-layout');
+    assert.equal(op.logicalKey, BOOTSTRAP_LOGICAL_KEY.leftmostView());
+    assert.ok(op.args.includes('layout=BOARD_LAYOUT'));
+    assert.ok(op.args.includes('viewId=PVTV_view1'));
+    assert.equal(op.args.some((a) => typeof a === 'string' && a.startsWith('name=')), false);
+    assert.equal(op.args.some((a) => typeof a === 'string' && a.startsWith('filter=')), false);
+    assert.equal(op.args.some((a) => typeof a === 'string' && (a.startsWith('fieldIds') || a.includes('visibleFieldIds'))), false);
+    assert.equal(op.stage, BOOTSTRAP_STAGE.VIEWS);
+    assert.equal(op.captures.length, 1);
+    assert.equal(op.captures[0].kind, 'node');
+    assert.equal(op.captures[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.leftmostView());
+    assert.equal(op.captures[0].nodeIdPath, 'updateProjectV2View.projectV2View.id');
+  });
+
+  test('leftmost named View 1 with BOARD_LAYOUT, configured board: zero operations, one checkpoint keyed view:leftmost carrying that view\'s id', () => {
+    const views = [remoteView('PVTV_view1', 'View 1', 'BOARD_LAYOUT', null)];
+    const result = planLeftmostViewLayout(remoteWithLeftmost(views), { kind: 'absent' }, VIEW_LAYOUT.BOARD, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 1);
+    assert.equal(result.checkpoints[0].logicalKey, BOOTSTRAP_LOGICAL_KEY.leftmostView());
+    assert.equal(result.checkpoints[0].nodeId, 'PVTV_view1');
+    assert.equal(result.checkpoints[0].stage, BOOTSTRAP_STAGE.VIEWS);
+    assert.deepEqual(result.checkpoints[0].completionContext, CONTEXT);
+  });
+
+  test('leftmost named View 1 with BOARD_LAYOUT, configured table: one operation carrying layout=TABLE_LAYOUT (the flip case D-10 requires)', () => {
+    const views = [remoteView('PVTV_view1', 'View 1', 'BOARD_LAYOUT', null)];
+    const result = planLeftmostViewLayout(remoteWithLeftmost(views), { kind: 'absent' }, VIEW_LAYOUT.TABLE, CONTEXT);
+    assert.equal(result.operations.length, 1);
+    assert.ok(result.operations[0].args.includes('layout=TABLE_LAYOUT'));
+  });
+
+  test('second-run convergence: a snapshot in which the leftmost view\'s layout already equals the configured value emits zero operations', () => {
+    const views = [remoteView('PVTV_view1', 'View 1', 'ROADMAP_LAYOUT', null)];
+    const result = planLeftmostViewLayout(remoteWithLeftmost(views), { kind: 'absent' }, VIEW_LAYOUT.ROADMAP, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 1);
+  });
+
+  test('a snapshot whose views list is ordered with a GSD view first and View 1 second: zero operations (positional identity, not name-based scanning for View 1)', () => {
+    const views = [
+      remoteView('PVTV_roadmap', 'Roadmap', 'ROADMAP_LAYOUT', null),
+      remoteView('PVTV_view1', 'View 1', 'TABLE_LAYOUT', null),
+    ];
+    const result = planLeftmostViewLayout(remoteWithLeftmost(views), { kind: 'absent' }, VIEW_LAYOUT.BOARD, CONTEXT);
+    assert.equal(result.operations.length, 0);
+    assert.equal(result.checkpoints.length, 0);
+  });
+});
+
 describe('mutation document parity: view documents (D-06 / plan 06-02 Task 1)', () => {
   test('CREATE_VIEW_WITH_FIELDS_DOCUMENT and CREATE_VIEW_DOCUMENT both carry no filter variable (only update can set filter)', () => {
     assert.doesNotMatch(CREATE_VIEW_WITH_FIELDS_DOCUMENT, /\bfilter\b/);
@@ -1234,6 +1332,20 @@ describe('mutation document parity: view documents (D-06 / plan 06-02 Task 1)', 
 
   test('UPDATE_VIEW_SHAPE_DOCUMENT is byte-identical to BOOTSTRAP_DOCUMENTS.updateViewShape', () => {
     assert.equal(UPDATE_VIEW_SHAPE_DOCUMENT, bootstrapRemote.BOOTSTRAP_DOCUMENTS.updateViewShape);
+  });
+
+  test('UPDATE_VIEW_LAYOUT_DOCUMENT carries none of name, filter, or configuration — T-06-14\'s mitigation', () => {
+    assert.doesNotMatch(UPDATE_VIEW_LAYOUT_DOCUMENT, /\bname\b/);
+    assert.doesNotMatch(UPDATE_VIEW_LAYOUT_DOCUMENT, /\bfilter\b/);
+    assert.doesNotMatch(UPDATE_VIEW_LAYOUT_DOCUMENT, /configuration/);
+  });
+
+  test('UPDATE_VIEW_LAYOUT_DOCUMENT selects no rateLimit', () => {
+    assert.doesNotMatch(UPDATE_VIEW_LAYOUT_DOCUMENT, /rateLimit/);
+  });
+
+  test('UPDATE_VIEW_LAYOUT_DOCUMENT is byte-identical to BOOTSTRAP_DOCUMENTS.updateViewLayout', () => {
+    assert.equal(UPDATE_VIEW_LAYOUT_DOCUMENT, bootstrapRemote.BOOTSTRAP_DOCUMENTS.updateViewLayout);
   });
 });
 
