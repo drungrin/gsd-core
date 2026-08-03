@@ -5,11 +5,12 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   planReconciliation, OPERATION_KIND, OPERATION_REASON, issueKeyFor,
-  buildFieldValueOperations,
+  buildFieldValueOperations, buildPlanFieldValueOperations, PLAN_FIELD_VALUE_SPEC,
   planKeyFor, planIssueKeyFor, buildCreatePlanIssueOperation, buildAddSubIssueOperation, ADD_SUB_ISSUE_DOCUMENT,
+  UPDATE_FIELD_VALUE_NUMBER_DOCUMENT,
 } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
 const { GSD_LABELS, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
-const { renderPhaseRegion, renderPlanRegion, contentHash, renderFieldState } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const { renderPhaseRegion, renderPlanRegion, contentHash, renderFieldState, PLAN_FIELD_NAMES } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 
 /** Recursively asserts no object among `inputs` carries a `body` key anywhere — proves SYNC-05/D-08's "no remote body read at all" structurally, not by convention. */
 function assertNoRemoteBodyInInputs(...inputs) {
@@ -782,6 +783,183 @@ test('buildFieldValueOperations: every operation\'s capture is keyed on the phas
   }
 });
 
+test('buildFieldValueOperations (the phase builder): passing "wave" and "autonomous" in the changed set alongside all four phase fields still produces exactly four operations — FIELD_VALUE_SPEC has no Wave/Autonomous member', () => {
+  const phase = { id: '04', title: 'Phase Four', goal: 'g', requirements: ['R1'], status: 'Todo' };
+  const result = buildFieldValueOperations(phase, ['gsdId', 'phaseId', 'requirements', 'status', 'wave', 'autonomous'], fieldBootstrapCompletions(), 'phase:04', CONTEXT);
+  assert.equal(result.operations.length, 4);
+  assert.deepEqual(result.operations.map(fieldIdOf), ['FIELD_GSD_ID', 'FIELD_PHASE', 'FIELD_REQUIREMENTS', 'FIELD_STATUS']);
+});
+
+// ─── Plan 05-05 Task 1: plan item field values (buildPlanFieldValueOperations) ─
+
+const PLAN_FIELD_KEY = {
+  gsdId: BOOTSTRAP_LOGICAL_KEY.field('GSD ID'),
+  phase: BOOTSTRAP_LOGICAL_KEY.field('Phase'),
+  requirements: BOOTSTRAP_LOGICAL_KEY.field('Requirements'),
+  status: BOOTSTRAP_LOGICAL_KEY.field('Status'),
+  wave: BOOTSTRAP_LOGICAL_KEY.field('Wave'),
+  autonomous: BOOTSTRAP_LOGICAL_KEY.field('Autonomous'),
+};
+
+/** Plan 05-05: the six plan-item fields' own reserved-key completions a bootstrapped board (`init`) already recorded — the phase four plus the two new Wave/Autonomous ones. */
+function planFieldBootstrapCompletions() {
+  return {
+    [PLAN_FIELD_KEY.gsdId]: { nodeId: 'FIELD_GSD_ID' },
+    [PLAN_FIELD_KEY.phase]: { nodeId: 'FIELD_PHASE' },
+    [PLAN_FIELD_KEY.requirements]: { nodeId: 'FIELD_REQUIREMENTS' },
+    [PLAN_FIELD_KEY.status]: { nodeId: 'FIELD_STATUS' },
+    [PLAN_FIELD_KEY.wave]: { nodeId: 'FIELD_WAVE' },
+    [PLAN_FIELD_KEY.autonomous]: { nodeId: 'FIELD_AUTONOMOUS' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('Todo')]: { nodeId: 'OPTION_TODO' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('In Progress')]: { nodeId: 'OPTION_IN_PROGRESS' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('Done')]: { nodeId: 'OPTION_DONE' },
+    [BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')]: { nodeId: 'OPTION_AUTONOMOUS_YES' },
+    [BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')]: { nodeId: 'OPTION_AUTONOMOUS_NO' },
+  };
+}
+
+function planFieldFixture(overrides = {}) {
+  return {
+    id: '04-03', phaseId: '04', title: '04-03 — Splice a region', tasks: ['Task 1: First'],
+    status: 'Todo', wave: 3, autonomous: true, requirements: ['PLAN-01'],
+    ...overrides,
+  };
+}
+
+test('PLAN_FIELD_VALUE_SPEC: declares exactly six members in the fixed order GSD ID, Phase, Requirements, Status, Wave, Autonomous', () => {
+  assert.deepEqual(PLAN_FIELD_VALUE_SPEC.map((entry) => entry.fieldName), ['gsdId', 'phaseId', 'requirements', 'status', 'wave', 'autonomous']);
+  assert.deepEqual(PLAN_FIELD_VALUE_SPEC.map((entry) => entry.declaredName), ['GSD ID', 'Phase', 'Requirements', 'Status', 'Wave', 'Autonomous']);
+});
+
+test('UPDATE_FIELD_VALUE_NUMBER_DOCUMENT: declares a Float! variable and wraps the value under the "number" key, matching the createFieldNumber precedent\'s naming', () => {
+  assert.match(UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, /# github-sync:updateFieldValueNumber/);
+  assert.match(UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, /\$value:Float!/);
+  assert.match(UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, /value:\{number:\$value\}/);
+  assert.match(UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, /projectV2Item \{ id content \{ \.\.\. on Issue \{ number \} \} \}/);
+  assert.doesNotMatch(UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, /rateLimit/);
+});
+
+test('buildPlanFieldValueOperations: all six names changed emits six operations, in PLAN_FIELD_VALUE_SPEC\'s declared order', () => {
+  const plan = planFieldFixture();
+  const result = buildPlanFieldValueOperations(plan, [...PLAN_FIELD_NAMES], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  assert.deepEqual(result.blocked, []);
+  assert.equal(result.operations.length, 6);
+  assert.deepEqual(result.operations.map(fieldIdOf), [
+    'FIELD_GSD_ID', 'FIELD_PHASE', 'FIELD_REQUIREMENTS', 'FIELD_STATUS', 'FIELD_WAVE', 'FIELD_AUTONOMOUS',
+  ]);
+});
+
+test('buildPlanFieldValueOperations: only the LAST of the six operations carries plannerFields.fieldState, serialized through the six-name variant', () => {
+  const plan = planFieldFixture();
+  const result = buildPlanFieldValueOperations(plan, [...PLAN_FIELD_NAMES], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  assert.deepEqual(result.operations.map((op) => op.captures[0].plannerFields !== undefined), [false, false, false, false, false, true]);
+  assert.deepEqual(JSON.parse(result.operations[5].captures[0].plannerFields.fieldState), {
+    gsdId: 'plan:04-03', phaseId: '04', requirements: ['PLAN-01'], status: 'Todo', wave: 3, autonomous: true,
+  });
+});
+
+test('buildPlanFieldValueOperations: the Status write is an ArgvRef resolving option:status:<slug>; the Autonomous write is an ArgvRef resolving option:autonomous:yes or option:autonomous:no — never a literal name, never a literal id', () => {
+  const planTrue = planFieldFixture({ status: 'Done', autonomous: true });
+  const resultTrue = buildPlanFieldValueOperations(planTrue, ['status', 'autonomous'], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  const [statusOp, autonomousOp] = resultTrue.operations;
+  const statusValueArg = statusOp.args.find((arg) => typeof arg === 'object' && arg.prefix === 'value=');
+  assert.deepEqual(statusValueArg, { from: BOOTSTRAP_LOGICAL_KEY.statusOption('Done'), part: 'nodeId', prefix: 'value=' });
+  assert.equal(statusOp.args.includes('value=Done'), false);
+  const autonomousValueArgYes = autonomousOp.args.find((arg) => typeof arg === 'object' && arg.prefix === 'value=');
+  assert.deepEqual(autonomousValueArgYes, { from: BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes'), part: 'nodeId', prefix: 'value=' });
+
+  const planFalse = planFieldFixture({ autonomous: false });
+  const resultFalse = buildPlanFieldValueOperations(planFalse, ['autonomous'], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  const autonomousValueArgNo = resultFalse.operations[0].args.find((arg) => typeof arg === 'object' && arg.prefix === 'value=');
+  assert.deepEqual(autonomousValueArgNo, { from: BOOTSTRAP_LOGICAL_KEY.autonomousOption('No'), part: 'nodeId', prefix: 'value=' });
+});
+
+test('buildPlanFieldValueOperations: the three text writes carry literal values — the plan\'s own logical key, its phase id as it appears on disk, and its requirement ids joined by ", "', () => {
+  const plan = planFieldFixture({ requirements: ['PLAN-01', 'PLAN-05'] });
+  const result = buildPlanFieldValueOperations(plan, ['gsdId', 'phaseId', 'requirements'], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  assert.ok(result.operations[0].args.includes('value=plan:04-03'));
+  assert.ok(result.operations[1].args.includes('value=04'));
+  assert.ok(result.operations[2].args.includes('value=PLAN-01, PLAN-05'));
+});
+
+test('buildPlanFieldValueOperations: a null wave emits five operations, omitting the Wave write, and the recorded field state still reflects the null', () => {
+  const plan = planFieldFixture({ wave: null });
+  const result = buildPlanFieldValueOperations(plan, [...PLAN_FIELD_NAMES], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  assert.deepEqual(result.blocked, []);
+  assert.equal(result.operations.length, 5);
+  assert.deepEqual(result.operations.map(fieldIdOf), ['FIELD_GSD_ID', 'FIELD_PHASE', 'FIELD_REQUIREMENTS', 'FIELD_STATUS', 'FIELD_AUTONOMOUS']);
+  const lastCapture = result.operations[4].captures[0];
+  assert.equal(JSON.parse(lastCapture.plannerFields.fieldState).wave, null);
+});
+
+test('buildPlanFieldValueOperations: an empty requirements list emits the Requirements write with an empty text value, never a skip', () => {
+  const plan = planFieldFixture({ requirements: [] });
+  const result = buildPlanFieldValueOperations(plan, ['requirements'], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  assert.equal(result.operations.length, 1);
+  assert.ok(result.operations[0].args.includes('value='));
+});
+
+test('buildPlanFieldValueOperations: an absent field:wave completion returns zero operations and one field_unresolved blocked entry naming that key', () => {
+  const plan = planFieldFixture();
+  const completions = planFieldBootstrapCompletions();
+  delete completions[PLAN_FIELD_KEY.wave];
+  const result = buildPlanFieldValueOperations(plan, [...PLAN_FIELD_NAMES], completions, 'plan:04-03', CONTEXT);
+  assert.deepEqual(result.operations, []);
+  assert.deepEqual(result.blocked, [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${PLAN_FIELD_KEY.wave} has no resolved completion` }]);
+});
+
+test('buildPlanFieldValueOperations: an absent option:autonomous:yes completion returns zero operations and one field_unresolved blocked entry naming that key', () => {
+  const plan = planFieldFixture({ autonomous: true });
+  const completions = planFieldBootstrapCompletions();
+  delete completions[BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')];
+  const result = buildPlanFieldValueOperations(plan, ['autonomous'], completions, 'plan:04-03', CONTEXT);
+  assert.deepEqual(result.operations, []);
+  assert.deepEqual(result.blocked, [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')} has no resolved completion` }]);
+});
+
+test('buildPlanFieldValueOperations: two plans sharing a Wave value each produce their own six operations against their own item logical key — no convergence onto one item', () => {
+  const planA = planFieldFixture({ id: '02-01', phaseId: '02', wave: 3 });
+  const planB = planFieldFixture({ id: '02-02', phaseId: '02', wave: 3 });
+  const resultA = buildPlanFieldValueOperations(planA, [...PLAN_FIELD_NAMES], planFieldBootstrapCompletions(), 'plan:02-01', CONTEXT);
+  const resultB = buildPlanFieldValueOperations(planB, [...PLAN_FIELD_NAMES], planFieldBootstrapCompletions(), 'plan:02-02', CONTEXT);
+  assert.equal(resultA.operations.length, 6);
+  assert.equal(resultB.operations.length, 6);
+  assert.ok(resultA.operations.every((op) => op.logicalKey === 'plan:02-01'));
+  assert.ok(resultB.operations.every((op) => op.logicalKey === 'plan:02-02'));
+});
+
+test('buildPlanFieldValueOperations: the Wave write uses the NUMBER document and carries a validated integer literal on the raw flag', () => {
+  const plan = planFieldFixture({ wave: 7 });
+  const result = buildPlanFieldValueOperations(plan, ['wave'], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  assert.equal(result.operations.length, 1);
+  assert.match(queryOf(result.operations[0]), /value:\{number:\$value\}/);
+  assert.ok(result.operations[0].args.includes('value=7'));
+  assert.equal(result.operations[0].args.filter((arg) => arg === '-F').length, 0, 'Wave still rides the raw flag despite being a validated integer');
+});
+
+test('buildPlanFieldValueOperations: no field-write operation\'s query= argv entry contains any plan title, task name, requirement id, or phase id text (T-5-01 injection control)', () => {
+  const plan = planFieldFixture({
+    title: 'INJECTED_TITLE <script>alert(1)</script>',
+    tasks: ['INJECTED_TASK'],
+    requirements: ['INJECTED-REQ'],
+    phaseId: 'INJECTED_PHASE',
+  });
+  const result = buildPlanFieldValueOperations(plan, [...PLAN_FIELD_NAMES], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  for (const op of result.operations) {
+    const query = queryOf(op);
+    assert.doesNotMatch(query, /INJECTED_TITLE/);
+    assert.doesNotMatch(query, /INJECTED_TASK/);
+    assert.doesNotMatch(query, /INJECTED-REQ/);
+    assert.doesNotMatch(query, /INJECTED_PHASE/);
+  }
+});
+
+test('buildPlanFieldValueOperations: an empty changed set produces zero operations and zero blocked entries', () => {
+  const plan = planFieldFixture();
+  const result = buildPlanFieldValueOperations(plan, [], planFieldBootstrapCompletions(), 'plan:04-03', CONTEXT);
+  assert.deepEqual(result, { operations: [], blocked: [] });
+});
+
 // ─── Phase 5 (05-01 Task 1): plan-issue reconciliation, D-13's addSubIssue ─
 
 test('planKeyFor/planIssueKeyFor: mirror phase:<id>/issue:phase:<id> namespacing, and never collide with each other for the same id', () => {
@@ -866,16 +1044,27 @@ function mapWithPhaseIssue(phaseId, phaseIssueNodeId, extraCompletions = {}) {
   };
 }
 
-test('planReconciliation: a plan with no issue:plan:<id> completion and a resolvable parent produces exactly three content-creating operations in order — REST create, addSubIssue, addProjectV2ItemById', () => {
+test('planReconciliation: a plan with no issue:plan:<id> completion, a resolvable parent, and a resolvable milestone but no plan-item field completions produces the three create operations plus one field_unresolved blocked entry — mirroring the phase precedent, zero partial field writes', () => {
   const plan = planFixture();
   const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), mapWithPhaseIssue('04', 'I_node_phase_parent'));
 
-  assert.deepEqual(result.blocked, []);
   assert.deepEqual(result.operations.map((op) => op.logicalKey), ['issue:plan:04-03', 'issue:plan:04-03', 'plan:04-03']);
   assert.deepEqual(result.operations.map((op) => op.transport), ['rest', 'graphql', 'graphql']);
+  assert.deepEqual(result.blocked, [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${PLAN_FIELD_KEY.gsdId} has no resolved completion` }]);
 });
 
-test('planReconciliation: the create operation carries the freshly computed content hash on its planner fields, matching contentHash({title, region, milestoneNumber})', () => {
+test('planReconciliation: the same plan, with plan-item field completions also seeded, produces the three create operations plus the full field-write set (five: Wave omitted since unset) and zero blocked entries', () => {
+  const plan = planFixture();
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions());
+  const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), map);
+
+  assert.deepEqual(result.blocked, []);
+  assert.equal(result.operations.length, 8, 'three create operations plus five field writes (gsdId, phaseId, requirements, status, autonomous)');
+  assert.deepEqual(result.operations.slice(0, 3).map((op) => op.logicalKey), ['issue:plan:04-03', 'issue:plan:04-03', 'plan:04-03']);
+  assert.ok(result.operations.slice(3).every((op) => op.logicalKey === 'plan:04-03'));
+});
+
+test('planReconciliation: the addSubIssue operation (the LAST write to issue:plan:<id> within the run) carries the freshly computed content hash on its planner fields, matching contentHash({title, region, milestoneNumber}) — never the preceding create\'s own capture, which recordCompletion would otherwise wipe', () => {
   const plan = planFixture();
   const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), mapWithPhaseIssue('04', 'I_node_phase_parent'));
 
@@ -884,40 +1073,65 @@ test('planReconciliation: the create operation carries the freshly computed cont
     region: renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks }),
     milestoneNumber: 3,
   });
-  assert.equal(result.operations[0].captures[0].plannerFields.contentHash, expectedHash);
+  assert.equal(result.operations[0].captures[0].plannerFields, undefined, 'the create operation itself must carry no plannerFields');
+  assert.equal(result.operations[1].kind, 'add-sub-issue');
+  assert.equal(result.operations[1].captures[0].plannerFields.contentHash, expectedHash);
 });
 
-test('planReconciliation: re-running with the same plan files on disk and the two completions present emits zero further create operations for that plan', () => {
-  const plan = planFixture();
-  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', {
-    [planIssueKeyFor('04-03')]: { nodeId: 'I_node_plan_already', issueNumber: 88 },
-    [planKeyFor('04-03')]: { nodeId: 'PVTI_item_plan_already' },
-  });
-
-  const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), map);
-
-  assert.deepEqual(result.operations, []);
-  assert.deepEqual(result.blocked, []);
-});
-
-test('planReconciliation: an unresolvable parent (no issue:phase:<phaseId> completion) emits zero operations and no blocked entry, in this tracer\'s scope', () => {
+test('planReconciliation: a plan with no completion whose parent phase carries no issue:phase:<phaseId> completion and is not created earlier in the same run emits zero operations and one parent_unresolved blocked entry naming the plan', () => {
   const plan = planFixture();
   const map = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 } } } };
 
   const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), map);
 
   assert.deepEqual(result.operations, []);
-  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.blocked, [{ reason: OPERATION_REASON.PARENT_UNRESOLVED, detail: 'plan:04-03' }]);
 });
 
-test('planReconciliation: an unresolvable milestone emits zero operations and no blocked entry for the plan, even with a resolvable parent', () => {
+test('planReconciliation: a plan whose parent phase IS created earlier in the same run emits its three operations, and the same fixture with the phase already bound-and-completed also emits them — proving both parent sources resolve', () => {
+  const newPhase = { id: '04', title: 'Phase Four', goal: 'g4', requirements: [], status: 'Todo' };
+  const plan = planFixture();
+  const desiredSameRunCreate = {
+    available: true, reason: 'ok', currentPhase: '04',
+    phases: [newPhase],
+    plans: [plan],
+    milestones: [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }],
+  };
+  const mapSameRunCreate = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 }, ...planFieldBootstrapCompletions() } } };
+
+  const sameRunResult = planReconciliation(desiredSameRunCreate, remoteForPlans(), mapSameRunCreate);
+  assert.deepEqual(sameRunResult.blocked, []);
+  const sameRunPlanOps = sameRunResult.operations.filter((op) => op.logicalKey.startsWith('issue:plan:') || op.logicalKey.startsWith('plan:'));
+  assert.deepEqual(sameRunPlanOps.slice(0, 3).map((op) => op.logicalKey), ['issue:plan:04-03', 'issue:plan:04-03', 'plan:04-03']);
+
+  // Same plan, but the phase is already bound-and-completed from a prior run
+  // instead of being created in this same run.
+  const mapPriorRun = mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions());
+  const priorRunResult = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), mapPriorRun);
+  assert.deepEqual(priorRunResult.blocked, []);
+  assert.deepEqual(priorRunResult.operations.slice(0, 3).map((op) => op.logicalKey), ['issue:plan:04-03', 'issue:plan:04-03', 'plan:04-03']);
+});
+
+test('planReconciliation: a plan with a resolvable parent but no resolvable milestone emits zero operations and one milestone_unresolved blocked entry', () => {
   const plan = planFixture();
   const map = { kind: 'valid', map: { completions: { [issueKeyFor('04')]: { nodeId: 'I_node_phase_parent', issueNumber: 40 } } } };
 
   const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), map);
 
   assert.deepEqual(result.operations, []);
-  assert.deepEqual(result.blocked, []);
+  assert.deepEqual(result.blocked, [{ reason: OPERATION_REASON.MILESTONE_UNRESOLVED, detail: 'plan:04-03' }]);
+});
+
+test('planReconciliation: one plan blocked on an unresolved parent never suppresses a sibling plan\'s operations in the same run', () => {
+  const blockedPlan = planFixture({ id: '09-01', phaseId: '09', title: '09-01 — No parent yet' });
+  const okPlan = planFixture({ id: '04-03', phaseId: '04' });
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions());
+
+  const result = planReconciliation(desiredWithPlans([blockedPlan, okPlan]), remoteForPlans(), map);
+
+  assert.deepEqual(result.blocked, [{ reason: OPERATION_REASON.PARENT_UNRESOLVED, detail: 'plan:09-01' }]);
+  const okOps = result.operations.filter((op) => op.logicalKey.includes('04-03'));
+  assert.ok(okOps.length > 0, 'the sibling plan with a resolvable parent must still emit its operations');
 });
 
 test('planReconciliation: with zero PLAN.md files on disk (an empty plans array), the reconciler emits zero plan operations, records no blocked entry attributable to plans, and does not fail the run', () => {
@@ -931,7 +1145,8 @@ test('planReconciliation: with zero PLAN.md files on disk (an empty plans array)
 test('planReconciliation: two plans whose ids sort adjacently each map to their own sub-issue — no two plans ever share one issue:plan:<id> logical key', () => {
   const planA = planFixture({ id: '04-02', title: '04-02 — Earlier plan' });
   const planB = planFixture({ id: '04-03', title: '04-03 — Later plan' });
-  const result = planReconciliation(desiredWithPlans([planB, planA]), remoteForPlans(), mapWithPhaseIssue('04', 'I_node_phase_parent'));
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', planFieldBootstrapCompletions());
+  const result = planReconciliation(desiredWithPlans([planB, planA]), remoteForPlans(), map);
 
   assert.deepEqual(result.blocked, []);
   const planIssueKeys = result.operations.filter((op) => op.logicalKey.startsWith('issue:plan:')).map((op) => op.logicalKey);
@@ -945,7 +1160,7 @@ test('planReconciliation: every phase create operation appears at a lower index 
   // The plan's own parent (phase 02) is already resolved from a prior run —
   // decoupled from `newPhase` (04) so this test isolates the phase-loop
   // vs. plan-loop structural ordering from D-13's same-run parent-resolution
-  // question, which plan 05-05 owns.
+  // question, which the two tests above cover directly.
   const plan = planFixture({ id: '02-05', phaseId: '02', title: '02-05 — Plan under an existing phase' });
   const plannedDesired = {
     available: true, reason: 'ok', currentPhase: '04',
@@ -958,7 +1173,7 @@ test('planReconciliation: every phase create operation appears at a lower index 
     map: {
       completions: {
         [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
-        ...fieldBootstrapCompletions(),
+        ...planFieldBootstrapCompletions(),
         [issueKeyFor('02')]: { nodeId: 'I_node_phase_02', issueNumber: 20 },
       },
     },
@@ -967,9 +1182,231 @@ test('planReconciliation: every phase create operation appears at a lower index 
   const result = planReconciliation(plannedDesired, remoteForPlans(), map);
 
   assert.deepEqual(result.blocked, []);
-  assert.equal(result.operations.length, 9, 'six for phase 04\'s create, three for the plan\'s create');
-  const phaseOps = result.operations.slice(0, 6);
-  const planOps = result.operations.slice(6);
-  assert.ok(phaseOps.every((op) => op.logicalKey === 'phase:04' || op.logicalKey === 'issue:phase:04'));
-  assert.deepEqual(planOps.map((op) => op.logicalKey), ['issue:plan:02-05', 'issue:plan:02-05', 'plan:02-05']);
+  const phaseCreateIndex = Math.max(...result.operations.map((op, index) => (op.kind === 'create-issue' ? index : -1)));
+  const planCreateIndex = Math.min(...result.operations.map((op, index) => (op.kind === 'create-plan-issue' ? index : Infinity)));
+  assert.ok(phaseCreateIndex >= 0, 'expected a phase create-issue operation');
+  assert.ok(planCreateIndex < Infinity, 'expected a plan create-plan-issue operation');
+  assert.ok(phaseCreateIndex < planCreateIndex, 'every phase create must appear at a lower index than every plan create');
+});
+
+// ─── Plan 05-05 Task 2: the full per-plan decision order (bound/pending-update/pending-field-change/bind/converged) ─
+
+const PLAN_STEADY_ID = '04-03';
+const PLAN_STEADY_LOGICAL_KEY = planKeyFor(PLAN_STEADY_ID);
+const PLAN_STEADY_ISSUE_KEY = planIssueKeyFor(PLAN_STEADY_ID);
+const PLAN_STEADY_MILESTONE_NUMBER = 3;
+
+function steadyPlan(overrides = {}) {
+  return {
+    id: PLAN_STEADY_ID, phaseId: '04', title: '04-03 — Splice a region', tasks: ['Task 1: First'],
+    status: 'In Progress', wave: 2, autonomous: true, requirements: ['PLAN-01'],
+    ...overrides,
+  };
+}
+
+function steadyPlanDesired(plan) {
+  return {
+    available: true, reason: 'ok', currentPhase: null,
+    phases: [], plans: [plan],
+    milestones: [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }],
+  };
+}
+
+function steadyPlanRemote() {
+  return {
+    available: true, reason: 'ok',
+    target: { owner: 'octo', repo: 'repo', repositoryNumber: 42, projectNumber: 7, projectNodeId: 'PVT_proj_node_1' },
+    items: [{ id: 'item-plan-0403', content: { id: 'ISSUE_NODE_PLAN_0403', number: 88 } }],
+    fields: [], subIssues: [], issueNodeIds: {},
+  };
+}
+
+function steadyPlanFieldValues(plan) {
+  return { gsdId: PLAN_STEADY_LOGICAL_KEY, phaseId: plan.phaseId, requirements: plan.requirements ?? [], status: plan.status ?? '', wave: plan.wave ?? null, autonomous: plan.autonomous ?? false };
+}
+
+function steadyPlanMap({ contentHashValue, fieldStateValue, milestoneNumber = PLAN_STEADY_MILESTONE_NUMBER } = {}) {
+  return {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: milestoneNumber },
+        [PLAN_STEADY_LOGICAL_KEY]: { nodeId: 'item-plan-0403', issueNumber: 88, ...(fieldStateValue !== undefined ? { fieldState: fieldStateValue } : {}) },
+        [PLAN_STEADY_ISSUE_KEY]: { nodeId: 'ISSUE_NODE_PLAN_0403', issueNumber: 88, ...(contentHashValue !== undefined ? { contentHash: contentHashValue } : {}) },
+      },
+    },
+  };
+}
+
+test('planReconciliation: a converged plan (equal content hash, equal field state) contributes exactly one no-op and zero operations', () => {
+  const plan = steadyPlan();
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: fieldState });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  assert.deepEqual(result.operations, []);
+  assert.deepEqual(result.pendingIssueUpdates, []);
+  assert.deepEqual(result.pendingFieldChanges, []);
+  assert.deepEqual(result.noops, [{ logicalKey: PLAN_STEADY_LOGICAL_KEY }]);
+  assert.deepEqual(result.blocked, []);
+});
+
+test('planReconciliation: a stored content hash that differs from the freshly computed one produces zero operations and one pending update entry carrying the full projection', () => {
+  const plan = steadyPlan();
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const fieldState = renderFieldState(steadyPlanFieldValues(plan), PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: 'stale-plan-hash', fieldStateValue: fieldState });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  assert.deepEqual(result.operations, []);
+  assert.equal(result.pendingIssueUpdates.length, 1);
+  assert.deepEqual(result.pendingIssueUpdates[0], {
+    logicalKey: PLAN_STEADY_LOGICAL_KEY,
+    issueKey: PLAN_STEADY_ISSUE_KEY,
+    issueNumber: 88,
+    issueNodeId: 'ISSUE_NODE_PLAN_0403',
+    title: plan.title,
+    region,
+    milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER,
+    milestoneKey: MILESTONE_KEY,
+    contentHash: hash,
+    completionContext: { owner: 'octo', repo: 'repo', repositoryNumber: 42 },
+  });
+});
+
+test('planReconciliation: a matching content hash but a differing field state produces a field-change entry and no pending update — the two units converge independently', () => {
+  const plan = steadyPlan();
+  const region = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+  const hash = contentHash({ title: plan.title, region, milestoneNumber: PLAN_STEADY_MILESTONE_NUMBER });
+  const staleFieldState = renderFieldState({ ...steadyPlanFieldValues(plan), wave: 999 }, PLAN_FIELD_NAMES);
+  const map = steadyPlanMap({ contentHashValue: hash, fieldStateValue: staleFieldState });
+
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  assert.deepEqual(result.pendingIssueUpdates, []);
+  assert.deepEqual(result.operations, []);
+  assert.deepEqual(result.pendingFieldChanges, [{ logicalKey: PLAN_STEADY_LOGICAL_KEY, changed: ['wave'] }]);
+});
+
+test('planReconciliation: a plan bound on the board with no issue:plan:<id> completion is a plain no-op, mirroring the phase loop\'s pre-migration case', () => {
+  const plan = steadyPlan();
+  const map = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: PLAN_STEADY_MILESTONE_NUMBER }, [PLAN_STEADY_LOGICAL_KEY]: { nodeId: 'item-plan-0403', issueNumber: 88 } } } };
+  const result = planReconciliation(steadyPlanDesired(plan), steadyPlanRemote(), map);
+  assert.deepEqual(result.noops, [{ logicalKey: PLAN_STEADY_LOGICAL_KEY }]);
+  assert.deepEqual(result.operations, []);
+  assert.deepEqual(result.blocked, []);
+});
+
+test('planReconciliation: a plan with an issue:plan:<id> completion but no board binding emits one add-to-board operation and no create', () => {
+  const plan = steadyPlan();
+  const map = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 }, [PLAN_STEADY_ISSUE_KEY]: { nodeId: 'ISSUE_NODE_PLAN_0403', issueNumber: 88 } } } };
+  const result = planReconciliation(steadyPlanDesired(plan), remoteForPlans(), map);
+  assert.equal(result.operations.length, 1);
+  assert.equal(result.operations[0].kind, 'create');
+  assert.equal(result.operations[0].logicalKey, PLAN_STEADY_LOGICAL_KEY);
+  assert.ok(result.operations[0].args.includes('contentId=ISSUE_NODE_PLAN_0403'));
+  assert.deepEqual(result.noops, []);
+  assert.deepEqual(result.blocked, []);
+});
+
+// ─── Plan 05-05 Task 3: plan orphans, reported by name, never acted on ────
+
+test('planReconciliation: a plan:<id> completion whose id is absent from the desired plan set produces one orphan entry keyed plan:<id>', () => {
+  const plan = planFixture();
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    ...planFieldBootstrapCompletions(),
+    'plan:09-09': { nodeId: 'item-orphan-plan', issueNumber: 500 },
+  });
+  const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), map);
+  assert.deepEqual(result.orphans.filter((entry) => entry.logicalKey === 'plan:09-09'), [{ logicalKey: 'plan:09-09', issueNumber: 500 }]);
+});
+
+test('planReconciliation: a deleted plan with both plan:<id> and issue:plan:<id> completions produces exactly one orphan entry carrying the issue number, whichever completion carries it', () => {
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'plan:09-09': { nodeId: 'item-orphan-plan' },
+        'issue:plan:09-09': { nodeId: 'ISSUE_orphan_plan', issueNumber: 500 },
+      },
+    },
+  };
+  const result = planReconciliation(desiredWithPlans([]), remoteForPlans(), map);
+  assert.deepEqual(result.orphans, [{ logicalKey: 'plan:09-09', issueNumber: 500 }]);
+});
+
+test('planReconciliation: a phase:<id> completion is still reported under the phase namespace, unchanged, alongside a plan orphan in the same run', () => {
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'phase:09': { nodeId: 'item-09', issueNumber: 77 },
+        'issue:phase:09': { nodeId: 'ISSUE_NODE_09', issueNumber: 77 },
+        'plan:09-01': { nodeId: 'item-plan-09-01', issueNumber: 501 },
+      },
+    },
+  };
+  const result = planReconciliation(desiredWithPlans([]), remoteForPlans(), map);
+  assert.deepEqual(result.orphans, [
+    { logicalKey: 'phase:09', issueNumber: 77 },
+    { logicalKey: 'plan:09-01', issueNumber: 501 },
+  ]);
+});
+
+test('planReconciliation: every reserved bootstrap key shape — including option:autonomous:yes — is never reported as a plan orphan', () => {
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        project: { nodeId: 'PVT_x' },
+        'project-link': { nodeId: 'PVT_link_x' },
+        'field:gsd-id': { nodeId: 'FIELD_x' },
+        'field:wave': { nodeId: 'FIELD_WAVE_x' },
+        'field:autonomous': { nodeId: 'FIELD_AUTO_x' },
+        'option:status:todo': { nodeId: 'OPT_x' },
+        'option:autonomous:yes': { nodeId: 'OPT_AUTO_YES_x' },
+        'option:autonomous:no': { nodeId: 'OPT_AUTO_NO_x' },
+        'label:gsd-plan': { nodeId: 'LABEL_x' },
+        'milestone:v1-0': { nodeId: 'MI_x' },
+      },
+    },
+  };
+  const result = planReconciliation(desiredWithPlans([]), remoteForPlans(), map);
+  assert.deepEqual(result.orphans, []);
+});
+
+test('planReconciliation: zero operations are emitted for any orphaned plan, and no operation anywhere in the plan carries an action that would close, unlink, or delete an issue', () => {
+  const plan = planFixture();
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    ...planFieldBootstrapCompletions(),
+    'plan:09-09': { nodeId: 'item-orphan-plan', issueNumber: 500 },
+    'issue:plan:09-09': { nodeId: 'ISSUE_orphan_plan', issueNumber: 500 },
+  });
+  const result = planReconciliation(desiredWithPlans([plan]), remoteForPlans(), map);
+  const orphanOps = result.operations.filter((op) => op.logicalKey.includes('09-09'));
+  assert.deepEqual(orphanOps, []);
+  const DESTRUCTIVE_ACTIONS = new Set(['close', 'unlink', 'delete']);
+  assert.ok(result.operations.every((op) => !DESTRUCTIVE_ACTIONS.has(op.action)));
+});
+
+test('planReconciliation: orphan entries (phase and plan namespaces together) are emitted in ascending logical-key order and are stable across runs', () => {
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'plan:10-02': { nodeId: 'item-plan-10-02', issueNumber: 100 },
+        'plan:02-01': { nodeId: 'item-plan-02-01', issueNumber: 20 },
+      },
+    },
+  };
+  const first = planReconciliation(desiredWithPlans([]), remoteForPlans(), map);
+  const second = planReconciliation(desiredWithPlans([]), remoteForPlans(), map);
+  assert.deepEqual(first.orphans, [{ logicalKey: 'plan:02-01', issueNumber: 20 }, { logicalKey: 'plan:10-02', issueNumber: 100 }]);
+  assert.deepEqual(first.orphans, second.orphans);
 });

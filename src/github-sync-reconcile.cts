@@ -14,7 +14,7 @@ const { OPERATION_TRANSPORT, OPERATION_ACTION, ARGV_REF_PART } = operationMod;
 const { BOOTSTRAP_LOGICAL_KEY, GSD_LABELS, STATUS_FIELD_NAME } = bootstrapPlanMod;
 const {
   renderNewIssueBody, renderPhaseRegion, contentHash, renderFieldState, parseFieldState, changedFields,
-  renderNewPlanIssueBody, renderPlanRegion,
+  renderNewPlanIssueBody, renderPlanRegion, PLAN_FIELD_NAMES,
 } = issueBodyMod;
 
 const OPERATION_KIND = Object.freeze({ CREATE: 'create', UPDATE: 'update' } as const);
@@ -48,6 +48,15 @@ const OPERATION_REASON = Object.freeze({
   // phase whose id the field/option belongs to; every other phase in the
   // same run is unaffected.
   FIELD_UNRESOLVED: 'field_unresolved',
+  // Plan 05-05 Task 2 (D-13): a plan whose parent phase issue cannot be
+  // resolved — neither from a prior run's `issue:phase:<phaseId>` completion
+  // nor from a phase-create operation emitted earlier in this same run's
+  // plan-loop-preceding phase loop. GSD never creates an unparented plan
+  // issue to attach later, which would invent an "exists but unattached"
+  // state the reconciler would then have to recognize and repair. Scoped to
+  // the one plan whose parent is unresolved; every other plan in the same
+  // run is unaffected.
+  PARENT_UNRESOLVED: 'parent_unresolved',
 } as const);
 
 /** The `gsd:phase` label's own name, as declared in `GSD_LABELS` (github-sync-bootstrap-plan.cts) — never re-spelled. */
@@ -101,6 +110,17 @@ interface DesiredPlan {
   title: string;
   tasks: string[];
   status: PlanStatus;
+  /**
+   * Plan 05-05: the six field values' remaining three plan-only inputs.
+   * Optional so pre-05-05 fixtures (which never set them) still type-check —
+   * `desiredPlanFieldValuesFor` below falls back to `null`/`false`/`[]`,
+   * mirroring `github-sync-desired.cts`'s own `DesiredPlan` defaults.
+   */
+  wave?: number | null;
+  autonomous?: boolean;
+  requirements?: string[];
+  /** Plan 05-06's own concern; declared here only so a caller passing the real `DesiredPlan` (which always carries it) still type-checks with no cast. */
+  dependsOn?: string[];
 }
 interface DesiredState { available: boolean; reason: string; phases: DesiredPhase[]; plans?: DesiredPlan[]; milestones?: DesiredMilestone[]; }
 interface RemoteItem { id?: unknown; content?: { id?: unknown; number?: unknown } | null; }
@@ -152,7 +172,8 @@ interface ReconciliationPlan {
       | typeof OPERATION_REASON.MILESTONE_UNRESOLVED
       | typeof OPERATION_REASON.UNSAFE_TARGET
       | typeof OPERATION_REASON.REGION_DAMAGED
-      | typeof OPERATION_REASON.FIELD_UNRESOLVED;
+      | typeof OPERATION_REASON.FIELD_UNRESOLVED
+      | typeof OPERATION_REASON.PARENT_UNRESOLVED;
     detail?: string;
   }>;
   uncertain: Array<{ reason: typeof OPERATION_REASON.REMOTE_UNAVAILABLE }>;
@@ -206,6 +227,27 @@ function orphanPhaseIdFromKey(key: string): string | null {
   return null;
 }
 
+/** Phase 5 (D-11 extended to plan sub-issues): mirrors `PHASE_KEY_PREFIX`/`ISSUE_PHASE_KEY_PREFIX`. */
+const PLAN_KEY_PREFIX = 'plan:';
+const ISSUE_PLAN_KEY_PREFIX = 'issue:plan:';
+
+/**
+ * Plan 05-05 Task 3: the plan id a `plan:<id>` or `issue:plan:<id>`
+ * completion key names, or `null` for any other key — including every
+ * reserved bootstrap-namespace key (`project`, `project-link`, `field:*`,
+ * `option:status:*`, `option:autonomous:*`, `label:*`, `milestone:*`) and
+ * every phase-namespace key, none of which start with either prefix.
+ * `issue:plan:` is checked first, for the identical reason
+ * `orphanPhaseIdFromKey` checks `issue:phase:` first: it is the longer, more
+ * specific prefix, and checking the shorter one first would slice off too
+ * little.
+ */
+function orphanPlanIdFromKey(key: string): string | null {
+  if (key.startsWith(ISSUE_PLAN_KEY_PREFIX)) return key.slice(ISSUE_PLAN_KEY_PREFIX.length);
+  if (key.startsWith(PLAN_KEY_PREFIX)) return key.slice(PLAN_KEY_PREFIX.length);
+  return null;
+}
+
 /** The single current (non-archived) milestone's version, or `null` when none is declared. */
 function currentMilestoneVersion(milestones: DesiredMilestone[] | undefined): string | null {
   const found = (milestones ?? []).find((milestone) => !milestone.archived);
@@ -223,6 +265,25 @@ function desiredFieldValuesFor(phase: DesiredPhase, logicalKey: string): FieldVa
 }
 
 /**
+ * Plan 05-05 Task 1: the six item field values for a plan, derived from disk
+ * truth alone — the plan-level mirror of `desiredFieldValuesFor`. `gsdId` is
+ * the plan's own logical key, never re-derived from the issue or the board.
+ * `wave`/`autonomous`/`requirements` default to `null`/`false`/`[]` for a
+ * `DesiredPlan` fixture that omits them, matching `github-sync-desired.cts`'s
+ * own total-by-construction defaults.
+ */
+function desiredPlanFieldValuesFor(plan: DesiredPlan, logicalKey: string): FieldValues {
+  return {
+    gsdId: logicalKey,
+    phaseId: plan.phaseId,
+    requirements: plan.requirements ?? [],
+    status: plan.status ?? '',
+    wave: plan.wave ?? null,
+    autonomous: plan.autonomous ?? false,
+  };
+}
+
+/**
  * Plan 04-05 Task 2: the four item fields, in the fixed declared write order
  * (D-15/D-16) — `GSD ID`, `Phase`, `Requirements`, `Status`. Mirrors
  * `github-sync-issue-body.cts`'s `FIELD_NAMES` order exactly, so a run's
@@ -231,13 +292,29 @@ function desiredFieldValuesFor(phase: DesiredPhase, logicalKey: string): FieldVa
  * plan-level facts belonging to Phase 5 (D-15) — a phase-level guess written
  * into them would have to be unwritten later.
  */
-const FIELD_VALUE_DATA_TYPE = Object.freeze({ TEXT: 'TEXT', SINGLE_SELECT: 'SINGLE_SELECT' } as const);
+const FIELD_VALUE_DATA_TYPE = Object.freeze({ TEXT: 'TEXT', SINGLE_SELECT: 'SINGLE_SELECT', NUMBER: 'NUMBER' } as const);
 type FieldValueDataType = typeof FIELD_VALUE_DATA_TYPE[keyof typeof FIELD_VALUE_DATA_TYPE];
 const FIELD_VALUE_SPEC: ReadonlyArray<{ fieldName: FieldName; declaredName: string; dataType: FieldValueDataType }> = Object.freeze([
   Object.freeze({ fieldName: 'gsdId' as const, declaredName: 'GSD ID', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
   Object.freeze({ fieldName: 'phaseId' as const, declaredName: 'Phase', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
   Object.freeze({ fieldName: 'requirements' as const, declaredName: 'Requirements', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
   Object.freeze({ fieldName: 'status' as const, declaredName: STATUS_FIELD_NAME, dataType: FIELD_VALUE_DATA_TYPE.SINGLE_SELECT }),
+]);
+
+/**
+ * Plan 05-05 Task 1: the plan item's six fields, in the fixed declared write
+ * order — `GSD ID`, `Phase`, `Requirements`, `Status`, `Wave`, `Autonomous`.
+ * Mirrors `PLAN_FIELD_NAMES`'s order exactly (`github-sync-issue-body.cts`).
+ * `Wave` and `Autonomous` never appear on `FIELD_VALUE_SPEC` above — that
+ * spec stays the phase-only four, unchanged by this plan.
+ */
+const PLAN_FIELD_VALUE_SPEC: ReadonlyArray<{ fieldName: FieldName; declaredName: string; dataType: FieldValueDataType }> = Object.freeze([
+  Object.freeze({ fieldName: 'gsdId' as const, declaredName: 'GSD ID', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
+  Object.freeze({ fieldName: 'phaseId' as const, declaredName: 'Phase', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
+  Object.freeze({ fieldName: 'requirements' as const, declaredName: 'Requirements', dataType: FIELD_VALUE_DATA_TYPE.TEXT }),
+  Object.freeze({ fieldName: 'status' as const, declaredName: STATUS_FIELD_NAME, dataType: FIELD_VALUE_DATA_TYPE.SINGLE_SELECT }),
+  Object.freeze({ fieldName: 'wave' as const, declaredName: 'Wave', dataType: FIELD_VALUE_DATA_TYPE.NUMBER }),
+  Object.freeze({ fieldName: 'autonomous' as const, declaredName: 'Autonomous', dataType: FIELD_VALUE_DATA_TYPE.SINGLE_SELECT }),
 ]);
 
 /**
@@ -248,16 +325,17 @@ const FIELD_VALUE_SPEC: ReadonlyArray<{ fieldName: FieldName; declaredName: stri
  * developer-influenced string into a query document
  * (`github-sync-operation.cts`'s SECURITY rule forbids this outright). The
  * resolution mirrors `CREATE_FIELD_TEXT_DOCUMENT`/
- * `CREATE_FIELD_SINGLE_SELECT_DOCUMENT` (github-sync-bootstrap-plan.cts) in
- * shape: one document per data type, the wrapper key (`text`/
- * `singleSelectOptionId`) a literal in the query text, only the scalar leaf
- * riding a variable. Both documents select
- * `projectV2Item { id content { ... on Issue { number } } }`, not merely
- * `id` — so re-recording the phase's project-item completion after a field
- * write preserves the issue number the add-to-project capture stored;
- * selecting only `id` would silently drop it. No `rateLimit` selection and
- * no points-budget selection, for the same live-verified reason every other
- * document in this capability declares `hasPointsBudget: false`.
+ * `CREATE_FIELD_SINGLE_SELECT_DOCUMENT`/`CREATE_FIELD_NUMBER_DOCUMENT`
+ * (github-sync-bootstrap-plan.cts) in shape: one document per data type, the
+ * wrapper key (`text`/`singleSelectOptionId`/`number`) a literal in the
+ * query text, only the scalar leaf riding a variable. All three documents
+ * select `projectV2Item { id content { ... on Issue { number } } }`, not
+ * merely `id` — so re-recording the phase's (or plan's) project-item
+ * completion after a field write preserves the issue number the
+ * add-to-project capture stored; selecting only `id` would silently drop it.
+ * No `rateLimit` selection and no points-budget selection, for the same
+ * live-verified reason every other document in this capability declares
+ * `hasPointsBudget: false`.
  */
 const UPDATE_FIELD_VALUE_TEXT_DOCUMENT =
   'mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:String!) { # github-sync:updateFieldValueText\n' +
@@ -267,10 +345,26 @@ const UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT =
   'mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:String!) { # github-sync:updateFieldValueSingleSelect\n' +
   'updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,fieldId:$fieldId,value:{singleSelectOptionId:$value}}) { ' +
   'projectV2Item { id content { ... on Issue { number } } } } }';
+/**
+ * Plan 05-05 Task 1: the NUMBER variant `Wave` needs, absent until now
+ * (05-RESEARCH.md Pitfall 4 / Open Question 3). Mirrors the two documents
+ * above exactly, except the value wrapper key is `number` and `$value` is
+ * declared `Float!` per GitHub's `ProjectV2FieldValue` input — a
+ * community-sourced fact (05-RESEARCH.md assumption A3), not yet live-tested
+ * in this codebase for the NUMBER case specifically; 05-08's live run is
+ * where it is proven, the same "flagged in place" comment discipline this
+ * module already applies to its two siblings.
+ */
+const UPDATE_FIELD_VALUE_NUMBER_DOCUMENT =
+  'mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$value:Float!) { # github-sync:updateFieldValueNumber\n' +
+  'updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,fieldId:$fieldId,value:{number:$value}}) { ' +
+  'projectV2Item { id content { ... on Issue { number } } } } }';
 
 /** Mirrors `fieldCreateDocument`'s shape (github-sync-bootstrap-plan.cts). */
 function documentForFieldType(dataType: FieldValueDataType): string {
-  return dataType === FIELD_VALUE_DATA_TYPE.SINGLE_SELECT ? UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT : UPDATE_FIELD_VALUE_TEXT_DOCUMENT;
+  if (dataType === FIELD_VALUE_DATA_TYPE.SINGLE_SELECT) return UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT;
+  if (dataType === FIELD_VALUE_DATA_TYPE.NUMBER) return UPDATE_FIELD_VALUE_NUMBER_DOCUMENT;
+  return UPDATE_FIELD_VALUE_TEXT_DOCUMENT;
 }
 
 /** The raw text value for one of the three TEXT fields (never called for `status`, whose value is an `ArgvRef`). */
@@ -381,6 +475,128 @@ function buildFieldValueOperations(
         nodeIdPath: 'updateProjectV2ItemFieldValue.projectV2Item.id',
         numberPath: 'updateProjectV2ItemFieldValue.projectV2Item.content.number',
         ...(isLast ? { plannerFields: { fieldState: renderFieldState(desiredValues) } } : {}),
+      }],
+    };
+  });
+
+  return { operations, blocked: [] };
+}
+
+/**
+ * Plan 05-05 Task 1: the plan-level mirror of `buildFieldValueOperations`,
+ * built against `PLAN_FIELD_VALUE_SPEC`'s six-member fixed order instead of
+ * `FIELD_VALUE_SPEC`'s four. Every invariant `buildFieldValueOperations`
+ * states applies here unchanged: field/option ids resolve synchronously
+ * against `completions` (never a live read), the first unresolved id stops
+ * this one plan's whole field-write sequence with a single typed
+ * `FIELD_UNRESOLVED` blocked entry, project id and item id ride `ArgvRef`s,
+ * and only the LAST emitted operation's capture carries
+ * `plannerFields.fieldState` (serialized via
+ * `renderFieldState(desiredValues, PLAN_FIELD_NAMES)` — the six-name variant,
+ * never the phase default).
+ *
+ * Two plan-only differences:
+ *
+ * - `status` resolves `option:status:<slug>` exactly as the phase builder
+ *   does; `autonomous` resolves `option:autonomous:yes` or
+ *   `option:autonomous:no` (never a literal name, never a literal id) —
+ *   `desiredValues.autonomous ? 'Yes' : 'No'` is the only place this mapping
+ *   is written.
+ * - `wave` is skipped entirely — no field-id resolution attempted, no
+ *   operation emitted — when the plan's own `wave` is `null` (the
+ *   `<accepted_limitation>` this plan documents: clearing an already-set
+ *   Wave cell needs a `clearProjectV2ItemFieldValue` mutation this capability
+ *   has never called). When non-null, `wave`'s value is the one argv entry
+ *   in this builder that is a validated positive integer rather than a
+ *   developer string; it still rides the raw `-f` flag, because
+ *   `github-sync-operation.cts`'s SECURITY rule records that new code always
+ *   does and there is no typing benefit.
+ */
+function buildPlanFieldValueOperations(
+  plan: DesiredPlan,
+  changed: FieldName[],
+  completions: Record<string, StrictMapCompletion>,
+  projectItemKey: string,
+  context: CompletionContext,
+): { operations: MutationOperation[]; blocked: Array<{ reason: typeof OPERATION_REASON.FIELD_UNRESOLVED; detail: string }> } {
+  if (changed.length === 0) return { operations: [], blocked: [] };
+
+  const changedSet = new Set(changed);
+  const desiredValues = desiredPlanFieldValuesFor(plan, projectItemKey);
+
+  const resolved: Array<{ dataType: FieldValueDataType; fieldId: string; valueEntry: ArgvEntry }> = [];
+
+  for (const spec of PLAN_FIELD_VALUE_SPEC) {
+    if (!changedSet.has(spec.fieldName)) continue;
+    // The accepted limitation: a null Wave contributes no operation at all,
+    // and no field/option id is resolved for it — a run with only Wave
+    // cleared still converges to zero operations rather than refusing on an
+    // id it will never use.
+    if (spec.fieldName === 'wave' && desiredValues.wave === null) continue;
+
+    const fieldKey = BOOTSTRAP_LOGICAL_KEY.field(spec.declaredName);
+    const fieldCompletion = completions[fieldKey];
+    if (!fieldCompletion || !isNonEmptyString(fieldCompletion.nodeId)) {
+      return { operations: [], blocked: [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${fieldKey} has no resolved completion` }] };
+    }
+
+    let valueEntry: ArgvEntry;
+    if (spec.fieldName === 'status') {
+      const statusOptionKey = BOOTSTRAP_LOGICAL_KEY.statusOption(desiredValues.status);
+      const optionCompletion = completions[statusOptionKey];
+      if (!optionCompletion || !isNonEmptyString(optionCompletion.nodeId)) {
+        return { operations: [], blocked: [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${statusOptionKey} has no resolved completion` }] };
+      }
+      valueEntry = { from: statusOptionKey, part: ARGV_REF_PART.NODE_ID, prefix: 'value=' };
+    } else if (spec.fieldName === 'autonomous') {
+      const autonomousOptionKey = BOOTSTRAP_LOGICAL_KEY.autonomousOption(desiredValues.autonomous ? 'Yes' : 'No');
+      const optionCompletion = completions[autonomousOptionKey];
+      if (!optionCompletion || !isNonEmptyString(optionCompletion.nodeId)) {
+        return { operations: [], blocked: [{ reason: OPERATION_REASON.FIELD_UNRESOLVED, detail: `${autonomousOptionKey} has no resolved completion` }] };
+      }
+      valueEntry = { from: autonomousOptionKey, part: ARGV_REF_PART.NODE_ID, prefix: 'value=' };
+    } else if (spec.fieldName === 'wave') {
+      // SECURITY: a validated positive integer, not a developer string — but
+      // still on the raw flag (github-sync-operation.cts's module header:
+      // new code puts every value on the raw flag).
+      valueEntry = `value=${desiredValues.wave}`;
+    } else {
+      valueEntry = `value=${textValueFor(spec.fieldName, desiredValues)}`;
+    }
+
+    resolved.push({ dataType: spec.dataType, fieldId: fieldCompletion.nodeId, valueEntry });
+  }
+
+  const operations: MutationOperation[] = resolved.map((entry, index) => {
+    const isLast = index === resolved.length - 1;
+    const args: ArgvEntry[] = [
+      'api', 'graphql',
+      '-f', `query=${documentForFieldType(entry.dataType)}`,
+      // SECURITY: projectId/itemId/fieldId are all opaque GitHub node ids and
+      // ride the raw -f flag, never the typed -F flag.
+      '-f', { from: BOOTSTRAP_LOGICAL_KEY.project(), part: ARGV_REF_PART.NODE_ID, prefix: 'projectId=' },
+      '-f', { from: projectItemKey, part: ARGV_REF_PART.NODE_ID, prefix: 'itemId=' },
+      '-f', `fieldId=${entry.fieldId}`,
+      '-f', entry.valueEntry,
+    ];
+
+    return {
+      kind: 'update-field-value',
+      logicalKey: projectItemKey,
+      args,
+      completionContext: context,
+      transport: OPERATION_TRANSPORT.GRAPHQL,
+      action: OPERATION_ACTION.UPDATE,
+      hasPointsBudget: false,
+      // A field write creates no content and must not consume the
+      // content-creation pacing budget the three create operations share.
+      contentCreation: false,
+      captures: [{
+        kind: 'node',
+        logicalKey: projectItemKey,
+        nodeIdPath: 'updateProjectV2ItemFieldValue.projectV2Item.id',
+        numberPath: 'updateProjectV2ItemFieldValue.projectV2Item.content.number',
+        ...(isLast ? { plannerFields: { fieldState: renderFieldState(desiredValues, PLAN_FIELD_NAMES) } } : {}),
       }],
     };
   });
@@ -528,9 +744,20 @@ const ADD_SUB_ISSUE_DOCUMENT =
  * Phase 5: the plan-issue equivalent of `buildCreateIssueOperation` — REST
  * create with the `gsd:plan` label, the rendered plan body
  * (`renderNewPlanIssueBody`), and the milestone number late-bound from the
- * milestone completion (D-15). `plannerFields` carries the freshly computed
- * content hash so an immediate re-plan sees the create's own hash already
- * equal to the recomputed one.
+ * milestone completion (D-15).
+ *
+ * Plan 05-05 (Rule 1 fix): unlike `buildCreateIssueOperation`, this create's
+ * own capture is NOT where `plannerFields.contentHash` is recorded.
+ * `buildAddSubIssueOperation` below captures under this SAME `issueKey` —
+ * GitHub's `addSubIssue` response echoes the same sub-issue identity back —
+ * and `recordCompletion` (`github-sync-map.cts`) replaces a logical key's
+ * completion wholesale rather than merging it. Recording the hash here would
+ * have it silently wiped by the addSubIssue capture that always follows in
+ * the same run, leaving `issue:plan:<id>` permanently hash-less and every
+ * future run generating a pending update it can never converge out of. The
+ * hash therefore rides the LAST operation to write this logical key, exactly
+ * the same "only the last write wins" discipline `buildFieldValueOperations`
+ * already applies to `plannerFields.fieldState`.
  */
 function buildCreatePlanIssueOperation(
   plan: DesiredPlan,
@@ -538,7 +765,6 @@ function buildCreatePlanIssueOperation(
   milestoneKey: string,
   restApiPath: string,
   context: CompletionContext,
-  plannerFields?: Record<string, string>,
 ): MutationOperation {
   const planLabel = GSD_LABELS.find((label) => label.name === PLAN_LABEL_NAME);
   const labelName = planLabel ? planLabel.name : PLAN_LABEL_NAME;
@@ -566,7 +792,6 @@ function buildCreatePlanIssueOperation(
       logicalKey: issueKey,
       nodeIdPath: 'node_id',
       numberPath: 'number',
-      ...(plannerFields === undefined ? {} : { plannerFields }),
     }],
   };
 }
@@ -582,8 +807,12 @@ function buildCreatePlanIssueOperation(
  * opaque GitHub-minted node ids GSD is echoing back, per
  * `github-sync-operation.cts`'s SECURITY rule ("new code puts node ids on
  * the raw flag").
+ *
+ * Plan 05-05: `plannerFields` (the freshly computed content hash) rides
+ * THIS operation's capture, not the preceding create's — see
+ * `buildCreatePlanIssueOperation`'s doc comment for why.
  */
-function buildAddSubIssueOperation(planId: string, phaseId: string, context: CompletionContext): MutationOperation {
+function buildAddSubIssueOperation(planId: string, phaseId: string, context: CompletionContext, plannerFields?: Record<string, string>): MutationOperation {
   const planIssueKey = planIssueKeyFor(planId);
   const phaseIssueKey = issueKeyFor(phaseId);
   const args: ArgvEntry[] = [
@@ -606,6 +835,7 @@ function buildAddSubIssueOperation(planId: string, phaseId: string, context: Com
       logicalKey: planIssueKey,
       nodeIdPath: 'addSubIssue.subIssue.id',
       numberPath: 'addSubIssue.subIssue.number',
+      ...(plannerFields === undefined ? {} : { plannerFields }),
     }],
   };
 }
@@ -801,61 +1031,149 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
     blocked.push(...fieldResult.blocked);
   }
 
-  // Plan 05-01 Task 1: a second pass over `desired.plans`, appended after the
+  // Plan 05-05 Task 2: a second pass over `desired.plans`, appended after the
   // phase loop above rather than interleaved with it — this is what makes
   // D-13's ordering constraint (phase creates before any plan create) hold
-  // structurally, not by convention. This tracer implements exactly one
-  // branch: no `issue:plan:<id>` completion, a resolvable
-  // `issue:phase:<phaseId>` completion, and a resolvable milestone
-  // completion push the three content-creating operations, in order (REST
-  // create, addSubIssue, add-to-project), carrying the freshly computed
-  // content hash on the create's planner fields. Every other case — an
-  // existing `issue:plan:<id>` completion, an unresolvable parent, or an
-  // unresolvable milestone — `continue`s with no operation and no blocked
-  // entry: plan 05-05 supplies the real convergence/bind branches and the
-  // typed PARENT_UNRESOLVED refusal this tracer deliberately leaves unbuilt
-  // (noted here, not silently assumed complete).
+  // structurally, not by convention. Mirrors the phase loop's own six-branch
+  // decision order (per-plan, ascending id), plus D-13's sixth branch a phase
+  // does not need: an unresolvable parent.
   const milestoneCompletionForPlans = milestoneKey ? completions[milestoneKey] : undefined;
   for (const plan of [...(desired.plans ?? [])].sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))) {
     const planLogicalKey = planKeyFor(plan.id);
     const planIssueKey = planIssueKeyFor(plan.id);
-    if (completions[planIssueKey]) continue;
+    const planCompletion = completions[planLogicalKey];
+    const planIssueCompletion = completions[planIssueKey];
+    const phaseIssueKeyForPlan = issueKeyFor(plan.phaseId);
 
-    const phaseIssueCompletion = completions[issueKeyFor(plan.phaseId)];
-    if (!phaseIssueCompletion || !isNonEmptyString(phaseIssueCompletion.nodeId)) continue;
+    if (bindingOnBoard(planCompletion, remote)) {
+      if (!planIssueCompletion) {
+        // A plan bound on the board with no issue:plan:<id> completion has
+        // never migrated onto the content-hash/field-state system — left a
+        // plain no-op, mirroring the phase loop's identical pre-Phase-4 case.
+        noops.push({ logicalKey: planLogicalKey });
+        continue;
+      }
+      if (!milestoneCompletionForPlans || milestoneCompletionForPlans.issueNumber === undefined) {
+        blocked.push({ reason: OPERATION_REASON.MILESTONE_UNRESOLVED, detail: planLogicalKey });
+        continue;
+      }
 
-    if (!milestoneCompletionForPlans || milestoneCompletionForPlans.issueNumber === undefined) continue;
+      const planRegion = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
+      const milestoneNumberForPlan = milestoneCompletionForPlans.issueNumber;
+      const desiredPlanHash = contentHash({ title: plan.title, region: planRegion, milestoneNumber: milestoneNumberForPlan });
+      const planContentConverged = planIssueCompletion.contentHash !== undefined && planIssueCompletion.contentHash === desiredPlanHash;
+
+      const desiredPlanFieldValues = desiredPlanFieldValuesFor(plan, planLogicalKey);
+      const previousPlanFieldState: ParsedFieldState = planCompletion.fieldState !== undefined
+        ? parseFieldState(planCompletion.fieldState, PLAN_FIELD_NAMES)
+        : { kind: 'unknown' };
+      const planChanged = changedFields(previousPlanFieldState, desiredPlanFieldValues, PLAN_FIELD_NAMES);
+
+      if (!planContentConverged) {
+        pendingIssueUpdates.push({
+          logicalKey: planLogicalKey,
+          issueKey: planIssueKey,
+          issueNumber: planIssueCompletion.issueNumber,
+          issueNodeId: planIssueCompletion.nodeId,
+          title: plan.title,
+          region: planRegion,
+          milestoneNumber: milestoneNumberForPlan,
+          milestoneKey: milestoneKey as string,
+          contentHash: desiredPlanHash,
+          completionContext: context,
+        });
+      }
+      if (planChanged.length > 0) {
+        pendingFieldChanges.push({ logicalKey: planLogicalKey, changed: planChanged });
+        const planFieldResult = buildPlanFieldValueOperations(plan, planChanged, completions, planLogicalKey, context);
+        operations.push(...planFieldResult.operations);
+        blocked.push(...planFieldResult.blocked);
+      }
+      if (planContentConverged && planChanged.length === 0) noops.push({ logicalKey: planLogicalKey });
+      continue;
+    }
+
+    if (planIssueCompletion) {
+      // GSD created this plan issue on an earlier run but it is not yet
+      // bound to the project — bind it via a literal content id, no create.
+      operations.push(operationFor(planLogicalKey, remote.target.projectNodeId, planIssueCompletion.nodeId, remote.target));
+      continue;
+    }
+
+    // No completion of any kind: this plan has never been created or bound.
+    // D-13: the parent phase issue must be resolvable either from a prior
+    // run's own completion, or from a phase-create operation this very run
+    // already pushed (checked structurally against `operations`, since the
+    // phase loop above always finishes before this loop starts).
+    const phaseIssueCompletion = completions[phaseIssueKeyForPlan];
+    const parentResolvedFromMap = Boolean(phaseIssueCompletion) && isNonEmptyString(phaseIssueCompletion.nodeId);
+    const parentCreatedThisRun = operations.some((op) => op.kind === 'create-issue' && op.logicalKey === phaseIssueKeyForPlan);
+    if (!parentResolvedFromMap && !parentCreatedThisRun) {
+      blocked.push({ reason: OPERATION_REASON.PARENT_UNRESOLVED, detail: planLogicalKey });
+      continue;
+    }
+
+    if (!milestoneCompletionForPlans || milestoneCompletionForPlans.issueNumber === undefined) {
+      blocked.push({ reason: OPERATION_REASON.MILESTONE_UNRESOLVED, detail: planLogicalKey });
+      continue;
+    }
 
     const restApiPath = phaseIssueRestPath(remote.target.owner, remote.target.repo, '/issues');
-    if (!restApiPath) continue;
+    if (!restApiPath) {
+      // Unreachable in practice — the whole-run unsafe-target gate above
+      // already rejected this owner/repo before any plan reached this point.
+      blocked.push({ reason: OPERATION_REASON.UNSAFE_TARGET, detail: planLogicalKey });
+      continue;
+    }
 
     const planRegion = renderPlanRegion({ id: plan.id, title: plan.title, status: plan.status, tasks: plan.tasks });
-    const milestoneNumber = milestoneCompletionForPlans.issueNumber;
-    const desiredPlanHash = contentHash({ title: plan.title, region: planRegion, milestoneNumber });
+    const milestoneNumberForPlan = milestoneCompletionForPlans.issueNumber;
+    const desiredPlanHash = contentHash({ title: plan.title, region: planRegion, milestoneNumber: milestoneNumberForPlan });
 
-    operations.push(buildCreatePlanIssueOperation(plan, planIssueKey, milestoneKey as string, restApiPath, context, { contentHash: desiredPlanHash }));
-    operations.push(buildAddSubIssueOperation(plan.id, plan.phaseId, context));
+    operations.push(buildCreatePlanIssueOperation(plan, planIssueKey, milestoneKey as string, restApiPath, context));
+    operations.push(buildAddSubIssueOperation(plan.id, plan.phaseId, context, { contentHash: desiredPlanHash }));
     operations.push(operationFor(planLogicalKey, remote.target.projectNodeId, { from: planIssueKey }, remote.target));
+
+    // A brand-new plan carries no previous field state at all — every field
+    // is "changed" by construction, mirroring the phase create branch's own
+    // treatment of a brand-new phase.
+    const allPlanFieldNames = changedFields({ kind: 'unknown' }, desiredPlanFieldValuesFor(plan, planLogicalKey), PLAN_FIELD_NAMES);
+    const planFieldResult = buildPlanFieldValueOperations(plan, allPlanFieldNames, completions, planLogicalKey, context);
+    operations.push(...planFieldResult.operations);
+    blocked.push(...planFieldResult.blocked);
   }
 
-  // Plan 04-04 Task 1 (D-11): a post-loop pass, scoped to the two phase
-  // namespaces by prefix — a bootstrap-namespace key (`project`, `field:*`,
-  // `option:status:*`, `label:*`, `milestone:*`) never starts with either
-  // prefix and is never reported. Both completions for the same phase id
-  // collapse into one orphan entry; whichever holds a number wins.
-  const desiredIds = new Set(desired.phases.map((phase) => phase.id));
-  const orphanNumbers = new Map<string, number | undefined>();
-  for (const [key, entry] of Object.entries(completions)) {
-    const id = orphanPhaseIdFromKey(key);
-    if (id === null || desiredIds.has(id)) continue;
-    const existing = orphanNumbers.get(id);
-    if (!orphanNumbers.has(id) || (existing === undefined && entry.issueNumber !== undefined)) {
-      orphanNumbers.set(id, entry.issueNumber);
+  // Plan 04-04 Task 1 (D-11), extended by plan 05-05 Task 3 to the two plan
+  // namespaces: one orphan rule across both issue kinds, not a second pass.
+  // A bootstrap-namespace key (`project`, `field:*`, `option:status:*`,
+  // `option:autonomous:*`, `label:*`, `milestone:*`) never starts with any of
+  // the four prefixes and is never reported. Both completions for the same
+  // id collapse into one orphan entry; whichever holds a number wins.
+  function collectOrphans(
+    desiredIds: Set<string>,
+    idFromKey: (key: string) => string | null,
+    keyPrefix: string,
+  ): ReconciliationPlan['orphans'] {
+    const orphanNumbers = new Map<string, number | undefined>();
+    for (const [key, entry] of Object.entries(completions)) {
+      const id = idFromKey(key);
+      if (id === null || desiredIds.has(id)) continue;
+      const existing = orphanNumbers.get(id);
+      if (!orphanNumbers.has(id) || (existing === undefined && entry.issueNumber !== undefined)) {
+        orphanNumbers.set(id, entry.issueNumber);
+      }
     }
+    return [...orphanNumbers.entries()]
+      .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
+      .map(([id, issueNumber]) => (issueNumber === undefined ? { logicalKey: `${keyPrefix}${id}` } : { logicalKey: `${keyPrefix}${id}`, issueNumber }));
   }
-  const orphans: ReconciliationPlan['orphans'] = [...orphanNumbers.entries()]
-    .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
-    .map(([id, issueNumber]) => (issueNumber === undefined ? { logicalKey: `phase:${id}` } : { logicalKey: `phase:${id}`, issueNumber }));
+
+  const desiredPhaseIds = new Set(desired.phases.map((phase) => phase.id));
+  const desiredPlanIds = new Set((desired.plans ?? []).map((plan) => plan.id));
+  const orphans: ReconciliationPlan['orphans'] = [
+    ...collectOrphans(desiredPhaseIds, orphanPhaseIdFromKey, PHASE_KEY_PREFIX),
+    ...collectOrphans(desiredPlanIds, orphanPlanIdFromKey, PLAN_KEY_PREFIX),
+  ];
 
   return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges };
 }
@@ -874,7 +1192,10 @@ export = {
   buildAddSubIssueOperation,
   ADD_SUB_ISSUE_DOCUMENT,
   buildFieldValueOperations,
+  buildPlanFieldValueOperations,
   documentForFieldType,
   UPDATE_FIELD_VALUE_TEXT_DOCUMENT,
   UPDATE_FIELD_VALUE_SINGLE_SELECT_DOCUMENT,
+  UPDATE_FIELD_VALUE_NUMBER_DOCUMENT,
+  PLAN_FIELD_VALUE_SPEC,
 };
