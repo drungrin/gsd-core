@@ -179,6 +179,54 @@ function readProjectTitle(cwd: string): string | null {
 }
 
 /**
+ * The closed `github_sync.view.layout` config spellings, mapped to the three
+ * live-confirmed `ProjectV2ViewLayout` GraphQL enum members
+ * (`06-VIEW-PROBE.md` Question 1; mirrors `github-sync-bootstrap-plan.cts`'s
+ * `VIEW_LAYOUT` constant). Declared as a frozen module constant so the closed
+ * set exists in exactly one place, and `readViewLayout`'s return type is this
+ * map's value union rather than `string` — an unvalidated configured value
+ * cannot typecheck into a `layout` GraphQL argv entry (T-06-01).
+ */
+const VIEW_LAYOUT_CONFIG = Object.freeze({
+  board: 'BOARD_LAYOUT',
+  table: 'TABLE_LAYOUT',
+  roadmap: 'ROADMAP_LAYOUT',
+} as const);
+type ViewLayoutConfigKey = keyof typeof VIEW_LAYOUT_CONFIG;
+type ViewLayoutEnum = typeof VIEW_LAYOUT_CONFIG[ViewLayoutConfigKey];
+
+/** The `board` config spelling; the reader derives its default through the map, never as a second literal. */
+const DEFAULT_VIEW_LAYOUT_CONFIG: ViewLayoutConfigKey = 'board';
+
+/**
+ * Returns the GraphQL `ProjectV2ViewLayout` enum member for
+ * `github_sync.view.layout`, validated against `VIEW_LAYOUT_CONFIG`'s closed
+ * set. Every rejection path — absent key, absent `github_sync`/`view` block,
+ * absent/unreadable/unparseable config, wrong type, wrong case, or a spelling
+ * outside the closed set — falls back to the `board` default and never
+ * raises: `github-sync` never gates the GSD loop (P1 D-11), so a typo in
+ * one config key must not stop an `init` run that would otherwise converge
+ * the whole board. The configured value is never trimmed, lowercased, or
+ * otherwise coerced before lookup — a trailing space or a capitalized
+ * spelling is a typo, and coercing it would teach a spelling the manifest
+ * does not declare.
+ */
+function readViewLayout(cwd: string): ViewLayoutEnum {
+  const fallback = VIEW_LAYOUT_CONFIG[DEFAULT_VIEW_LAYOUT_CONFIG];
+
+  const config = readConfigRecord(cwd);
+  if (config === null) return fallback;
+  const githubSync = config.github_sync;
+  if (!isRecord(githubSync)) return fallback;
+  const view = githubSync.view;
+  if (!isRecord(view)) return fallback;
+  const layout = view.layout;
+  if (typeof layout !== 'string') return fallback;
+  if (!Object.hasOwn(VIEW_LAYOUT_CONFIG, layout)) return fallback;
+  return VIEW_LAYOUT_CONFIG[layout as ViewLayoutConfigKey];
+}
+
+/**
  * Pins the `gh repo view --json owner,name,databaseId` response shape
  * explicitly: the owner is an OBJECT carrying a login string (not a bare
  * string), the name is a non-empty string, and the database id is a
@@ -432,8 +480,11 @@ function writeProjectNumber(cwd: string, target: { owner: string; repo: string; 
 export = {
   readPartialSyncTarget,
   readProjectTitle,
+  readViewLayout,
   resolveTarget,
   writeProjectNumber,
   CONFIG_WRITE_REASON,
   RESOLVE_TARGET_REASON,
+  VIEW_LAYOUT_CONFIG,
+  DEFAULT_VIEW_LAYOUT_CONFIG,
 };
