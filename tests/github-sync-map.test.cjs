@@ -14,7 +14,7 @@ const path = require('node:path');
 const { createTempDir, cleanup } = require('./helpers.cjs');
 
 const mapMod = require('../gsd-core/bin/lib/github-sync-map.cjs');
-const { readSyncMapStrict, recordCompletion, writeSyncMapAtomically, SYNC_MAP_FILE_NAME, ISSUE_STATE } = mapMod;
+const { readSyncMapStrict, recordCompletion, writeSyncMapAtomically, mergeCompletion, SYNC_MAP_FILE_NAME, ISSUE_STATE } = mapMod;
 
 const REPOSITORY = { owner: 'open-gsd', repo: 'gsd-core', number: 42 };
 
@@ -299,6 +299,75 @@ test('a completion recorded before this change, with no issueState member at all
 
 test('SYNC_MAP_VERSION is unchanged by the issueState widening', () => {
   assert.equal(mapMod.SYNC_MAP_VERSION, '1');
+});
+
+// ─── Plan 07-01 Task 2 (D-08/T-07-03, WINDOWS #9): mergeCompletion's
+// field-survival regression. This is the exact bug class that silently wiped
+// contentHash twice already (plans 05-05 and 05-06) — a completion written
+// through mergeCompletion at a key that already carried other optional
+// members must never lose them. ────────────────────────────────────────────
+
+test('mergeCompletion preserves contentHash/fieldState/issueState when a later capture writes only the absence members (D-08 field-survival, WINDOWS #9)', () => {
+  const first = makeCompletion({ logicalKey: 'issue:phase:01', contentHash: 'hash-a', fieldState: 'field-a', issueState: ISSUE_STATE.OPEN });
+  let map = recordCompletion(null, first);
+
+  const merged = mergeCompletion(map.completions['issue:phase:01'], {
+    logicalKey: 'issue:phase:01',
+    nodeId: first.nodeId,
+    completedAt: '2026-08-01T00:00:00.000Z',
+    owner: REPOSITORY.owner,
+    repo: REPOSITORY.repo,
+    repositoryNumber: REPOSITORY.number,
+    absenceCount: 1,
+    absenceFirstSeenAt: '2026-08-01T00:00:00.000Z',
+  });
+  map = recordCompletion(map, merged);
+
+  const recorded = map.completions['issue:phase:01'];
+  assert.equal(recorded.contentHash, 'hash-a');
+  assert.equal(recorded.fieldState, 'field-a');
+  assert.equal(recorded.issueState, ISSUE_STATE.OPEN);
+  assert.equal(recorded.absenceCount, 1);
+  assert.equal(recorded.absenceFirstSeenAt, '2026-08-01T00:00:00.000Z');
+});
+
+test('the reverse also holds: a later contentHash-only capture through mergeCompletion preserves the previously-recorded absence members', () => {
+  const first = makeCompletion({ logicalKey: 'issue:phase:02', absenceCount: 2, absenceFirstSeenAt: '2026-08-01T00:00:00.000Z' });
+  let map = recordCompletion(null, first);
+
+  const merged = mergeCompletion(map.completions['issue:phase:02'], {
+    logicalKey: 'issue:phase:02',
+    nodeId: first.nodeId,
+    completedAt: '2026-08-02T00:00:00.000Z',
+    owner: REPOSITORY.owner,
+    repo: REPOSITORY.repo,
+    repositoryNumber: REPOSITORY.number,
+    contentHash: 'hash-b',
+  });
+  map = recordCompletion(map, merged);
+
+  const recorded = map.completions['issue:phase:02'];
+  assert.equal(recorded.contentHash, 'hash-b');
+  assert.equal(recorded.absenceCount, 2);
+  assert.equal(recorded.absenceFirstSeenAt, '2026-08-01T00:00:00.000Z');
+});
+
+test('mergeCompletion clears exactly the members named in options.clear and nothing else', () => {
+  const first = makeCompletion({ logicalKey: 'project', contentHash: 'hash-c', absenceCount: 3, absenceFirstSeenAt: '2026-08-01T00:00:00.000Z' });
+  const merged = mergeCompletion(
+    first,
+    { logicalKey: 'project', nodeId: first.nodeId, completedAt: first.completedAt, owner: first.owner, repo: first.repo, repositoryNumber: first.repositoryNumber },
+    { clear: ['absenceCount', 'absenceFirstSeenAt'] },
+  );
+  assert.equal(merged.contentHash, 'hash-c');
+  assert.equal(Object.prototype.hasOwnProperty.call(merged, 'absenceCount'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(merged, 'absenceFirstSeenAt'), false);
+});
+
+test('mergeCompletion with no previous completion builds a fresh completion from next alone', () => {
+  const next = makeCompletion({ logicalKey: 'project', absenceCount: 1, absenceFirstSeenAt: '2026-08-01T00:00:00.000Z' });
+  const merged = mergeCompletion(undefined, next);
+  assert.deepEqual(merged, next);
 });
 
 test('writeSyncMapAtomically reports directory fsync uncertainty after installing a complete map', (t) => {

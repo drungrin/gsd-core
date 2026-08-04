@@ -2159,4 +2159,38 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
 
     assert.equal(process.exitCode, 0);
   });
+
+  // ─── Plan 07-01 Task 2 (T-07-04, SAFE-03): status must stay a dry run —
+  // pins the property RESEARCH.md Pitfall 6 identified as implicit: the
+  // absence counter advances only on `sync`, never on `status`. ───────────
+
+  test('T-07-04: three consecutive status invocations against a confirmed-absent project never write the sync map and never dispatch a bootstrap operation', () => {
+    const initialMap = realMap.recordCompletion(null, baseProjectCompletion());
+    let writeCalls = 0;
+    const bootstrapCalls = [];
+    const cap = captureStdout();
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        routeGithubSyncCommandRouter({
+          args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+          error: (message) => { throw new Error(message); },
+          _isCapabilityActive: () => true,
+          _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+          _desired: { readDesiredState: () => ({ available: true }) },
+          _remote: { readRemoteSnapshot: () => ({ available: true }) },
+          _map: {
+            readSyncMapStrict: () => ({ kind: 'valid', map: initialMap }),
+            writeSyncMapAtomically: () => { writeCalls += 1; },
+          },
+          _bootstrapRemote: { readBootstrapRemoteState: () => { bootstrapCalls.push(1); return { available: true, projectOutcome: 'absent' }; } },
+          _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [] }) },
+          _status: { buildStatusV1: (remote, plan) => ({ version: 1, available: remote.available, operations: plan.operations.length }), renderStatusV1: (dto) => JSON.stringify(dto) },
+        });
+      }
+    } finally { cap.restore(); }
+
+    assert.equal(writeCalls, 0, 'status must never write the sync map');
+    assert.deepEqual(bootstrapCalls, [], 'status never runs bootstrap-remote reads — it has no classification path at all');
+    assert.deepEqual(initialMap.completions.project, baseProjectCompletion(), 'the map object itself is untouched across three status invocations — sync-map file equality, not merely no error thrown');
+  });
 });
