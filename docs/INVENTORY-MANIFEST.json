@@ -379,6 +379,7 @@
       "github-sync-issue-body.cjs",
       "github-sync-issue-update.cjs",
       "github-sync-map.cjs",
+      "github-sync-marker-search.cjs",
       "github-sync-operation.cjs",
       "github-sync-reconcile.cjs",
       "github-sync-remote.cjs",
