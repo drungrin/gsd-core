@@ -835,8 +835,17 @@ function routeGithubSyncCommandRouter({
                     }
                   }
 
-                  if (strictMap?.kind === 'valid') {
-                    const completions = ((strictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string; issueNumber?: number; owner?: string; repo?: string; repositoryNumber?: number; completedAt?: string; absenceCount?: number; absenceFirstSeenAt?: string } | undefined>;
+                  if (planningStrictMap?.kind === 'valid') {
+                    // Rule 1 (bug fix, plan 07-08): read from `planningStrictMap`,
+                    // never the original `strictMap` — the D-20 pre-pass above may
+                    // already have written new issue:phase:*/issue:plan:* bindings
+                    // into `planningStrictMap` (and to disk). `strictMap` stays the
+                    // pre-D-20 snapshot forever; sourcing this block's own
+                    // `recordCompletion` base from it silently discarded those
+                    // just-written bindings on every run where both pre-passes
+                    // fired together (D-08's own wholesale-replace trap, applied to
+                    // the WRONG base map — see 07-COVERAGE-AUDIT.md).
+                    const completions = ((planningStrictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string; issueNumber?: number; owner?: string; repo?: string; repositoryNumber?: number; completedAt?: string; absenceCount?: number; absenceFirstSeenAt?: string } | undefined>;
                     const projectCompletion = completions.project;
                     if (projectCompletion) {
                       const bootstrapRemoteState = bootstrapRemote.readBootstrapRemoteState({
@@ -870,7 +879,7 @@ function routeGithubSyncCommandRouter({
                           },
                           { clear: clearKeys },
                         );
-                        const nextSyncMap = map.recordCompletion(strictMap.map, mergedCompletion);
+                        const nextSyncMap = map.recordCompletion(planningStrictMap.map, mergedCompletion);
                         map.writeSyncMapAtomically(cwd, nextSyncMap);
                         planningStrictMap = { kind: 'valid', map: nextSyncMap };
 
