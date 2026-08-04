@@ -197,3 +197,118 @@ test('classifyExistence sorts verdicts by logical key with localeCompare numeric
   const sorted = [...verdicts].sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, undefined, { numeric: true }));
   assert.deepEqual(verdicts, sorted);
 });
+
+// ─── Plan 07-04 Task 1: namespace-complete classification (D-02/D-05/D-22) ─
+//
+// Widens `classifyExistence` from the `project` key alone to every
+// participating bootstrap namespace: `field:*`, `option:status:*`,
+// `option:autonomous:*`, `label:*`, `milestone:*`. `view:*` and
+// `project-link` stay exempt (D-14) and must carry no verdict.
+
+const FULL_BOOTSTRAP_REMOTE = Object.freeze({
+  available: true,
+  projectOutcome: 'resolved',
+  fields: [
+    { id: 'PVTF_gsdid', name: 'GSD ID' },
+    { id: 'PVTF_phase', name: 'Phase' },
+    { id: 'PVTF_autonomous', name: 'Autonomous', options: [{ id: 'OPT_yes', name: 'Yes' }, { id: 'OPT_no', name: 'No' }] },
+  ],
+  statusField: { id: 'PVTF_status', name: 'Status', options: [{ id: 'OPT_todo', name: 'Todo' }, { id: 'OPT_done', name: 'Done' }] },
+  labels: [{ nodeId: 'LA_phase', name: 'gsd:phase' }],
+  milestones: [{ nodeId: 'MI_v1', name: 'v1.0' }],
+});
+
+const UNAVAILABLE_BOOTSTRAP_REMOTE = Object.freeze({
+  available: false,
+  projectOutcome: 'unavailable',
+  fields: [],
+  statusField: null,
+  labels: [],
+  milestones: [],
+});
+
+const ZERO_ENUMERATED_BOOTSTRAP_REMOTE = Object.freeze({
+  available: true,
+  projectOutcome: 'absent',
+  fields: [],
+  statusField: null,
+  labels: [],
+  milestones: [],
+});
+
+const ALL_PARTICIPATING_COMPLETIONS = Object.freeze({
+  project: { nodeId: 'PVT_1' },
+  'field:gsd-id': { nodeId: 'PVTF_gsdid' },
+  'option:status:todo': { nodeId: 'OPT_todo' },
+  'option:autonomous:yes': { nodeId: 'OPT_yes' },
+  'label:gsd-phase': { nodeId: 'LA_phase' },
+  'milestone:v1-0': { nodeId: 'MI_v1' },
+});
+
+test('classifyExistence returns present for a mapped field key whose recorded node ID appears in an available bootstrap remote read', () => {
+  const verdicts = classifyExistence({ completions: { 'field:gsd-id': { nodeId: 'PVTF_gsdid' } }, bootstrapRemote: FULL_BOOTSTRAP_REMOTE });
+  assert.deepEqual(verdicts, [{ logicalKey: 'field:gsd-id', verdict: EXISTENCE_VERDICT.PRESENT }]);
+});
+
+test('classifyExistence returns confirmed-absent for a mapped field key whose recorded node ID does not appear in an available bootstrap remote read', () => {
+  const verdicts = classifyExistence({ completions: { 'field:gsd-id': { nodeId: 'PVTF_deleted' } }, bootstrapRemote: FULL_BOOTSTRAP_REMOTE });
+  assert.deepEqual(verdicts, [{ logicalKey: 'field:gsd-id', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }]);
+});
+
+const OTHER_PARTICIPATING_NAMESPACES = [
+  { logicalKey: 'option:status:todo', presentNodeId: 'OPT_todo', absentNodeId: 'OPT_bogus' },
+  { logicalKey: 'option:autonomous:yes', presentNodeId: 'OPT_yes', absentNodeId: 'OPT_bogus' },
+  { logicalKey: 'label:gsd-phase', presentNodeId: 'LA_phase', absentNodeId: 'LA_bogus' },
+  { logicalKey: 'milestone:v1-0', presentNodeId: 'MI_v1', absentNodeId: 'MI_bogus' },
+];
+
+for (const { logicalKey, presentNodeId, absentNodeId } of OTHER_PARTICIPATING_NAMESPACES) {
+  test(`classifyExistence classifies ${logicalKey} present/confirmed-absent/unknown exactly as it does a field key`, () => {
+    const present = classifyExistence({ completions: { [logicalKey]: { nodeId: presentNodeId } }, bootstrapRemote: FULL_BOOTSTRAP_REMOTE });
+    assert.deepEqual(present, [{ logicalKey, verdict: EXISTENCE_VERDICT.PRESENT }]);
+
+    const absent = classifyExistence({ completions: { [logicalKey]: { nodeId: absentNodeId } }, bootstrapRemote: FULL_BOOTSTRAP_REMOTE });
+    assert.deepEqual(absent, [{ logicalKey, verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }]);
+
+    const unknown = classifyExistence({ completions: { [logicalKey]: { nodeId: presentNodeId } }, bootstrapRemote: UNAVAILABLE_BOOTSTRAP_REMOTE });
+    assert.deepEqual(unknown, [{ logicalKey, verdict: EXISTENCE_VERDICT.UNKNOWN }]);
+  });
+}
+
+test('classifyExistence excludes a mapped view key and a mapped project-link key from its returned collection even alongside participating keys', () => {
+  const verdicts = classifyExistence({
+    completions: {
+      project: { nodeId: 'PVT_1' },
+      'view:roadmap': { nodeId: 'PVTV_1' },
+      'project-link': { nodeId: 'PVT_1' },
+      'field:gsd-id': { nodeId: 'PVTF_gsdid' },
+    },
+    bootstrapRemote: FULL_BOOTSTRAP_REMOTE,
+  });
+  assert.deepEqual(verdicts.map((entry) => entry.logicalKey).sort(), ['field:gsd-id', 'project']);
+});
+
+test('classifyExistence over an empty completions map yields zero verdicts', () => {
+  assert.deepEqual(classifyExistence({ completions: {}, bootstrapRemote: FULL_BOOTSTRAP_REMOTE }), []);
+});
+
+test('a successful bootstrap read enumerating zero objects yields confirmed-absent for every mapped bootstrap key, never unknown', () => {
+  const verdicts = classifyExistence({ completions: ALL_PARTICIPATING_COMPLETIONS, bootstrapRemote: ZERO_ENUMERATED_BOOTSTRAP_REMOTE });
+  assert.equal(verdicts.length, 6);
+  for (const entry of verdicts) assert.equal(entry.verdict, EXISTENCE_VERDICT.CONFIRMED_ABSENT, entry.logicalKey);
+});
+
+test('an unavailable bootstrap read whose arrays are empty yields unknown for every mapped bootstrap key, never confirmed-absent', () => {
+  const verdicts = classifyExistence({ completions: ALL_PARTICIPATING_COMPLETIONS, bootstrapRemote: UNAVAILABLE_BOOTSTRAP_REMOTE });
+  assert.equal(verdicts.length, 6);
+  for (const entry of verdicts) assert.equal(entry.verdict, EXISTENCE_VERDICT.UNKNOWN, entry.logicalKey);
+  assert.ok(verdicts.every((entry) => entry.verdict !== EXISTENCE_VERDICT.CONFIRMED_ABSENT));
+});
+
+test('classifyExistence returns byte-identical, key-sorted collections across two invocations over identical mixed-namespace input', () => {
+  const first = classifyExistence({ completions: ALL_PARTICIPATING_COMPLETIONS, bootstrapRemote: FULL_BOOTSTRAP_REMOTE });
+  const second = classifyExistence({ completions: ALL_PARTICIPATING_COMPLETIONS, bootstrapRemote: FULL_BOOTSTRAP_REMOTE });
+  assert.deepEqual(first, second);
+  const sortedByKey = [...first].sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, undefined, { numeric: true }));
+  assert.deepEqual(first, sortedByKey);
+});
