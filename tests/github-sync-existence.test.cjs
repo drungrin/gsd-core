@@ -13,6 +13,8 @@ const existenceMod = require('../gsd-core/bin/lib/github-sync-existence.cjs');
 const {
   EXISTENCE_VERDICT,
   RECREATE_GRACE_MS,
+  ISSUE_LOGICAL_KEY,
+  isIssueBearingLogicalKey,
   classifyExistence,
   advanceAbsence,
   absenceGateSatisfied,
@@ -359,4 +361,149 @@ test('rebuildTriggered never fires for an unknown verdict, regardless of absence
     const completions = { [logicalKey]: { absenceCount: 5, absenceFirstSeenAt: T0 } };
     assert.equal(rebuildTriggered(verdicts, completions, T0_PLUS_60S), false, logicalKey);
   }
+});
+
+// ─── Plan 07-05 Task 1 (D-11/D-12): issue-bearing namespace classification —
+// re-resolution by (owner, repo, number) runs BEFORE any issue's absence
+// verdict. `confirmed-absent` is reachable only when BOTH the cached node ID
+// and the (owner, repo, number) triple fail against a read that succeeded.
+
+test('isIssueBearingLogicalKey admits exactly the phase-issue, plan-issue, and legacy phase project-item key forms', () => {
+  assert.equal(isIssueBearingLogicalKey(ISSUE_LOGICAL_KEY.phaseIssue('04')), true);
+  assert.equal(isIssueBearingLogicalKey(ISSUE_LOGICAL_KEY.planIssue('04-03')), true);
+  assert.equal(isIssueBearingLogicalKey(ISSUE_LOGICAL_KEY.legacyPhase('04')), true);
+  // Every reserved bootstrap-namespace key, and the plan's own (non-issue) project-item key, are excluded.
+  assert.equal(isIssueBearingLogicalKey('plan:04-03'), false);
+  assert.equal(isIssueBearingLogicalKey('project'), false);
+  assert.equal(isIssueBearingLogicalKey('project-link'), false);
+  assert.equal(isIssueBearingLogicalKey('field:gsd-id'), false);
+  assert.equal(isIssueBearingLogicalKey('option:status:todo'), false);
+  assert.equal(isIssueBearingLogicalKey('option:autonomous:yes'), false);
+  assert.equal(isIssueBearingLogicalKey('label:gsd-phase'), false);
+  assert.equal(isIssueBearingLogicalKey('milestone:v1-0'), false);
+  assert.equal(isIssueBearingLogicalKey('view:roadmap'), false);
+});
+
+/** A `remote.issueNodeIds` wrapper recording every key ever read from it — the injected spy Task 1's acceptance criteria requires. */
+function issueNodeIdsSpy(realMap) {
+  const accessed = [];
+  const proxy = new Proxy(realMap, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'string') accessed.push(prop);
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+  return { proxy, accessed };
+}
+
+test('classifyExistence returns present for an issue-bearing key whose cached node ID appears among the run\'s own project items, without consulting the by-number lookup at all', () => {
+  const spy = issueNodeIdsSpy({});
+  const remote = {
+    available: true,
+    items: [{ id: 'item-05', content: { id: 'ISSUE_NODE_900', number: 900 } }],
+    issueNodeIds: spy.proxy,
+  };
+  const verdicts = classifyExistence({
+    completions: { [ISSUE_LOGICAL_KEY.phaseIssue('05')]: { nodeId: 'ISSUE_NODE_900', issueNumber: 900 } },
+    remote,
+  });
+  assert.deepEqual(verdicts, [{ logicalKey: 'issue:phase:05', verdict: EXISTENCE_VERDICT.PRESENT }]);
+  assert.deepEqual(spy.accessed, [], 'the node-ID-resolves case must reach its verdict without touching issueNodeIds at all');
+});
+
+test('classifyExistence returns present for an issue-bearing key whose cached node ID does not appear, but whose number resolves against the same successful read', () => {
+  const remote = {
+    available: true,
+    items: [],
+    issueNodeIds: { 900: 'ISSUE_NODE_NEW' },
+  };
+  const verdicts = classifyExistence({
+    completions: { [ISSUE_LOGICAL_KEY.phaseIssue('05')]: { nodeId: 'ISSUE_NODE_OLD', issueNumber: 900 } },
+    remote,
+  });
+  assert.deepEqual(verdicts, [{ logicalKey: 'issue:phase:05', verdict: EXISTENCE_VERDICT.PRESENT }]);
+});
+
+test('classifyExistence returns confirmed-absent for an issue-bearing key where neither the cached node ID nor the number resolves against a successful read', () => {
+  const remote = { available: true, items: [], issueNodeIds: {} };
+  const verdicts = classifyExistence({
+    completions: { [ISSUE_LOGICAL_KEY.phaseIssue('05')]: { nodeId: 'ISSUE_NODE_GONE', issueNumber: 900 } },
+    remote,
+  });
+  assert.deepEqual(verdicts, [{ logicalKey: 'issue:phase:05', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }]);
+});
+
+test('classifyExistence returns unknown for an issue-bearing key whenever the remote read is unavailable, even when its (empty) arrays would otherwise resolve both lookups', () => {
+  const remote = {
+    available: false,
+    items: [{ id: 'item-05', content: { id: 'ISSUE_NODE_900', number: 900 } }],
+    issueNodeIds: { 900: 'ISSUE_NODE_900' },
+  };
+  const verdicts = classifyExistence({
+    completions: { [ISSUE_LOGICAL_KEY.phaseIssue('05')]: { nodeId: 'ISSUE_NODE_900', issueNumber: 900 } },
+    remote,
+  });
+  assert.deepEqual(verdicts, [{ logicalKey: 'issue:phase:05', verdict: EXISTENCE_VERDICT.UNKNOWN }]);
+});
+
+test('classifyExistence returns unknown for an issue-bearing key when no remote is supplied at all', () => {
+  const verdicts = classifyExistence({ completions: { [ISSUE_LOGICAL_KEY.phaseIssue('05')]: { nodeId: 'X', issueNumber: 900 } } });
+  assert.deepEqual(verdicts, [{ logicalKey: 'issue:phase:05', verdict: EXISTENCE_VERDICT.UNKNOWN }]);
+});
+
+test('classifyExistence over a map holding a project completion, a milestone completion, and an issue completion reads only the issue number through the by-number lookup', () => {
+  const spy = issueNodeIdsSpy({ 900: 'ISSUE_NODE_900' });
+  const verdicts = classifyExistence({
+    completions: {
+      project: { nodeId: 'PVT_1', issueNumber: 9 },
+      'milestone:v1-0': { nodeId: 'MI_1', issueNumber: 4 },
+      [ISSUE_LOGICAL_KEY.phaseIssue('05')]: { nodeId: 'ISSUE_NODE_STALE', issueNumber: 900 },
+    },
+    remote: { available: true, items: [], issueNodeIds: spy.proxy },
+    bootstrapRemote: { available: true, projectOutcome: 'resolved' },
+  });
+  assert.deepEqual(spy.accessed, ['900'], 'only the issue completion\'s own number may reach the by-number lookup — never the project\'s or the milestone\'s');
+  const issueVerdict = verdicts.find((entry) => entry.logicalKey === 'issue:phase:05');
+  assert.equal(issueVerdict.verdict, EXISTENCE_VERDICT.PRESENT);
+});
+
+test('classifyExistence classifies the legacy phase-prefixed key form by number exactly as the current issue-prefixed form does', () => {
+  const presentRemote = { available: true, items: [], issueNodeIds: { 77: 'ISSUE_NODE_NEW' } };
+  const presentVerdicts = classifyExistence({
+    completions: { [ISSUE_LOGICAL_KEY.legacyPhase('09')]: { nodeId: 'item-09-stale', issueNumber: 77 } },
+    remote: presentRemote,
+  });
+  assert.deepEqual(presentVerdicts, [{ logicalKey: 'phase:09', verdict: EXISTENCE_VERDICT.PRESENT }]);
+
+  const absentRemote = { available: true, items: [], issueNodeIds: {} };
+  const absentVerdicts = classifyExistence({
+    completions: { [ISSUE_LOGICAL_KEY.legacyPhase('09')]: { nodeId: 'item-09-stale', issueNumber: 77 } },
+    remote: absentRemote,
+  });
+  assert.deepEqual(absentVerdicts, [{ logicalKey: 'phase:09', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }]);
+});
+
+test('classifyExistence excludes a mapped plan project-item key (plan:<id>, not issue-bearing) from its returned collection even though it carries a number', () => {
+  const verdicts = classifyExistence({
+    completions: { 'plan:04-03': { nodeId: 'item-plan', issueNumber: 55 } },
+    remote: { available: true, items: [], issueNodeIds: {} },
+  });
+  assert.deepEqual(verdicts, []);
+});
+
+test('classifyExistence over a mix of bootstrap-namespace and issue-bearing keys classifies each through its own axis, sorted together', () => {
+  const remote = { available: true, items: [], issueNodeIds: { 900: 'ISSUE_NODE_900' } };
+  const bootstrapRemote = { available: true, projectOutcome: 'resolved', fields: [], statusField: null, labels: [], milestones: [] };
+  const verdicts = classifyExistence({
+    completions: {
+      project: { nodeId: 'PVT_1' },
+      [ISSUE_LOGICAL_KEY.phaseIssue('05')]: { nodeId: 'ISSUE_NODE_900', issueNumber: 900 },
+    },
+    remote,
+    bootstrapRemote,
+  });
+  assert.deepEqual(verdicts, [
+    { logicalKey: 'issue:phase:05', verdict: EXISTENCE_VERDICT.PRESENT },
+    { logicalKey: 'project', verdict: EXISTENCE_VERDICT.PRESENT },
+  ]);
 });
