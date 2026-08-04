@@ -308,3 +308,91 @@ describe('failure rendering specifics', () => {
     assert.equal(stageByName(report, REPORT_STAGE.PROJECT).created, 1);
   });
 });
+
+// ─── 06-07 gap closure (CR-01, Task 2): a plan's `partial` entries carry the
+// per-item view-skip diagnostic into the report, WITHOUT reclassifying the
+// run's outcome or incrementing any stage counter ─────────────────────────
+
+describe('plan.partial entries render as views-stage notes, never as blocked or a counted quantity', () => {
+  test('an options plan carrying one partial entry produces exactly one views-stage note naming the view and the field, and the outcome stays completed', () => {
+    const optionsPlan = {
+      operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [],
+      partial: [{ reason: BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED, detail: 'view "By-Wave" needs field "Wave", not found on the remote' }],
+    };
+    const optionsApply = { kind: 'completed', outcomes: [] };
+    const report = buildInitReportV1({ target: TARGET, optionsPlan, optionsApply });
+    const views = stageByName(report, REPORT_STAGE.VIEWS);
+    assert.equal(views.notes.length, 1);
+    assert.match(views.notes[0], /By-Wave/);
+    assert.match(views.notes[0], /Wave/);
+    assert.equal(report.outcome.kind, 'completed');
+  });
+
+  test('the human render of that report contains a views: line followed by the note', () => {
+    const optionsPlan = {
+      operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [],
+      partial: [{ reason: BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED, detail: 'view "By-Wave" needs field "Wave", not found on the remote' }],
+    };
+    const report = buildInitReportV1({ target: TARGET, optionsPlan, optionsApply: { kind: 'completed', outcomes: [] } });
+    const human = renderInitReportV1(report, false);
+    assert.match(human, /views: no changes\n {2}- .*By-Wave.*Wave/);
+  });
+
+  test('two partial entries produce two notes, in the order supplied', () => {
+    const optionsPlan = {
+      operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [],
+      partial: [
+        { reason: BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED, detail: 'view "Table-by-Phase" needs field "Phase", not found on the remote' },
+        { reason: BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED, detail: 'view "By-Wave" needs field "Wave", not found on the remote' },
+      ],
+    };
+    const report = buildInitReportV1({ target: TARGET, optionsPlan, optionsApply: { kind: 'completed', outcomes: [] } });
+    const views = stageByName(report, REPORT_STAGE.VIEWS);
+    assert.equal(views.notes.length, 2);
+    assert.match(views.notes[0], /Table-by-Phase/);
+    assert.match(views.notes[1], /By-Wave/);
+  });
+
+  test('an options plan with partial: [] (or the field absent entirely) produces a views stage with zero notes, byte-identical to today\'s report for that input', () => {
+    const withEmptyPartial = buildInitReportV1({
+      target: TARGET,
+      optionsPlan: { operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [], partial: [] },
+      optionsApply: { kind: 'completed', outcomes: [] },
+    });
+    const withAbsentPartial = buildInitReportV1({
+      target: TARGET,
+      optionsPlan: { operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [] },
+      optionsApply: { kind: 'completed', outcomes: [] },
+    });
+    const withNoPlanAtAll = buildInitReportV1({ target: TARGET, optionsApply: { kind: 'completed', outcomes: [] } });
+    assert.equal(stageByName(withEmptyPartial, REPORT_STAGE.VIEWS).notes.length, 0);
+    assert.deepEqual(withEmptyPartial, withAbsentPartial);
+    assert.deepEqual(withEmptyPartial, withNoPlanAtAll);
+  });
+
+  test('a partial entry never increments created/updated/adopted/unchanged/skipped on any stage', () => {
+    const optionsPlan = {
+      operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [],
+      partial: [{ reason: BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED, detail: 'view "By-Wave" needs field "Wave", not found on the remote' }],
+    };
+    const report = buildInitReportV1({ target: TARGET, optionsPlan, optionsApply: { kind: 'completed', outcomes: [] } });
+    for (const stage of report.stages) {
+      assert.equal(stage.created, 0);
+      assert.equal(stage.updated, 0);
+      assert.equal(stage.linked, 0);
+      assert.equal(stage.adopted, 0);
+      assert.equal(stage.unchanged, 0);
+      assert.equal(stage.skipped, 0);
+    }
+  });
+
+  test('a structure-pass partial entry also renders (both passes are tallied through tallyPartials)', () => {
+    const structurePlan = {
+      operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [],
+      partial: [{ reason: BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED, detail: 'view "Backlog" needs field "Status", not found on the remote' }],
+    };
+    const report = buildInitReportV1({ target: TARGET, structurePlan, structureApply: { kind: 'completed', outcomes: [] } });
+    assert.equal(stageByName(report, REPORT_STAGE.VIEWS).notes.length, 1);
+    assert.equal(report.outcome.kind, 'completed');
+  });
+});
