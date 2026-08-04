@@ -151,6 +151,7 @@ export default tseslint.config(
       'gsd-core/bin/lib/github-sync-issue-body.cjs',
       'gsd-core/bin/lib/github-sync-issue-update.cjs',
       'gsd-core/bin/lib/github-sync-map.cjs',
+      'gsd-core/bin/lib/github-sync-marker-search.cjs',
       'gsd-core/bin/lib/github-sync-reconcile.cjs',
       'gsd-core/bin/lib/github-sync-remote.cjs',
       'gsd-core/bin/lib/github-sync-status.cjs',

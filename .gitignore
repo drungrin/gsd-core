@@ -179,6 +179,7 @@ build/
 /gsd-core/bin/lib/github-sync-auth.cjs
 /gsd-core/bin/lib/github-sync-command-router.cjs
 /gsd-core/bin/lib/github-sync-existence.cjs
+/gsd-core/bin/lib/github-sync-marker-search.cjs
 /gsd-core/bin/lib/audit-command-router.cjs
 /gsd-core/bin/lib/intel-command-router.cjs
 /gsd-core/bin/lib/install-profiles.cjs
