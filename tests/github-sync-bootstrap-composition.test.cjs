@@ -43,6 +43,9 @@ const {
   GSD_LABELS,
   GSD_VIEWS,
   VIEW_LAYOUT,
+  // 06-07 gap closure: runInitRound's options-pass gate mirrors the
+  // router's run-fatal-only gate, so it needs the same classifier.
+  isRunFatalBlockedReason,
 } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const { applyMutationPlan } = require('../gsd-core/bin/lib/github-sync-apply.cjs');
 const { mutatedKeys } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
@@ -287,6 +290,40 @@ function worldExecGhAlreadyExistsAt(world, failAtCall) {
   };
 }
 
+/**
+ * 06-07 gap closure (CR-01): wraps `worldExecGh` so a named field's create
+ * call confirms successfully (a real node id reaches the response, so
+ * `applyMutationPlan` records the completion and `mutatedKeys` still
+ * triggers the options pass's re-read) WITHOUT the field ever landing in
+ * `world.fields` — modeling the read-after-write consistency gap CR-01's
+ * own gap-source names (a field created in the structure pass may not yet
+ * be visible on the options pass's re-read). Every other call falls
+ * through to the ordinary `worldExecGh` behavior.
+ */
+function worldExecGhFieldCreateLag(world, laggingFieldName) {
+  const base = worldExecGh(world);
+  let seq = 0;
+  return function execGh(args) {
+    seq += 1;
+    const queryArg = args.find((a) => typeof a === 'string' && a.startsWith('query='));
+    const isFieldCreate = queryArg && (
+      queryArg.includes('github-sync-bootstrap:createFieldText') ||
+      queryArg.includes('github-sync-bootstrap:createFieldNumber') ||
+      queryArg.includes('github-sync-bootstrap:createFieldSingleSelect')
+    );
+    if (isFieldCreate) {
+      const name = argValue(args, 'name=');
+      if (name === laggingFieldName) {
+        world.calls.push(args);
+        const dataType = queryArg.includes('createFieldNumber') ? 'NUMBER' : (queryArg.includes('createFieldSingleSelect') ? 'SINGLE_SELECT' : 'TEXT');
+        const fieldId = `PVTF_${slugify(name)}_lag_${seq}`;
+        return graphqlOk({ createProjectV2Field: { projectV2Field: { id: fieldId, name, dataType } } });
+      }
+    }
+    return base(args);
+  };
+}
+
 /** A spy execGh that throws on any call — asserts zero dispatches. */
 function forbiddenExecGh() {
   return () => { throw new Error('this run must dispatch zero execGh calls'); };
@@ -318,8 +355,20 @@ function repositoryIdentity(target) {
 }
 
 /**
+ * 06-07 gap closure: mirrors the router's own `runFatalBlockedEntries` —
+ * the subset of `entries` `isRunFatalBlockedReason` classifies run-fatal.
+ * `planBootstrap` is always the real module here (never a legacy/injected
+ * stub), so this helper skips the router's fail-closed "predicate absent"
+ * fallback rather than reproducing dead code.
+ */
+function runFatalBlockedEntries(entries) {
+  return entries.filter((entry) => isRunFatalBlockedReason(entry.reason));
+}
+
+/**
  * Mirrors the router's `init` handler algorithm exactly (structure pass ->
- * apply -> conditional re-read on `mutatedKeys` -> options pass -> apply),
+ * apply -> conditional re-read on `mutatedKeys` -> options pass -> apply,
+ * gated on the run-fatal subset of `blocked` only — 06-07 gap closure),
  * driving `planBootstrap`/`applyMutationPlan` directly so a convergence
  * failure names the stage, not the command.
  */
@@ -369,7 +418,10 @@ function runInitRound({ cwd, desired, world, target, projectTitle = null, viewLa
     { desired, remote: optionsRemote, strictMap: optionsStrictMap, target: effectiveTarget, projectTitle, viewLayout },
     { pass: BOOTSTRAP_PASS.OPTIONS },
   );
-  if (optionsPlan.blocked.length > 0 || optionsPlan.uncertain.length > 0) {
+  // 06-07 gap closure: gate on the run-fatal subset only, matching the
+  // router's own fix — a per-item view skip (VIEW_FIELD_UNRESOLVED) lives
+  // in `optionsPlan.partial`, not `blocked`, and must not abort the apply.
+  if (runFatalBlockedEntries(optionsPlan.blocked).length > 0 || optionsPlan.uncertain.length > 0) {
     return { readCount, structurePlan, structureApply, optionsPlan, optionsApply: null, reRead, mutated, effectiveProjectNumber, remoteBefore, optionsRemote };
   }
   const optionsApply = applyMutationPlan(optionsPlan, {
@@ -618,6 +670,47 @@ function adoptedBoardWorldWithLeftmostView(layout) {
   world.views = [{ id: 'PVTV_view1_h', name: 'View 1', layout, filter: null }, ...world.views];
   return world;
 }
+
+// ─── 06-07 gap closure (CR-01): the run-fatal-only gate proven end to end ──
+
+describe('CR-01 gap closure: a per-item view skip does not discard the options pass', () => {
+  test("runInitRound mirrors the router's run-fatal gate: a world missing the Wave field still dispatches the other four views and both option merges", (t) => {
+    const cwd = createTempProject('bootstrap-composition-cr01-');
+    t.after(() => cleanup(cwd));
+    const world = createWorld({ owner: 'octo', repo: 'roadmap' });
+    // Simulates the read-after-write consistency gap CR-01's own gap-source
+    // names: Wave's create call confirms (so the structure pass's apply
+    // records it and mutatedKeys triggers the options pass's re-read), but
+    // the field never becomes visible in `world.fields` — so By-Wave's
+    // visible-field resolution stays unresolved on the options pass too.
+    const execGh = worldExecGhFieldCreateLag(world, 'Wave');
+
+    const round1 = runInitRound({ cwd, desired: desiredFixture(), world, target: freshTarget(), execGh });
+
+    assert.equal(round1.structureApply.kind, 'completed');
+    assert.equal(round1.optionsPlan.blocked.length, 0, 'a per-item view skip must never land in blocked');
+    assert.ok(
+      round1.optionsPlan.partial.some((p) => p.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED && p.detail.includes('By-Wave')),
+      'By-Wave\'s unresolved Wave field must be recorded in partial',
+    );
+    assert.ok(round1.optionsApply, 'the options pass must still reach apply — this is the CR-01 gap itself');
+    assert.equal(round1.optionsApply.kind, 'completed');
+
+    const dispatchedKeys = round1.optionsPlan.operations.map((o) => o.logicalKey);
+    assert.ok(dispatchedKeys.includes(BOOTSTRAP_LOGICAL_KEY.field('Status')), 'the Status option merge must dispatch');
+    for (const name of ['Roadmap', 'Board', 'Table-by-Phase', 'Backlog']) {
+      assert.ok(dispatchedKeys.includes(BOOTSTRAP_LOGICAL_KEY.view(name)), `${name} must dispatch`);
+    }
+    assert.equal(dispatchedKeys.includes(BOOTSTRAP_LOGICAL_KEY.view('By-Wave')), false, 'By-Wave must not dispatch — its visible field is unresolved');
+
+    // The world itself proves the dispatches actually reached execGh: the
+    // four resolvable views exist on the board, By-Wave does not, and
+    // Status grew past its GitHub-seeded three options to all five GSD ones.
+    assert.deepEqual(world.views.map((v) => v.name).sort(), ['Backlog', 'Board', 'Roadmap', 'Table-by-Phase'].sort());
+    const statusField = world.fields.find((f) => f.name === 'Status');
+    assert.equal(statusField.options.length, 5);
+  });
+});
 
 describe('adopted-board case (BOOT-06 on the path where nothing is created)', () => {
   test('a first run against a fully populated remote board with an absent map dispatches zero mutations and records every reserved key', (t) => {

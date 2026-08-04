@@ -128,8 +128,17 @@ interface BootstrapPlanStageResult {
 interface BootstrapPlanModule {
   planBootstrap(input: unknown, options: { pass: string }): BootstrapPlanStageResult;
   BOOTSTRAP_PASS: { STRUCTURE: string; OPTIONS: string };
-  /** 06-07 gap closure: fail-closed run-fatal classifier — absent on a legacy/injected seam, in which case `runFatalBlockedEntries` treats every blocked entry as run-fatal (today's pre-fix behavior, never silently more permissive). */
-  isRunFatalBlockedReason?(reason: string): boolean;
+  /**
+   * 06-07 gap closure: fail-closed run-fatal classifier — absent on a
+   * legacy/injected seam, in which case `runFatalBlockedEntries` treats
+   * every blocked entry as run-fatal (today's pre-fix behavior, never
+   * silently more permissive). Declared as a function-typed property, not
+   * method shorthand — this member is read into a local binding by
+   * `runFatalBlockedEntries` below, and it never touches `this`, so the
+   * property form keeps `@typescript-eslint/unbound-method` from flagging
+   * that detachment as unsafe.
+   */
+  isRunFatalBlockedReason?: (reason: string) => boolean;
 }
 
 interface ResolvedTargetLike { owner: string; repo: string; repositoryNumber: number; projectNumber: number | null; }
