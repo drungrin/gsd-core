@@ -117,9 +117,13 @@ interface MapModule {
   recordCompletion(current: unknown, completion: unknown): unknown;
   writeSyncMapAtomically(cwd: string, map: unknown): void;
   mergeCompletion(previous: unknown, next: unknown, options?: { clear?: string[] }): unknown;
+  /** Plan 07-06 Task 1 (D-07): the single map-shrinking function this phase adds — applied only from `sync`'s map-maintenance step, never `status`. */
+  pruneCompletions(map: unknown, logicalKeys: readonly string[]): unknown;
 }
-interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
-interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
+/** Plan 07-06 Task 1/2: the optional 4th/5th params — `existenceVerdicts` (D-06's prune gate input) and `now` (D-09's elapsed-gap clock input) — both threaded from `sync` and `status` alike, per the same pure-function-of-(desired,remote,map[,verdicts,now]) discipline plan 07-04 established for the 4th param alone. */
+interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown, existenceVerdicts?: unknown, now?: string): unknown; }
+/** Plan 07-06 Task 2: the optional 3rd param — the existence/absence/rebuild-scope summary `status` (never `sync`, which has no equivalent report) hands to the DTO builder. */
+interface StatusModule { buildStatusV1(remote: unknown, plan: unknown, existenceSummary?: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
 interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string; map: unknown }): unknown; }
 /** Plan 04-04 Task 3: the read-splice-write preparation stage `sync` (never `status`) runs between planning and applying. */
 interface IssueUpdateModule {
@@ -180,6 +184,8 @@ interface ExistenceModule {
   classifyExistence(input: { completions: Record<string, unknown>; remote: unknown; bootstrapRemote: unknown }): ExistenceVerdictEntry[];
   advanceAbsence(previous: AbsenceMarkerLike | undefined, verdict: string, nowIso?: string): AbsenceMarkerLike;
   rebuildTriggered(verdicts: ExistenceVerdictEntry[], completions: Record<string, unknown>, nowIso?: string): boolean;
+  /** Plan 07-06 Task 2 (D-03): the same trigger predicate as `rebuildTriggered`, naming every key that satisfies it — `status`'s rebuild-scope preview names these as "what triggered this." */
+  rebuildTriggerKeys(verdicts: ExistenceVerdictEntry[], completions: Record<string, unknown>, nowIso?: string): string[];
   EXISTENCE_VERDICT: { PRESENT: string; CONFIRMED_ABSENT: string; UNKNOWN: string };
 }
 
@@ -416,6 +422,18 @@ function routeGithubSyncCommandRouter({
     projectNumber: number | null;
     projectTitle: string | null;
     viewLayout: string;
+    /**
+     * Plan 07-06 Task 2 (D-03): when `true`, plans both passes exactly as
+     * `init`/`sync` do but withholds apply authority entirely — no
+     * `apply.applyMutationPlan` call, so zero `execGh` invocations, matching
+     * `status`'s standing write-nothing guarantee (SAFE-03/T-07-18). The
+     * options pass is then planned against the SAME (unmutated) remote/map
+     * the structure pass started from — a faithful preview of what CAN be
+     * known right now, not a simulation of server-assigned ids no
+     * undispatched preview can actually predict. Defaults to `false`
+     * (`init` and `sync`'s real, dispatching runs are unaffected).
+     */
+    dryRun?: boolean;
   }
   interface BootstrapTwoPassResult {
     reportTarget: { owner: string; repo: string; projectNumber: number | null };
@@ -430,7 +448,7 @@ function routeGithubSyncCommandRouter({
   }
 
   function runBootstrapTwoPass(options: BootstrapTwoPassOptions): BootstrapTwoPassResult {
-    const { cwd: runCwd, desiredState, remoteSnapshot, strictMap, baseTarget, projectNumber, projectTitle, viewLayout } = options;
+    const { cwd: runCwd, desiredState, remoteSnapshot, strictMap, baseTarget, projectNumber, projectTitle, viewLayout, dryRun } = options;
     const reportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber };
 
     const structurePlan = bootstrapPlan.planBootstrap(
@@ -445,10 +463,18 @@ function routeGithubSyncCommandRouter({
       };
     }
 
-    const structureApply = apply.applyMutationPlan(structurePlan, {
-      cwd: runCwd,
-      map: strictMap.kind === 'valid' ? strictMap.map : null,
-    }) as ApplyResultLike;
+    // Plan 07-06 Task 2 (D-03): a dry run never reaches `apply` — no
+    // `execGh` invocation, matching every OTHER path status already stays a
+    // dry run on. The synthesized "completed, zero outcomes" result carries
+    // the map FORWARD UNCHANGED, so `mutated` below is correctly empty and
+    // the options pass plans against the exact same (unmutated) remote/map
+    // the structure pass was itself planned against.
+    const structureApply: ApplyResultLike = dryRun
+      ? { kind: 'completed', outcomes: [], map: strictMap.kind === 'valid' ? strictMap.map ?? null : null }
+      : apply.applyMutationPlan(structurePlan, {
+        cwd: runCwd,
+        map: strictMap.kind === 'valid' ? strictMap.map : null,
+      }) as ApplyResultLike;
     if (structureApply.kind !== 'completed') {
       return {
         reportTarget, structurePlan, structureApply,
@@ -465,7 +491,7 @@ function routeGithubSyncCommandRouter({
       : projectNumber;
     const effectiveReportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: effectiveProjectNumber };
 
-    const optionsRemote = (projectMutated || fieldMutated)
+    const optionsRemote = (!dryRun && (projectMutated || fieldMutated))
       ? bootstrapRemote.readBootstrapRemoteState({ cwd: runCwd, owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: effectiveProjectNumber })
       : remoteSnapshot;
 
@@ -483,7 +509,9 @@ function routeGithubSyncCommandRouter({
       };
     }
 
-    const optionsApply = apply.applyMutationPlan(optionsPlan, { cwd: runCwd, map: structureApply.map ?? null }) as ApplyResultLike;
+    const optionsApply: ApplyResultLike = dryRun
+      ? { kind: 'completed', outcomes: [], map: structureApply.map ?? null }
+      : apply.applyMutationPlan(optionsPlan, { cwd: runCwd, map: structureApply.map ?? null }) as ApplyResultLike;
 
     return {
       reportTarget, structurePlan, structureApply, optionsPlan, optionsApply, effectiveReportTarget,
@@ -534,9 +562,77 @@ function routeGithubSyncCommandRouter({
             emitStatus(dto, raw, status);
             return;
           }
-          const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber });
-          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) });
-          dto = status.buildStatusV1(remoteSnapshot, reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap));
+          const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber }) as {
+            kind?: unknown; map?: { completions?: Record<string, unknown> };
+          };
+          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) }) as { available?: unknown };
+
+          const nowIso = clock.nowIso();
+          let existenceVerdicts: ExistenceVerdictEntry[] = [];
+          let absences: Array<{ logicalKey: string; count: number; firstSeenAt: string }> = [];
+          let rebuildScope: { triggered: boolean; triggeredKeys: string[]; structureOperations: string[]; optionsOperations: string[] } = {
+            triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [],
+          };
+
+          // D-03 (plan 07-06 Task 2): `status` runs the SAME existence
+          // classification and the SAME two `planBootstrap` passes `sync`
+          // runs — the identical `runBootstrapTwoPass` helper, called with
+          // `dryRun: true` so apply and map-write authority are both
+          // withheld — never a second copy of the sequence with the writes
+          // deleted. Gated on a recorded `project` completion, mirroring
+          // `sync`'s own gate exactly (T-07-04's original discipline
+          // extended, not replaced): a map that has never seen a bootstrap
+          // run has no bootstrap surface to classify or preview, and every
+          // pre-07-06 status fixture that omits a `project` completion
+          // takes this same "nothing new happens" path unchanged.
+          //
+          // The whole block is defensively contained (D-11: never gates) —
+          // a fault anywhere in the preview degrades to the empty preview
+          // already assigned above, never to an unavailable status; the
+          // reconciliation-level report below still runs either way.
+          try {
+            if (remoteSnapshot?.available === true && strictMap?.kind === 'valid') {
+              const completions = (strictMap.map?.completions ?? {}) as Record<string, { nodeId?: string; issueNumber?: number; absenceCount?: number; absenceFirstSeenAt?: string } | undefined>;
+              if (completions.project) {
+                const bootstrapRemoteState = bootstrapRemote.readBootstrapRemoteState({
+                  cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, projectNumber: resolvedTarget.target.projectNumber,
+                });
+                existenceVerdicts = existence.classifyExistence({ completions, remote: remoteSnapshot, bootstrapRemote: bootstrapRemoteState });
+                absences = Object.entries(completions)
+                  .filter((entry): entry is [string, { absenceCount: number; absenceFirstSeenAt: string }] =>
+                    typeof entry[1]?.absenceCount === 'number' && typeof entry[1]?.absenceFirstSeenAt === 'string')
+                  .map(([logicalKey, completion]) => ({ logicalKey, count: completion.absenceCount, firstSeenAt: completion.absenceFirstSeenAt }));
+
+                const triggerKeys = existence.rebuildTriggerKeys(existenceVerdicts, completions, nowIso);
+                if (triggerKeys.length > 0) {
+                  const projectTitle = bootstrapConfig.readProjectTitle(cwd);
+                  const viewLayout = bootstrapConfig.readViewLayout(cwd);
+                  const preview = runBootstrapTwoPass({
+                    cwd,
+                    desiredState,
+                    remoteSnapshot: bootstrapRemoteState,
+                    strictMap: strictMap as { kind: string; map?: unknown },
+                    baseTarget: { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber },
+                    projectNumber: resolvedTarget.target.projectNumber,
+                    projectTitle,
+                    viewLayout,
+                    dryRun: true,
+                  });
+                  rebuildScope = {
+                    triggered: true,
+                    triggeredKeys: triggerKeys,
+                    structureOperations: (preview.structurePlan.operations ?? []).map((op) => (op as { logicalKey: string }).logicalKey),
+                    optionsOperations: (preview.optionsPlan?.operations ?? []).map((op) => (op as { logicalKey: string }).logicalKey),
+                  };
+                }
+              }
+            }
+          } catch {
+            // Never gates (D-11) — leave the empty preview already assigned.
+          }
+
+          const plan = reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap, existenceVerdicts, nowIso);
+          dto = status.buildStatusV1(remoteSnapshot, plan, { verdicts: existenceVerdicts, absences, rebuildScope });
         } catch {
           dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
         }
@@ -584,6 +680,13 @@ function routeGithubSyncCommandRouter({
                   // invocation.
                   let planningStrictMap: { kind?: unknown; map?: unknown } = strictMap;
                   let planningRemoteSnapshot: unknown = remoteSnapshot;
+                  // Plan 07-06 Task 1 (D-07): hoisted so both the rebuild
+                  // gate below AND the prune gate that follows
+                  // `planReconciliation` share one instant and one
+                  // classification — never two clock reads or two
+                  // classification passes disagreeing about "now."
+                  const nowIso = clock.nowIso();
+                  let existenceVerdicts: ExistenceVerdictEntry[] = [];
                   if (strictMap?.kind === 'valid') {
                     const completions = ((strictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string; issueNumber?: number; owner?: string; repo?: string; repositoryNumber?: number; completedAt?: string; absenceCount?: number; absenceFirstSeenAt?: string } | undefined>;
                     const projectCompletion = completions.project;
@@ -595,9 +698,9 @@ function routeGithubSyncCommandRouter({
                         projectNumber: resolvedTarget.target.projectNumber,
                       });
                       const verdicts = existence.classifyExistence({ completions, remote: remoteSnapshot, bootstrapRemote: bootstrapRemoteState });
+                      existenceVerdicts = verdicts;
                       const projectVerdict = verdicts.find((entry) => entry.logicalKey === 'project');
                       if (projectVerdict) {
-                        const nowIso = clock.nowIso();
                         const advancedMarker = existence.advanceAbsence(
                           { absenceCount: projectCompletion.absenceCount, absenceFirstSeenAt: projectCompletion.absenceFirstSeenAt },
                           projectVerdict.verdict,
@@ -661,9 +764,10 @@ function routeGithubSyncCommandRouter({
                   // first run on an established repository takes minutes,
                   // and that killing it is free — every mutation is
                   // checkpointed, so a resumed run picks up where it left off.
-                  const plan = reconcile.planReconciliation(desiredState, planningRemoteSnapshot, planningStrictMap) as {
+                  const plan = reconcile.planReconciliation(desiredState, planningRemoteSnapshot, planningStrictMap, existenceVerdicts, nowIso) as {
                     operations: unknown[]; pendingIssueUpdates?: unknown[]; subIssueCeilingWarnings?: unknown[];
                     adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
+                    prune?: Array<{ logicalKey: string }>;
                   };
 
                   // D-13 (plan 07-05 Task 2): an issue whose (owner, repo,
@@ -694,6 +798,22 @@ function routeGithubSyncCommandRouter({
                     planningStrictMap = { kind: 'valid', map: adoptedMap };
                   }
 
+                  // Plan 07-06 Task 1 (D-07): the single map-shrinking step
+                  // anywhere in this phase — `plan.prune` already named the
+                  // keys (the one cell of the desired-vs-remote table where
+                  // removal destroys no information); this step is what
+                  // actually applies it, riding the exact same
+                  // read-then-write pattern the adoption step above uses.
+                  // Runs only from `sync`, never `status` (T-07-17): a
+                  // status run over prunable inputs reports `plan.prune` but
+                  // never reaches this branch, so the map file it read stays
+                  // byte-identical.
+                  if (Array.isArray(plan.prune) && plan.prune.length > 0 && planningStrictMap?.kind === 'valid') {
+                    const prunedMap = map.pruneCompletions(planningStrictMap.map, plan.prune.map((entry) => entry.logicalKey));
+                    map.writeSyncMapAtomically(cwd, prunedMap);
+                    planningStrictMap = { kind: 'valid', map: prunedMap };
+                  }
+
                   // Plan 04-04 Task 3: the read-splice-write preparation
                   // stage runs here, between planning and applying — never
                   // from `status`, which stays a dry run (SYNC-07/P2 D-13).
@@ -713,7 +833,13 @@ function routeGithubSyncCommandRouter({
                   // developer running `sync` sees them without also running
                   // `status` — never a new authority, sync still exits 0
                   // with warnings present (the exit-0-never-gates posture).
-                  result = { ...applyResult, issueUpdateReports: prepared.reports, subIssueCeilingWarnings: plan.subIssueCeilingWarnings ?? [], adoptions: plan.adoptions ?? [] };
+                  result = {
+                    ...applyResult,
+                    issueUpdateReports: prepared.reports,
+                    subIssueCeilingWarnings: plan.subIssueCeilingWarnings ?? [],
+                    adoptions: plan.adoptions ?? [],
+                    prune: plan.prune ?? [],
+                  };
                 }
               }
             }

@@ -56,7 +56,12 @@ test('enabled status composes only read seams and never receives a write adapter
   } finally {
     mock.restoreAll();
   }
-  assert.deepEqual(calls, [['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101] }], ['reconcile', 3], ['status', true, 0]]);
+  // Plan 07-06 Task 1/2: planReconciliation now always receives its 4th
+  // (existenceVerdicts) and 5th (now) params too — 5 args, not 3. This
+  // fixture's map carries no `project` completion, so the D-03 rebuild-scope
+  // preview block is skipped entirely (no `_bootstrapRemote` seam is even
+  // injected here) and existenceVerdicts stays `[]`.
+  assert.deepEqual(calls, [['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101] }], ['reconcile', 5], ['status', true, 0]]);
   assert.deepEqual(outputChunks, ['{"version":1,"available":true}']);
 });
 
@@ -111,8 +116,13 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
       _apply: { applyMutationPlan(plan, options) { calls.push(['apply', plan.operations[0].logicalKey, options.map]); return { kind: 'completed' }; } },
     });
   } finally { mock.restoreAll(); }
-  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101, 303] }], ['reconcile', 3], ['issueUpdate', 0, '/fixture'], ['apply', 'phase:01', { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } }]]);
-  assert.deepEqual(chunks, ['{\n  "kind": "completed",\n  "issueUpdateReports": [],\n  "subIssueCeilingWarnings": [],\n  "adoptions": []\n}']);
+  // Plan 07-06 Task 1/2: planReconciliation now always receives its 4th/5th
+  // params too (5 args, not 3) — this fixture's map carries no `project`
+  // completion, so existenceVerdicts stays `[]` (no `_bootstrapRemote` seam
+  // is injected here).
+  assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101, 303] }], ['reconcile', 5], ['issueUpdate', 0, '/fixture'], ['apply', 'phase:01', { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } }]]);
+  // Plan 07-06 Task 1: `result.prune` is now always present alongside `adoptions`.
+  assert.deepEqual(chunks, ['{\n  "kind": "completed",\n  "issueUpdateReports": [],\n  "subIssueCeilingWarnings": [],\n  "adoptions": [],\n  "prune": []\n}']);
 });
 
 // ─── Bug fix: collectIssueNodeIdHints must not feed bootstrap completions
@@ -2160,11 +2170,18 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
     assert.equal(process.exitCode, 0);
   });
 
-  // ─── Plan 07-01 Task 2 (T-07-04, SAFE-03): status must stay a dry run —
-  // pins the property RESEARCH.md Pitfall 6 identified as implicit: the
-  // absence counter advances only on `sync`, never on `status`. ───────────
+  // ─── Plan 07-01 Task 2 (T-07-04, SAFE-03), extended by plan 07-06 Task 2
+  // (D-03): status must stay a dry run — pins the property RESEARCH.md
+  // Pitfall 6 identified as implicit: the absence counter advances only on
+  // `sync`, never on `status`. D-03 now has `status` READ the bootstrap
+  // remote for its own rebuild-scope preview (a real, expected read this
+  // plan adds), but the absence marker it would advance to is never
+  // persisted, so the two-absence gate can never fire from `status` alone —
+  // three consecutive first-absence classifications never reach the second
+  // planBootstrap pass, so no `_bootstrapPlan`/`_bootstrapConfig` seam is
+  // needed here. ───────────────────────────────────────────────────────────
 
-  test('T-07-04: three consecutive status invocations against a confirmed-absent project never write the sync map and never dispatch a bootstrap operation', () => {
+  test('T-07-04/D-03: three consecutive status invocations against a confirmed-absent project never write the sync map, never advance the persisted absence marker, and never dispatch a bootstrap mutation', () => {
     const initialMap = realMap.recordCompletion(null, baseProjectCompletion());
     let writeCalls = 0;
     const bootstrapCalls = [];
@@ -2190,7 +2207,11 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
     } finally { cap.restore(); }
 
     assert.equal(writeCalls, 0, 'status must never write the sync map');
-    assert.deepEqual(bootstrapCalls, [], 'status never runs bootstrap-remote reads — it has no classification path at all');
+    // D-03 (plan 07-06): status now reads the bootstrap remote once per
+    // invocation for its own rebuild-scope preview — the property that
+    // changed is that the READ now happens; the guarantee that survives is
+    // that nothing is ever WRITTEN from it.
+    assert.equal(bootstrapCalls.length, 3, 'status now reads bootstrap remote state once per invocation for the D-03 rebuild-scope preview');
     assert.deepEqual(initialMap.completions.project, baseProjectCompletion(), 'the map object itself is untouched across three status invocations — sync-map file equality, not merely no error thrown');
   });
 
@@ -2399,5 +2420,279 @@ describe('github-sync router: plan 07-05 Task 2 — D-13 node-ID adoption persis
     assert.equal(reconcileCallCount, 1, 'status computes the identical reconciliation plan (and therefore the same adoptions array)');
     assert.deepEqual(initialMap.completions['issue:phase:05'], issuePhaseCompletion(), 'the map object itself is untouched — sync-map file equality, not merely no error thrown');
     assert.equal(process.exitCode, 0);
+  });
+});
+
+// ─── Plan 07-06 (D-07/D-03): the prune write and status's rebuild-scope
+// preview. Uses the REAL github-sync-map module, matching every other
+// describe block in this phase. ────────────────────────────────────────────
+
+describe('github-sync router: plan 07-06 — prune write and status rebuild-scope preview', () => {
+  const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+  const T0 = '2026-08-01T00:00:00.000Z';
+  const T0_PLUS_60S = '2026-08-01T00:01:00.000Z';
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  function orphanCompletion(overrides = {}) {
+    return {
+      logicalKey: 'plan:09-09',
+      nodeId: 'ITEM_ORPHAN',
+      issueNumber: 500,
+      completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner,
+      repo: TARGET.repo,
+      repositoryNumber: TARGET.repositoryNumber,
+      absenceCount: 1,
+      absenceFirstSeenAt: T0,
+      ...overrides,
+    };
+  }
+
+  test('Task 1 (D-07): sync applies the prune the plan named — the map file loses exactly that key', () => {
+    const seedMap = realMap.recordCompletion(null, orphanCompletion());
+    let stored = seedMap;
+    const writeCalls = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'valid', map: stored }),
+          recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+          mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+          pruneCompletions: (map, keys) => realMap.pruneCompletions(map, keys),
+          writeSyncMapAtomically: (cwd, map) => { writeCalls.push(map); stored = map; },
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _reconcile: {
+          planReconciliation: () => ({
+            operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [],
+            prune: [{ logicalKey: 'plan:09-09' }],
+          }),
+        },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan, options) => ({ kind: 'completed', outcomes: [], map: options.map }) },
+      });
+    } finally { cap.restore(); }
+
+    assert.ok(writeCalls.length >= 1, 'the prune write happened');
+    assert.equal(Object.prototype.hasOwnProperty.call(stored.completions, 'plan:09-09'), false, 'the pruned key is gone from the map sync ultimately writes');
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Task 1 (D-07): a status run over the identical prunable input reports the prune but leaves the map file byte-identical', () => {
+    const seedMap = realMap.recordCompletion(null, orphanCompletion());
+    const cap = captureStdout();
+    let dto;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'valid', map: seedMap }),
+          writeSyncMapAtomically: () => { throw new Error('status must never persist a map'); },
+          pruneCompletions: () => { throw new Error('status must never prune a map'); },
+          recordCompletion: () => { throw new Error('status must never record a completion'); },
+        },
+        _reconcile: {
+          planReconciliation: () => ({
+            operations: [], noops: [], blocked: [], uncertain: [],
+            prune: [{ logicalKey: 'plan:09-09' }],
+          }),
+        },
+        _status: { buildStatusV1: (remote, plan, existenceSummary) => { dto = { available: remote.available, prune: plan.prune ?? [], existenceSummary }; return dto; }, renderStatusV1: (d) => JSON.stringify(d) },
+      });
+    } finally { cap.restore(); }
+
+    assert.deepEqual(dto.prune, [{ logicalKey: 'plan:09-09' }], 'status still reports the prune');
+    assert.deepEqual(seedMap.completions['plan:09-09'], orphanCompletion(), 'the map file stays byte-identical — status never applies what it reports');
+    assert.equal(process.exitCode, 0);
+  });
+
+  // ─── Task 2 (D-03): status runs the same existence classification and the
+  // same two planBootstrap passes sync runs, with apply/map-write authority
+  // withheld. ─────────────────────────────────────────────────────────────
+
+  function rebuildTriggeringMapSeam() {
+    const projectCompletion = {
+      logicalKey: 'project',
+      nodeId: 'PVT_OLD',
+      completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner,
+      repo: TARGET.repo,
+      repositoryNumber: TARGET.repositoryNumber,
+      absenceCount: 1,
+      absenceFirstSeenAt: T0,
+    };
+    return realMap.recordCompletion(null, projectCompletion);
+  }
+
+  function bootstrapPlanStub(bootstrapPlanCalls) {
+    return {
+      BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+      planBootstrap: (_input, options) => {
+        bootstrapPlanCalls.push(options.pass);
+        if (options.pass === 'structure') {
+          return { operations: [{ logicalKey: 'project', kind: 'create' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+        }
+        return { operations: [{ logicalKey: 'option:status:todo', kind: 'update-field-value' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+      },
+    };
+  }
+
+  test('Task 2 (D-03): status against a rebuild-triggering fixture reports the SAME structure-pass and options-pass operations sync would dispatch, and dispatches zero mutations itself', () => {
+    const seedMap = rebuildTriggeringMapSeam();
+    const statusBootstrapPlanCalls = [];
+    const syncBootstrapPlanCalls = [];
+    const syncApplyCalls = [];
+    const cap = captureStdout();
+    let statusDto;
+    let syncResult;
+    try {
+      // The status run first — proves it never reaches `_apply` at all
+      // (the mock throws if called).
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _map: { readSyncMapStrict: () => ({ kind: 'valid', map: seedMap }), writeSyncMapAtomically: () => { throw new Error('status must never persist a map'); } },
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
+        _bootstrapPlan: bootstrapPlanStub(statusBootstrapPlanCalls),
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [] }) },
+        _apply: { applyMutationPlan: () => { throw new Error('status must never dispatch a mutation — zero gh spawn invocations'); } },
+        _status: {
+          buildStatusV1: (remote, plan, existenceSummary) => { statusDto = { available: remote.available, rebuildScope: existenceSummary?.rebuildScope }; return statusDto; },
+          renderStatusV1: (dto) => JSON.stringify(dto),
+        },
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+
+      // The equivalent sync run, over the identical seed and bootstrap
+      // fixtures — its own real apply IS invoked (this is `sync`, not
+      // `status`), and its dispatched operations are what status's preview
+      // is compared against.
+      let stored = seedMap;
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'valid', map: stored }),
+          recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+          mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+          writeSyncMapAtomically: (cwd, map) => { stored = map; },
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
+        _bootstrapPlan: bootstrapPlanStub(syncBootstrapPlanCalls),
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: {
+          applyMutationPlan: (plan) => {
+            syncApplyCalls.push((plan.operations[0] || {}).logicalKey ?? null);
+            return { kind: 'completed', outcomes: [] };
+          },
+        },
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+      syncResult = syncApplyCalls;
+    } finally { cap.restore(); }
+
+    assert.deepEqual(statusBootstrapPlanCalls, ['structure', 'options'], 'status ran both planBootstrap passes');
+    assert.deepEqual(syncBootstrapPlanCalls, ['structure', 'options'], 'sync ran the identical two passes over the identical fixture');
+    // The third `apply` call is `sync`'s own reconciliation apply (an empty
+    // operations plan, from this fixture's `_reconcile` mock) — unrelated to
+    // the bootstrap rebuild this test compares.
+    assert.deepEqual(syncResult, ['project', 'option:status:todo', null], 'sync actually dispatched both bootstrap operations, then its own (empty) reconciliation apply');
+    assert.deepEqual(statusDto.rebuildScope, {
+      triggered: true,
+      triggeredKeys: ['project'],
+      structureOperations: ['project'],
+      optionsOperations: ['option:status:todo'],
+    }, "status's preview names the identical operations sync dispatched, without dispatching anything itself");
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Task 3: status --raw against a rebuild-triggering fixture emits a parseable JSON document containing the rebuild-scope keys', () => {
+    const seedMap = rebuildTriggeringMapSeam();
+    const bootstrapPlanCalls = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _map: { readSyncMapStrict: () => ({ kind: 'valid', map: seedMap }), writeSyncMapAtomically: () => { throw new Error('status must never persist a map'); } },
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
+        _bootstrapPlan: bootstrapPlanStub(bootstrapPlanCalls),
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [] }) },
+        _apply: { applyMutationPlan: () => { throw new Error('status must never dispatch a mutation'); } },
+        _status: require('../gsd-core/bin/lib/github-sync-status.cjs'),
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+
+    const chunks = cap.chunks.join('');
+    const parsed = JSON.parse(chunks);
+    assert.deepEqual(parsed.rebuildScope.triggeredKeys, ['project']);
+    assert.deepEqual(parsed.rebuildScope.structureOperations, ['project']);
+    assert.deepEqual(parsed.rebuildScope.optionsOperations, ['option:status:todo']);
+  });
+
+  test('Task 2 (D-03): ten consecutive status invocations against a confirmed-absent-but-not-yet-gated fixture never write the sync map and never advance the persisted absence marker', () => {
+    const seedMap = realMap.recordCompletion(null, {
+      logicalKey: 'project', nodeId: 'PVT_OLD', completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber,
+    });
+    const beforeHash = JSON.stringify(seedMap);
+    let writeCalls = 0;
+    const cap = captureStdout();
+    try {
+      for (let i = 0; i < 10; i += 1) {
+        routeGithubSyncCommandRouter({
+          args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+          error: (message) => { throw new Error(message); },
+          _isCapabilityActive: () => true,
+          _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+          _desired: { readDesiredState: () => ({ available: true }) },
+          _remote: { readRemoteSnapshot: () => ({ available: true }) },
+          _map: { readSyncMapStrict: () => ({ kind: 'valid', map: seedMap }), writeSyncMapAtomically: () => { writeCalls += 1; } },
+          _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
+          _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [] }) },
+          _status: { buildStatusV1: (remote) => ({ available: remote.available }), renderStatusV1: (dto) => JSON.stringify(dto) },
+        });
+      }
+    } finally { cap.restore(); }
+
+    assert.equal(writeCalls, 0, 'ten status invocations never write the sync map');
+    assert.equal(JSON.stringify(seedMap), beforeHash, 'the sync map is byte-identical after ten status invocations');
+    assert.equal(seedMap.completions.project.absenceCount, undefined, 'the absence counter never advanced — status never records a marker');
   });
 });

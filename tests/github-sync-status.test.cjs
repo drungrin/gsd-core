@@ -38,6 +38,11 @@ test('buildStatusV1 groups a complete reconciliation plan into the documented co
     pendingIssueUpdates: ['phase:03'],
     pendingFieldChanges: ['plan:04-01'],
     subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
+    // Plan 07-05/07-06: always present, empty on a pre-07-05/07-06-shaped plan fixture.
+    adoptions: [], prune: [],
+    existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
+    absences: [],
+    rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
     limitations: [],
   });
   assert.equal(JSON.parse(renderStatusV1(result, true)).version, 1);
@@ -75,6 +80,10 @@ test('buildStatusV1 produces an actionable fixed unavailable state without raw t
     message: 'github-sync status is unavailable because GitHub could not be read. Retry shortly.',
     creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
     orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
+    adoptions: [], prune: [],
+    existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
+    absences: [],
+    rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
     limitations: ['Remote data is currently unavailable; no changes were made.'],
   });
   assert.doesNotMatch(JSON.stringify(result), /secret transport output/);
@@ -110,6 +119,11 @@ test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), unce
     pendingIssueUpdates: ['phase:03'],
     pendingFieldChanges: ['plan:04-01'],
     subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
+    adoptions: [{ logicalKey: 'issue:phase:11', previousNodeId: 'ISSUE_OLD', resolvedNodeId: 'ISSUE_NEW' }],
+    prune: ['plan:09-09'],
+    existence: { present: 3, confirmedAbsent: 1, unknown: 1, unknownKeys: ['field:gsd-id'] },
+    absences: [{ logicalKey: 'plan:09-09', count: 2, firstSeenAt: '2026-08-01T00:00:00.000Z' }],
+    rebuildScope: { triggered: true, triggeredKeys: ['project'], structureOperations: ['project'], optionsOperations: ['option:status:todo'] },
     limitations: ['Remote data is currently unavailable; no changes were made.'],
   };
   const out = renderStatusV1(dto, false);
@@ -133,6 +147,18 @@ test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), unce
     '  - plan:04-01',
     'sub-issue-ceiling-warnings: 1',
     '  - 05 (91/100)',
+    'adoptions: 1',
+    '  - issue:phase:11: ISSUE_OLD -> ISSUE_NEW',
+    'prune: 1',
+    '  - plan:09-09',
+    'existence: present=3 confirmed-absent=1 unknown=1',
+    '  - field:gsd-id',
+    'absences: 1',
+    '  - plan:09-09 (count=2, since=2026-08-01T00:00:00.000Z)',
+    'rebuild-scope: triggered=true',
+    '  - trigger: project',
+    '  - structure: project',
+    '  - options: option:status:todo',
     'limitations:',
     '  - Remote data is currently unavailable; no changes were made.',
     '',
@@ -149,6 +175,10 @@ test('renderStatusV1 renders a blocked entry without a detail as the bare reason
     pendingIssueUpdates: [],
     pendingFieldChanges: [],
     subIssueCeilingWarnings: [],
+    adoptions: [], prune: [],
+    existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
+    absences: [],
+    rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
     limitations: [],
   };
   const out = renderStatusV1(dto, false);
@@ -157,11 +187,16 @@ test('renderStatusV1 renders a blocked entry without a detail as the bare reason
   assert.doesNotMatch(out, /\(/);
 });
 
-test('renderStatusV1 still shows all nine count lines at zero when every group is empty, with no limitations line (D-14) — including field-changes-pending and sub-issue-ceiling-warnings', () => {
+test('renderStatusV1 still shows all group lines at zero when every group is empty, with no limitations line (D-14) — including field-changes-pending, sub-issue-ceiling-warnings, adoptions, prune, existence, absences, and rebuild-scope (07-06)', () => {
   const dto = {
     version: 1, available: true,
     creates: [], updates: [], noops: [], blocked: [], uncertain: [],
-    orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [], limitations: [],
+    orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
+    adoptions: [], prune: [],
+    existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
+    absences: [],
+    rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
+    limitations: [],
   };
   const out = renderStatusV1(dto, false);
   assert.equal(out, [
@@ -175,6 +210,11 @@ test('renderStatusV1 still shows all nine count lines at zero when every group i
     'updates-pending: 0',
     'field-changes-pending: 0',
     'sub-issue-ceiling-warnings: 0',
+    'adoptions: 0',
+    'prune: 0',
+    'existence: present=0 confirmed-absent=0 unknown=0',
+    'absences: 0',
+    'rebuild-scope: triggered=false',
     '',
   ].join('\n'));
   assert.doesNotMatch(out, /limitations:/);
@@ -403,4 +443,65 @@ test('buildStatusV1 on a plan carrying zero operations still produces empty crea
   const result = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] });
   assert.deepEqual(result.creates, []);
   assert.deepEqual(result.updates, []);
+});
+
+// ─── Plan 07-06 Task 2/3 (D-01/D-02/D-03/D-06/D-08/D-09): the existence,
+// absence, and rebuild-scope groups the router now hands buildStatusV1 as
+// its third argument. ────────────────────────────────────────────────────
+
+test('buildStatusV1 with no third argument (every pre-07-06 call site) defaults every new group to empty', () => {
+  const result = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] });
+  assert.deepEqual(result.adoptions, []);
+  assert.deepEqual(result.prune, []);
+  assert.deepEqual(result.existence, { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] });
+  assert.deepEqual(result.absences, []);
+  assert.deepEqual(result.rebuildScope, { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] });
+});
+
+test('buildStatusV1 counts verdicts by kind and names an unreadable object by its own logical key, not only by its reason', () => {
+  const result = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [{ reason: 'existence_unknown', detail: 'field:gsd-id' }], uncertain: [] }, {
+    verdicts: [
+      { logicalKey: 'project', verdict: 'present' },
+      { logicalKey: 'label:gsd-phase', verdict: 'present' },
+      { logicalKey: 'plan:09-09', verdict: 'confirmed-absent' },
+      { logicalKey: 'field:gsd-id', verdict: 'unknown' },
+    ],
+  });
+  assert.deepEqual(result.existence, { present: 2, confirmedAbsent: 1, unknown: 1, unknownKeys: ['field:gsd-id'] });
+  // The same object is also named individually in `blocked` — this group is
+  // an additional, not a replacing, surface.
+  assert.deepEqual(result.blocked, [{ reason: 'existence_unknown', detail: 'field:gsd-id' }]);
+});
+
+test('buildStatusV1 reports the per-object absence count and first-seen instant verbatim', () => {
+  const result = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] }, {
+    absences: [{ logicalKey: 'plan:09-09', count: 2, firstSeenAt: '2026-08-01T00:00:00.000Z' }],
+  });
+  assert.deepEqual(result.absences, [{ logicalKey: 'plan:09-09', count: 2, firstSeenAt: '2026-08-01T00:00:00.000Z' }]);
+});
+
+test('buildStatusV1 carries the rebuild-scope preview verbatim, including when the run has no trigger at all', () => {
+  const triggered = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] }, {
+    rebuildScope: { triggered: true, triggeredKeys: ['project'], structureOperations: ['project'], optionsOperations: ['option:status:todo'] },
+  });
+  assert.deepEqual(triggered.rebuildScope, { triggered: true, triggeredKeys: ['project'], structureOperations: ['project'], optionsOperations: ['option:status:todo'] });
+
+  const healthy = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] }, {
+    rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
+  });
+  assert.deepEqual(healthy.rebuildScope, { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] });
+});
+
+test('buildStatusV1 carries plan.adoptions and plan.prune through verbatim, defaulting to empty on a pre-07-05/07-06-shaped plan', () => {
+  const withBoth = buildStatusV1({ available: true, reason: 'ok' }, {
+    operations: [], noops: [], blocked: [], uncertain: [],
+    adoptions: [{ logicalKey: 'issue:phase:05', previousNodeId: 'ISSUE_OLD', resolvedNodeId: 'ISSUE_NEW' }],
+    prune: [{ logicalKey: 'plan:09-09' }],
+  });
+  assert.deepEqual(withBoth.adoptions, [{ logicalKey: 'issue:phase:05', previousNodeId: 'ISSUE_OLD', resolvedNodeId: 'ISSUE_NEW' }]);
+  assert.deepEqual(withBoth.prune, ['plan:09-09']);
+
+  const withNeither = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] });
+  assert.deepEqual(withNeither.adoptions, []);
+  assert.deepEqual(withNeither.prune, []);
 });

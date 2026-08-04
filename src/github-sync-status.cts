@@ -3,8 +3,15 @@
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import operationMod = require('./github-sync-operation.cjs');
+// Plan 07-06 Task 3 (D-03): both `github-sync-existence.cts` and this module
+// are zero-I/O — importing the verdict catalog here keeps the three literal
+// strings ('present'/'confirmed-absent'/'unknown') defined in exactly one
+// place, never re-spelled.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import existenceMod = require('./github-sync-existence.cjs');
 
 const { statusBucketForKind, STATUS_BUCKET } = operationMod;
+const { EXISTENCE_VERDICT } = existenceMod;
 
 const STATUS_SCHEMA_VERSION = 1;
 const UNAVAILABLE_MESSAGE = 'github-sync status is unavailable because GitHub could not be read. Retry shortly.';
@@ -49,6 +56,25 @@ interface ReconciliationPlan {
   orphans?: Array<{ logicalKey: string; issueNumber?: number }>;
   /** Plan 05-07: optional so a pre-05-07-shaped plan fixture still type-checks and renders as empty. */
   subIssueCeilingWarnings?: SubIssueCeilingWarning[];
+  /** Plan 07-05 Task 2 (D-13): optional so a pre-07-05-shaped plan fixture still type-checks and renders as empty. */
+  adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
+  /** Plan 07-06 Task 1 (D-07): optional so a pre-07-06-shaped plan fixture still type-checks and renders as empty. */
+  prune?: Array<{ logicalKey: string }>;
+}
+
+/** Plan 07-06 Task 2/3 (D-03): the existence classification and D-01's rebuild-scope preview — computed once by the router (the same `classifyExistence`/`runBootstrapTwoPass` calls `sync` makes, apply/map-write withheld) and handed here as already-typed data, never re-derived from a raw completions map. */
+interface ExistenceSummaryLike {
+  /** `classifyExistence`'s own return shape (`github-sync-existence.cjs`) — one entry per classified logical key. */
+  verdicts?: Array<{ logicalKey: string; verdict: string }>;
+  /** D-08/D-09: every completion currently carrying an absence marker, by logical key. */
+  absences?: Array<{ logicalKey: string; count: number; firstSeenAt: string }>;
+  /** D-01/D-02/D-03: the rebuild this run's classification would trigger — `triggered: false` (with every array empty) when nothing crossed the two-absence-plus-elapsed gate. */
+  rebuildScope?: {
+    triggered: boolean;
+    triggeredKeys: string[];
+    structureOperations: string[];
+    optionsOperations: string[];
+  };
 }
 
 interface StatusV1 {
@@ -68,10 +94,39 @@ interface StatusV1 {
   pendingFieldChanges: string[];
   /** Plan 05-07 (D-14): always present, empty when nothing applies — matches every other group; never gates. */
   subIssueCeilingWarnings: SubIssueCeilingWarning[];
+  /** Plan 07-05 Task 2 (D-13): always present, empty when nothing applies — matches every other group. */
+  adoptions: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
+  /** Plan 07-06 Task 1 (D-07): always present, empty when nothing applies — matches every other group. Reports every prune this run would apply (or, from `sync`, has just applied); never gates. */
+  prune: string[];
+  /** Plan 07-06 Task 2 (D-06): counts by verdict, plus the logical keys of every object this run could not read — the same objects already named individually in `blocked` under `EXISTENCE_UNKNOWN`. */
+  existence: { present: number; confirmedAbsent: number; unknown: number; unknownKeys: string[] };
+  /** Plan 07-06 Task 2 (D-08/D-09): the per-object absence count and first-seen timestamp for every completion currently carrying one. */
+  absences: Array<{ logicalKey: string; count: number; firstSeenAt: string }>;
+  /** Plan 07-06 Task 2 (D-01/D-02/D-03): the rebuild this run's classification would trigger, and what both bootstrap passes would emit for it. */
+  rebuildScope: { triggered: boolean; triggeredKeys: string[]; structureOperations: string[]; optionsOperations: string[] };
   limitations: string[];
 }
 
-function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): StatusV1 {
+const EMPTY_REBUILD_SCOPE: StatusV1['rebuildScope'] = { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] };
+const EMPTY_EXISTENCE: StatusV1['existence'] = { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] };
+
+function buildExistenceSummary(existenceSummary: ExistenceSummaryLike | null | undefined): { existence: StatusV1['existence']; absences: StatusV1['absences']; rebuildScope: StatusV1['rebuildScope'] } {
+  const verdicts = existenceSummary?.verdicts ?? [];
+  const existence = { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] as string[] };
+  for (const entry of verdicts) {
+    if (entry.verdict === EXISTENCE_VERDICT.PRESENT) existence.present += 1;
+    else if (entry.verdict === EXISTENCE_VERDICT.CONFIRMED_ABSENT) existence.confirmedAbsent += 1;
+    else { existence.unknown += 1; existence.unknownKeys.push(entry.logicalKey); }
+  }
+  const absences = (existenceSummary?.absences ?? []).map(({ logicalKey, count, firstSeenAt }) => ({ logicalKey, count, firstSeenAt }));
+  const scope = existenceSummary?.rebuildScope;
+  const rebuildScope = scope
+    ? { triggered: scope.triggered, triggeredKeys: [...scope.triggeredKeys], structureOperations: [...scope.structureOperations], optionsOperations: [...scope.optionsOperations] }
+    : EMPTY_REBUILD_SCOPE;
+  return { existence, absences, rebuildScope };
+}
+
+function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, existenceSummary?: ExistenceSummaryLike | null): StatusV1 {
   if (!remote.available) {
     // G-02-4: a local github_sync.target fault is diagnosed distinctly from a
     // remote outage — typed blocker, no `uncertain` entry, no remote read
@@ -87,6 +142,7 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
         blocked: [remote.field === undefined ? { reason: remote.reason } : { reason: remote.reason, detail: remote.field }],
         uncertain: [],
         orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
+        adoptions: [], prune: [], existence: EMPTY_EXISTENCE, absences: [], rebuildScope: EMPTY_REBUILD_SCOPE,
         limitations: ['The local github_sync.target configuration is invalid; no remote read was attempted.'],
       };
     }
@@ -94,10 +150,12 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
       version: STATUS_SCHEMA_VERSION, available: false, message: UNAVAILABLE_MESSAGE,
       creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
       orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
+      adoptions: [], prune: [], existence: EMPTY_EXISTENCE, absences: [], rebuildScope: EMPTY_REBUILD_SCOPE,
       limitations: ['Remote data is currently unavailable; no changes were made.'],
     };
   }
-  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], pendingFieldChanges: [], orphans: [], subIssueCeilingWarnings: [] };
+  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], pendingFieldChanges: [], orphans: [], subIssueCeilingWarnings: [], adoptions: [], prune: [] };
+  const { existence, absences, rebuildScope } = buildExistenceSummary(existenceSummary);
   return {
     version: STATUS_SCHEMA_VERSION, available: true,
     // WINDOWS #8: the shared, exhaustively-tested catalog decides the
@@ -113,6 +171,9 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
     pendingIssueUpdates: (safePlan.pendingIssueUpdates ?? []).map(({ logicalKey }) => logicalKey),
     pendingFieldChanges: (safePlan.pendingFieldChanges ?? []).map(({ logicalKey }) => logicalKey),
     subIssueCeilingWarnings: (safePlan.subIssueCeilingWarnings ?? []).map(({ phaseId, issueNumber, count, limit }) => ({ phaseId, issueNumber, count, limit })),
+    adoptions: (safePlan.adoptions ?? []).map(({ logicalKey, previousNodeId, resolvedNodeId }) => ({ logicalKey, previousNodeId, resolvedNodeId })),
+    prune: (safePlan.prune ?? []).map(({ logicalKey }) => logicalKey),
+    existence, absences, rebuildScope,
     limitations: [],
   };
 }
@@ -165,6 +226,28 @@ function renderStatusV1(status: StatusV1, raw: boolean): string {
   // followed by its count against the limit, in the same parenthesized-
   // detail shape the `orphans` group already uses.
   appendGroup('sub-issue-ceiling-warnings', status.subIssueCeilingWarnings.map(({ phaseId, count, limit }) => `${phaseId} (${count}/${limit})`));
+  // Plan 07-05 Task 2 (D-13): an adoption renders as its logical key and both
+  // node ids, so a developer can see exactly which stale id was replaced.
+  appendGroup('adoptions', status.adoptions.map(({ logicalKey, previousNodeId, resolvedNodeId }) => `${logicalKey}: ${previousNodeId} -> ${resolvedNodeId}`));
+  // Plan 07-06 Task 1 (D-07): a prune renders as the removed key alone — the
+  // single destructive act anywhere in this phase, named explicitly (T-07-20).
+  appendGroup('prune', status.prune);
+  // Plan 07-06 Task 2/3 (D-06): counts by verdict on the header line, then
+  // the logical key of every object this run could not read — the human
+  // branch names the object, not only the reason (matching this task's own
+  // must-have).
+  lines.push(`existence: present=${status.existence.present} confirmed-absent=${status.existence.confirmedAbsent} unknown=${status.existence.unknown}`);
+  for (const key of status.existence.unknownKeys) lines.push(`  - ${key}`);
+  // Plan 07-06 Task 2/3 (D-08/D-09): one line per object currently carrying
+  // an absence marker, naming its count and its first-seen instant.
+  appendGroup('absences', status.absences.map(({ logicalKey, count, firstSeenAt }) => `${logicalKey} (count=${count}, since=${firstSeenAt})`));
+  // Plan 07-06 Task 2/3 (D-01/D-02/D-03): the rebuild-scope preview — the
+  // keys that triggered it, then every operation both bootstrap passes would
+  // emit for it, each labeled by which pass it belongs to.
+  lines.push(`rebuild-scope: triggered=${status.rebuildScope.triggered}`);
+  for (const key of status.rebuildScope.triggeredKeys) lines.push(`  - trigger: ${key}`);
+  for (const key of status.rebuildScope.structureOperations) lines.push(`  - structure: ${key}`);
+  for (const key of status.rebuildScope.optionsOperations) lines.push(`  - options: ${key}`);
   if (status.limitations.length > 0) {
     lines.push('limitations:');
     for (const limitation of status.limitations) lines.push(`  - ${limitation}`);
