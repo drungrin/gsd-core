@@ -564,21 +564,44 @@ test('no fixture in this suite ever yields Blocked or Deferred', (t) => {
   }
 });
 
-test('reading the repository\'s own ROADMAP.md and STATE.md yields Done for phases 01-03, In Progress for phase 04, and Todo for phases 05-08', () => {
+// D-18 (WINDOWS #6): the prior version of this test hardcoded exact phase
+// statuses against this project's own live ROADMAP.md/STATE.md, so its
+// expectations broke the moment this project's own phase statuses advanced
+// (confirmed live 2026-08-04: phase 04 read Done, not the hardcoded In
+// Progress). Replaced with a committed, frozen fixture pair under
+// tests/fixtures/github-sync/desired-recorded-repo/ that is authored
+// independently of this project's .planning/ tree, so the derivation rule's
+// exact-status assertions can never again drift with this project's own
+// progress. A separate, deliberately thin smoke test below keeps proving
+// the real planning files still parse.
+test('reading a frozen recorded fixture pair yields the exact per-phase statuses it was recorded to produce (Done, In Progress, Todo x2)', (t) => {
+  const repoDir = createTempDir('github-sync-desired-frozen-fixture-');
+  t.after(() => cleanup(repoDir));
+  const fixtureDir = path.join(__dirname, 'fixtures', 'github-sync', 'desired-recorded-repo');
+  write(repoDir, '.planning/ROADMAP.md', fs.readFileSync(path.join(fixtureDir, 'ROADMAP.md'), 'utf8'));
+  write(repoDir, '.planning/STATE.md', fs.readFileSync(path.join(fixtureDir, 'STATE.md'), 'utf8'));
+
+  const result = readDesiredState(repoDir);
+
+  assert.equal(result.available, true);
+  const statusFor = (id) => result.phases.find((phase) => phase.id === id).status;
+  assert.equal(statusFor('01'), PHASE_STATUS.DONE);
+  assert.equal(statusFor('02'), PHASE_STATUS.IN_PROGRESS);
+  assert.equal(statusFor('03'), PHASE_STATUS.TODO);
+  assert.equal(statusFor('04'), PHASE_STATUS.TODO);
+});
+
+// D-18's thin smoke assertion: the real repository's own planning files must
+// still parse without error and yield a non-empty phase list. Deliberately
+// asserts nothing about any individual phase's status — that expectation is
+// what made the prior version of this test re-break on every phase advance.
+test('reading the repository\'s own ROADMAP.md and STATE.md stays available with a non-empty phase list', () => {
   const repoRoot = path.join(__dirname, '..');
 
   const result = readDesiredState(repoRoot);
 
   assert.equal(result.available, true);
-  const statusFor = (id) => result.phases.find((phase) => phase.id === id).status;
-  assert.equal(statusFor('01'), PHASE_STATUS.DONE);
-  assert.equal(statusFor('02'), PHASE_STATUS.DONE);
-  assert.equal(statusFor('03'), PHASE_STATUS.DONE);
-  assert.equal(statusFor('04'), PHASE_STATUS.IN_PROGRESS);
-  assert.equal(statusFor('05'), PHASE_STATUS.TODO);
-  assert.equal(statusFor('06'), PHASE_STATUS.TODO);
-  assert.equal(statusFor('07'), PHASE_STATUS.TODO);
-  assert.equal(statusFor('08'), PHASE_STATUS.TODO);
+  assert.ok(result.phases.length > 0);
 });
 
 test('every fixture in this suite produces a milestone array with no two entries sharing a version', (t) => {
