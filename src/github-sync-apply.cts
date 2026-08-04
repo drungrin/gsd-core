@@ -35,6 +35,13 @@ const {
   decodeResponseRoot,
   decodeCompletions,
 } = operationMod;
+// D-08/WINDOWS #9: `recordCompletion` (github-sync-map.cts) replaces the
+// WHOLE completion at a logical key. `mergeCompletion` is the mandatory seam
+// every capture routes through first, so a capture that only knows about one
+// field (e.g. `prepareIssueUpdates`'s content-hash-only capture) can never
+// silently erase a sibling field (e.g. `issueState`) a PRIOR operation in
+// this same run, or a prior run, already recorded at that key.
+const { mergeCompletion } = mapMod;
 
 interface GhResult {
   exitCode: number;
@@ -267,7 +274,7 @@ function applyMutationPlan(plan: MutationPlan, adapters: ApplyAdapters): ApplyRe
             // the applier's own authoritative fields (written after) can
             // never be shadowed by a planner constant — asserted directly by
             // test rather than relied upon from spread order alone.
-            pendingMap = recordCompletion(pendingMap, {
+            const capturedFields = {
               ...(item.plannerFields ?? {}),
               logicalKey: item.logicalKey,
               nodeId: item.nodeId,
@@ -276,7 +283,17 @@ function applyMutationPlan(plan: MutationPlan, adapters: ApplyAdapters): ApplyRe
               owner: operation.completionContext.owner,
               repo: operation.completionContext.repo,
               repositoryNumber: operation.completionContext.repositoryNumber,
-            });
+            };
+            // D-08/WINDOWS #9: merge onto whatever is already recorded at
+            // this logical key — in `pendingMap`, which already reflects
+            // every prior capture dispatched earlier in this same run —
+            // before handing the result to `recordCompletion`'s wholesale
+            // replace. Precedence: previously-recorded members first, then
+            // this capture's planner-supplied fields, then its own
+            // applier-authoritative fields last (`capturedFields` already
+            // resolved that inner precedence, above).
+            const previousCompletion = pendingMap?.completions[item.logicalKey];
+            pendingMap = recordCompletion(pendingMap, mergeCompletion(previousCompletion, capturedFields));
             pendingOutcomes.push({ logicalKey: item.logicalKey, operationKey: operation.logicalKey, action: operation.action, result: OPERATION_OUTCOME.CONFIRMED });
           }
           writeSyncMapAtomically(adapters.cwd, pendingMap as SyncMap);

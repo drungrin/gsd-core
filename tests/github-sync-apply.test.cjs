@@ -384,6 +384,81 @@ test('planner fields colliding with an applier-owned schema key never overwrite 
   assert.notEqual(recordCall[1].completedAt, attackerCompletedAt);
 });
 
+// ─── D-08/WINDOWS #9: the wholesale-replace trap, closed once at the applier ──
+//
+// `recordCompletion` (github-sync-map.cts) replaces the whole completion
+// object at a logical key. A capture that only knows about one field (e.g.
+// `prepareIssueUpdates`'s content-hash-only capture) used to silently erase
+// a sibling field (e.g. `issueState`) a PRIOR operation already recorded at
+// the same key in the same run. `applyMutationPlan` now merges each capture
+// onto whatever is currently recorded at that key before handing it to
+// `recordCompletion`.
+
+test('WINDOWS #9: a run applying an issue-content PATCH then a plan-issue-state PATCH for the same plan (content first) leaves both contentHash and issueState recorded at that logical key', () => {
+  const key = 'issue:plan:04-03';
+  // Mirrors prepareIssueUpdates's real single-field capture shape exactly
+  // (plannerFields: { contentHash: item.contentHash }) — the task
+  // instruction is NOT to widen that capture, only to fix the applier.
+  const contentOp = operationWithPlannerFields(key, { contentHash: 'HASH1' });
+  const stateOp = operationWithPlannerFields(key, { issueState: 'closed' });
+  const setup = makeAdapters([success({ nodeId: 'plan-issue-node' }), success({ nodeId: 'plan-issue-node' })]);
+  const result = applyMutationPlan({ operations: [contentOp, stateOp] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.map.completions[key].contentHash, 'HASH1');
+  assert.equal(result.map.completions[key].issueState, 'closed');
+});
+
+test('WINDOWS #9: the same scenario with the two operations dispatched in the opposite order (state first) also leaves both values recorded', () => {
+  const key = 'issue:plan:04-03';
+  const stateOp = operationWithPlannerFields(key, { issueState: 'closed' });
+  const contentOp = operationWithPlannerFields(key, { contentHash: 'HASH1' });
+  const setup = makeAdapters([success({ nodeId: 'plan-issue-node' }), success({ nodeId: 'plan-issue-node' })]);
+  const result = applyMutationPlan({ operations: [stateOp, contentOp] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.map.completions[key].contentHash, 'HASH1');
+  assert.equal(result.map.completions[key].issueState, 'closed');
+});
+
+test('D-08: a capture supplying a fresh contentHash overwrites the previously recorded value — the merge never resurrects a superseded hash', () => {
+  const key = 'issue:plan:04-03';
+  const staleOp = operationWithPlannerFields(key, { contentHash: 'STALE' });
+  const freshOp = operationWithPlannerFields(key, { contentHash: 'FRESH' });
+  const setup = makeAdapters([success({ nodeId: 'plan-issue-node' }), success({ nodeId: 'plan-issue-node' })]);
+  const result = applyMutationPlan({ operations: [staleOp, freshOp] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.map.completions[key].contentHash, 'FRESH');
+});
+
+test('D-08: a capture at a logical key with no previously recorded completion behaves exactly as it does today (map: null, single operation)', () => {
+  const setup = makeAdapters([success({ nodeId: 'plain-node', issueNumber: 7 })]);
+  const result = applyMutationPlan({ operations: [operation('one')] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  assert.deepEqual(Object.keys(result.map.completions.one).sort(), ['completedAt', 'issueNumber', 'logicalKey', 'nodeId', 'owner', 'repo', 'repositoryNumber']);
+});
+
+test('D-08: the applier\'s own authoritative fields still win over both the previously-recorded completion and this capture\'s planner-supplied fields (plan 04-03\'s precedence, generalized a level)', () => {
+  const key = 'issue:plan:04-03';
+  // First operation seeds a previously-recorded completion at `key` whose
+  // nodeId/owner/repo an attacker-shaped second capture then tries to
+  // override via plannerFields — the applier's own authoritative fields
+  // (written after plannerFields in this run's capture) must still win.
+  const seedOp = operationWithPlannerFields(key, { contentHash: 'SEED' });
+  const attackOp = operationWithPlannerFields(key, {
+    nodeId: 'HIJACKED_NODE', owner: 'attacker', repo: 'attacker-repo', repositoryNumber: '999',
+  });
+  const setup = makeAdapters([success({ nodeId: 'seed-node' }), success({ nodeId: 'real-node-id' })]);
+  const result = applyMutationPlan({ operations: [seedOp, attackOp] }, { cwd: '/repo', map: null, ...setup.adapters });
+  assert.equal(result.kind, 'completed');
+  const finalCompletion = result.map.completions[key];
+  assert.equal(finalCompletion.nodeId, 'real-node-id');
+  assert.equal(finalCompletion.owner, 'octo');
+  assert.equal(finalCompletion.repo, 'repo');
+  assert.equal(finalCompletion.repositoryNumber, 1);
+  // The previously-recorded contentHash survives — this capture's own
+  // fields never mentioned contentHash, so the merge is not a full replace.
+  assert.equal(finalCompletion.contentHash, 'SEED');
+});
+
 // ─── outcome journal ────────────────────────────────────────────────────────
 
 test('a completed result lists every checkpointed logical key in fold-then-dispatch order with producing operation key and result', () => {

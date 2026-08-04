@@ -84,10 +84,27 @@ test('one pending update whose fetched body contains a well-formed fence pair pr
   assert.equal(op.hasPointsBudget, false);
   assert.equal(op.contentCreation, false);
   assert.equal(op.captures.length, 1);
+  // D-08/WINDOWS #9: this capture is DELIBERATELY single-field
+  // (contentHash only, never issueState) — the fix for the wholesale-
+  // replace trap lives once at the applier (github-sync-apply.cts's
+  // mergeCompletion seam), not here. Widening this capture to also carry
+  // issueState would close only this one call site and leave the class
+  // open for the next capture that forgets a sibling field.
   assert.deepEqual(op.captures[0], {
     kind: 'node', logicalKey: update.issueKey, nodeIdPath: 'node_id', numberPath: 'number',
     plannerFields: { contentHash: update.contentHash },
   });
+});
+
+test('D-08/WINDOWS #9: the patch operation\'s capture never carries issueState — pinning that this stage stays single-field by design, so a future "helpful" widening here is a deliberate, reviewed change, not an accidental reintroduction of the fix in the wrong place', () => {
+  const body = `${FENCE_BEGIN}\nold\n${FENCE_END}`;
+  const execGh = fakeExecGh([issueResponse(body)]);
+  const update = pendingUpdate();
+
+  const result = prepareIssueUpdates([update], { cwd: '/f', execGh });
+  const plannerFields = result.operations[0].captures[0].plannerFields;
+  assert.deepEqual(Object.keys(plannerFields), ['contentHash']);
+  assert.equal('issueState' in plannerFields, false);
 });
 
 test('the spliced body preserves the fetched body\'s text outside the fences byte-for-byte', () => {
