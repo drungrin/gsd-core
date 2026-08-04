@@ -112,7 +112,7 @@ test('enabled sync preflights, composes authoritative inputs, and passes the rec
     });
   } finally { mock.restoreAll(); }
   assert.deepEqual(calls, [['preflight', '/fixture'], ['desired', '/fixture'], ['target', '/fixture'], ['map', '/fixture', { owner: 'octo', repo: 'example', number: 42 }], ['remote', { cwd: '/fixture', owner: 'octo', repo: 'example', repositoryNumber: 42, projectNumber: 7, issueNodeIdHints: [101, 303] }], ['reconcile', 3], ['issueUpdate', 0, '/fixture'], ['apply', 'phase:01', { completions: { 'phase:01': { nodeId: 'item-01', issueNumber: 101 }, 'phase:03': { nodeId: 'item-03', issueNumber: 303 } } }]]);
-  assert.deepEqual(chunks, ['{\n  "kind": "completed",\n  "issueUpdateReports": [],\n  "subIssueCeilingWarnings": []\n}']);
+  assert.deepEqual(chunks, ['{\n  "kind": "completed",\n  "issueUpdateReports": [],\n  "subIssueCeilingWarnings": [],\n  "adoptions": []\n}']);
 });
 
 // ─── Bug fix: collectIssueNodeIdHints must not feed bootstrap completions
@@ -2260,6 +2260,144 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
 
     assert.deepEqual(bootstrapPlanCalls, ['structure', 'options'], 'a field-only second confirmed absence past the gate triggers both bootstrap passes, unchanged call site');
     assert.ok(applyCalls.includes('phase:01'), 'reconciliation still runs after the rebuild delegation');
+    assert.equal(process.exitCode, 0);
+  });
+});
+
+// ─── Plan 07-05 Task 2 (D-13): the sync-side map-maintenance write for a
+// node-ID adoption. Uses the REAL github-sync-map module (recordCompletion/
+// mergeCompletion), the same discipline plan 07-01's describe block above
+// established, so D-08's wholesale-replace trap would actually be exercised
+// by an incomplete fix. ───────────────────────────────────────────────────
+
+describe('github-sync router: plan 07-05 Task 2 — D-13 node-ID adoption persistence', () => {
+  const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+
+  function issuePhaseCompletion(overrides = {}) {
+    return {
+      logicalKey: 'issue:phase:05',
+      nodeId: 'ISSUE_OLD',
+      issueNumber: 900,
+      completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner,
+      repo: TARGET.repo,
+      repositoryNumber: TARGET.repositoryNumber,
+      contentHash: 'hash-abc',
+      fieldState: '{"status":"Todo"}',
+      ...overrides,
+    };
+  }
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  test('sync persists an adoption through mergeCompletion, preserving contentHash and fieldState, and writes exactly once', () => {
+    const initialMap = realMap.recordCompletion(null, issuePhaseCompletion());
+    let stored = initialMap;
+    const writeCalls = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'valid', map: stored }),
+          recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+          mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+          writeSyncMapAtomically: (cwd, map) => { writeCalls.push(map); stored = map; },
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _reconcile: {
+          planReconciliation: () => ({
+            operations: [{ logicalKey: 'phase:05', args: ['contentId=ISSUE_NEW'] }],
+            noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [],
+            adoptions: [{ logicalKey: 'issue:phase:05', previousNodeId: 'ISSUE_OLD', resolvedNodeId: 'ISSUE_NEW' }],
+          }),
+        },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: () => ({ kind: 'completed', outcomes: [] }) },
+      });
+    } finally { cap.restore(); }
+
+    assert.equal(writeCalls.length, 1, 'the adoption write happens exactly once');
+    const written = writeCalls[0].completions['issue:phase:05'];
+    assert.equal(written.nodeId, 'ISSUE_NEW', 'the sync map now holds the newly resolved node ID');
+    // D-08's wholesale-replace trap: every other previously recorded member must survive.
+    assert.equal(written.contentHash, 'hash-abc');
+    assert.equal(written.fieldState, '{"status":"Todo"}');
+    assert.equal(written.issueNumber, 900);
+    assert.equal(written.owner, TARGET.owner);
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('sync writes nothing when plan.adoptions is empty', () => {
+    const initialMap = realMap.recordCompletion(null, issuePhaseCompletion());
+    let writeCalls = 0;
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'valid', map: initialMap }),
+          writeSyncMapAtomically: () => { writeCalls += 1; },
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], adoptions: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: () => ({ kind: 'completed', outcomes: [] }) },
+      });
+    } finally { cap.restore(); }
+
+    assert.equal(writeCalls, 0);
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('status computes the same adoption detection (via planReconciliation) but never writes the sync map — the map file stays byte-identical', () => {
+    const initialMap = realMap.recordCompletion(null, issuePhaseCompletion());
+    let reconcileCallCount = 0;
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'valid', map: initialMap }),
+          writeSyncMapAtomically: () => { throw new Error('status must never persist a map'); },
+          mergeCompletion: () => { throw new Error('status must never merge a completion'); },
+          recordCompletion: () => { throw new Error('status must never record a completion'); },
+        },
+        _reconcile: {
+          planReconciliation: () => {
+            reconcileCallCount += 1;
+            return {
+              operations: [], noops: [], blocked: [], uncertain: [],
+              adoptions: [{ logicalKey: 'issue:phase:05', previousNodeId: 'ISSUE_OLD', resolvedNodeId: 'ISSUE_NEW' }],
+            };
+          },
+        },
+        _status: { buildStatusV1: (remote, plan) => ({ version: 1, available: remote.available, adoptions: plan.adoptions ?? [] }), renderStatusV1: (dto) => JSON.stringify(dto) },
+      });
+    } finally { cap.restore(); }
+
+    assert.equal(reconcileCallCount, 1, 'status computes the identical reconciliation plan (and therefore the same adoptions array)');
+    assert.deepEqual(initialMap.completions['issue:phase:05'], issuePhaseCompletion(), 'the map object itself is untouched — sync-map file equality, not merely no error thrown');
     assert.equal(process.exitCode, 0);
   });
 });
