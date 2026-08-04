@@ -11,6 +11,15 @@ import ghMod = require('./github-sync-gh.cjs');
 const REMOTE_REASON = Object.freeze({
   OK: 'ok',
   UNAVAILABLE: 'remote_unavailable',
+  // Plan 07-10 (D-01/D-05 gap closure): the project itself resolved to a
+  // confirmed, explicit absence — `data.repositoryOwner.projectV2: null`
+  // decoded alongside an exclusively NOT_FOUND-typed `errors` array (or none
+  // at all). Distinct from the plain UNAVAILABLE default, which still means
+  // "the read failed" (a FORBIDDEN/rate-limit error, a malformed body, a
+  // decode mismatch) — never evidence of deletion. `items`/`fields`/
+  // `subIssues` genuinely were not read either way; `available` stays false
+  // for both reasons.
+  PROJECT_ABSENT: 'project_absent',
 } as const);
 
 type RemoteReason = typeof REMOTE_REASON[keyof typeof REMOTE_REASON];
@@ -73,8 +82,8 @@ const DOCUMENTS = Object.freeze({
   issueId: 'query($owner:String!,$repo:String!,$issueNumber:Int!) { # github-sync:issueId\n repository(owner:$owner,name:$repo) { issue(number:$issueNumber) { id } } }',
 });
 
-function unavailable(): RemoteSnapshot {
-  return { available: false, reason: REMOTE_REASON.UNAVAILABLE, items: [], fields: [], subIssues: [] };
+function unavailable(reason: RemoteReason = REMOTE_REASON.UNAVAILABLE): RemoteSnapshot {
+  return { available: false, reason, items: [], fields: [], subIssues: [] };
 }
 
 function readPath(value: unknown, path: string[]): unknown {
@@ -149,7 +158,26 @@ function decodePage(result: GhResult, path: string[]): Page | null {
   return { nodes: nodes as RemoteNode[], hasNextPage, endCursor };
 }
 
-function readProjectNodeId(options: ReadRemoteSnapshotOptions): string | null {
+/**
+ * Plan 07-10 (D-01/D-05 gap closure): widened to the same three-way
+ * `string | null | undefined` idiom `decodeIssueNodeId` below already
+ * established — a real deleted-Project envelope carries a non-zero exit
+ * code AND a NOT_FOUND-typed `errors` entry alongside a decodable
+ * `data.repositoryOwner.projectV2: null`; the prior unconditional
+ * `exitCode !== 0` short-circuit collapsed that shape into the identical
+ * `null` a merely-failed read also produced, making
+ * `REMOTE_REASON.PROJECT_ABSENT` below unreachable against a real deleted
+ * board. The envelope is now consulted BEFORE `exitCode`: `null` is returned
+ * ONLY for an explicit `projectV2: null` accompanied by errors that are
+ * absent, empty, or exclusively NOT_FOUND-typed (`isNotFoundOnlyErrors`,
+ * reused rather than re-implemented); every other outcome — a null
+ * `repositoryOwner`, a non-object `projectV2`, an empty-string id, an
+ * unparseable body, or any errors entry not typed NOT_FOUND — returns
+ * `undefined`, preserving the guarantee that a token which merely lost read
+ * access (FORBIDDEN, rate limit, ...) is never indistinguishable from a
+ * genuinely deleted project (T-07-31).
+ */
+function readProjectNodeId(options: ReadRemoteSnapshotOptions): string | null | undefined {
   const execGh = options.execGh ?? ghMod.execGh;
   const result = execGh(
     [
@@ -160,24 +188,23 @@ function readProjectNodeId(options: ReadRemoteSnapshotOptions): string | null {
     ],
     { cwd: options.cwd },
   );
-  if (result.exitCode !== 0) return null;
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(result.stdout);
   } catch {
-    return null;
+    return undefined;
   }
-  if (parsed === null || typeof parsed !== 'object') return null;
+  if (parsed === null || typeof parsed !== 'object') return undefined;
   const envelope = parsed as { data?: unknown; errors?: unknown };
-  if (Array.isArray(envelope.errors) && envelope.errors.length > 0) return null;
   // D-12/D-13: re-rooted to match the owner-scoped document above — a
   // viewer-rooted response (the pre-generalization shape) resolves to
-  // undefined here and correctly decodes to null (cycle-2 HIGH-H).
+  // undefined here (cycle-2 HIGH-H).
   const project = readPath(envelope.data, ['repositoryOwner', 'projectV2']);
-  if (project === null || typeof project !== 'object') return null;
+  if (project === null) return isNotFoundOnlyErrors(envelope.errors) ? null : undefined;
+  if (typeof project !== 'object') return undefined;
   const projectNodeId = (project as { id?: unknown }).id;
-  return typeof projectNodeId === 'string' && projectNodeId.length > 0 ? projectNodeId : null;
+  return typeof projectNodeId === 'string' && projectNodeId.length > 0 ? projectNodeId : undefined;
 }
 
 function normalizeIssueNodeIdHints(hints: number[] | undefined): number[] {
@@ -307,7 +334,15 @@ function collectIssueNumbers(items: RemoteNode[]): number[] | null {
 }
 
 function readRemoteSnapshot(options: ReadRemoteSnapshotOptions): RemoteSnapshot {
+  // Plan 07-10: branch on the three-way result. A resolved string proceeds
+  // unchanged below; `null` (the project is confirmed, explicitly gone)
+  // returns `unavailable(PROJECT_ABSENT)`; `undefined` (the read merely
+  // failed — malformed body, decode mismatch, any non-NOT_FOUND error) returns
+  // the plain `unavailable()` exactly as before. `available` stays false in
+  // both absent and failed cases — items, fields, and sub-issues genuinely
+  // were not read either way.
   const projectNodeId = readProjectNodeId(options);
+  if (projectNodeId === null) return unavailable(REMOTE_REASON.PROJECT_ABSENT);
   if (!projectNodeId) return unavailable();
 
   const items = readConnection(

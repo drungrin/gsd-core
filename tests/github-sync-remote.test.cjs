@@ -455,19 +455,59 @@ describe('readRemoteSnapshot', () => {
     assert.equal(orgFake.calls.filter((call) => call.connection === 'fields').length, 2, 'a two-page fields connection must exhaust both pages for an organization-kind owner too');
   });
 
-  test('a project read whose owner resolves but whose project is null yields the existing unavailable result, distinct from a transport failure', () => {
-    const result = readRemoteSnapshot({
+  // Plan 07-10 (D-01/D-05 gap closure): re-expressed against the new
+  // three-way reason. A genuinely deleted Project — `projectV2: null`,
+  // errors absent or exclusively NOT_FOUND-typed, regardless of exit code —
+  // now decodes to the distinct `PROJECT_ABSENT` reason rather than
+  // collapsing into the same `UNAVAILABLE` a merely-failed read produces
+  // (the conflation this plan closes). A companion case in this same test
+  // pins the "distinct from a transport failure" half of the title: a
+  // non-NOT_FOUND error (FORBIDDEN) alongside a failed read still fails
+  // closed to the plain `UNAVAILABLE` reason, never `PROJECT_ABSENT`
+  // (T-07-31 — a token that merely lost read access is never
+  // indistinguishable from a genuinely deleted project).
+  test('a project read whose owner resolves but whose project is null yields PROJECT_ABSENT, distinct from a transport failure', () => {
+    const absent = readRemoteSnapshot({
       cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 999,
       execGh: (args) => {
         const query = args.find((arg) => arg.startsWith('query='));
         if (query.includes('github-sync:project')) {
-          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify({ data: { repositoryOwner: { projectV2: null } } }), stderr: '' };
+          return {
+            exitCode: 1,
+            reason: 'gh_exit_nonzero',
+            stdout: JSON.stringify({
+              data: { repositoryOwner: { projectV2: null } },
+              errors: [{ type: 'NOT_FOUND', path: ['repositoryOwner', 'projectV2'], message: 'Could not resolve to a ProjectV2 node with the number 999.' }],
+            }),
+            stderr: 'gh: Could not resolve to a ProjectV2 node with the number 999.',
+          };
         }
         throw new Error('a null project must short-circuit before any connection read');
       },
     });
-    assert.equal(result.available, false);
-    assert.equal(result.reason, REMOTE_REASON.UNAVAILABLE);
+    assert.equal(absent.available, false);
+    assert.equal(absent.reason, REMOTE_REASON.PROJECT_ABSENT);
+
+    const failed = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 999,
+      execGh: (args) => {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return {
+            exitCode: 1,
+            reason: 'gh_exit_nonzero',
+            stdout: JSON.stringify({
+              data: { repositoryOwner: { projectV2: null } },
+              errors: [{ type: 'FORBIDDEN', path: ['repositoryOwner', 'projectV2'], message: 'Resource not accessible by integration.' }],
+            }),
+            stderr: 'gh: Resource not accessible by integration.',
+          };
+        }
+        throw new Error('a failed project read must short-circuit before any connection read');
+      },
+    });
+    assert.equal(failed.available, false);
+    assert.equal(failed.reason, REMOTE_REASON.UNAVAILABLE);
   });
 
   test('a response still shaped the OLD way — rooted at the viewer rather than the owner — decodes to null/unavailable for the project, items, and fields reads (the HIGH-H gate)', () => {

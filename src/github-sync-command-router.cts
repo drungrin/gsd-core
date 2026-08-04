@@ -66,6 +66,10 @@ const { output } = io;
 const { routeHubCommandFamily } = cjsCommandRouterAdapter;
 const { PREFLIGHT_REASON } = authMod;
 const { mutatedKeys } = operationMod;
+// Plan 07-10: read from the real module directly (never the injected `_remote`
+// test seam) — a test double that omits this member must never make the
+// PROJECT_ABSENT comparison silently degrade to `undefined !== 'project_absent'`.
+const { REMOTE_REASON } = remoteMod;
 
 // ─── WR-03: D-11 local containment literals ────────────────────────────────
 //
@@ -728,8 +732,18 @@ function routeGithubSyncCommandRouter({
               const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber }) as {
                 kind?: unknown; map?: unknown;
               };
-              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) }) as { available?: unknown };
-              if (remoteSnapshot?.available !== true) {
+              const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) }) as { available?: unknown; reason?: unknown };
+              // Plan 07-10 (D-01/D-05 gap closure): an unavailable snapshot
+              // whose reason is PROJECT_ABSENT is not a transport failure —
+              // it is precisely the input the D-01 existence-classification
+              // block below exists to classify and, past the recreate gate,
+              // repair. Every OTHER unavailable reason (a failed read, a
+              // decode mismatch, the plain `remote_unavailable` default)
+              // still short-circuits here exactly as before. The
+              // pre-reconciliation availability guard further below is what
+              // keeps this decoupling from ever reconciling against a dead
+              // board on a first, not-yet-gated absence.
+              if (remoteSnapshot?.available !== true && remoteSnapshot?.reason !== REMOTE_REASON.PROJECT_ABSENT) {
                 result = { kind: 'uncertain', reason: 'remote_unavailable' };
               } else {
                 if (strictMap?.kind === 'blocking') {
@@ -912,91 +926,105 @@ function routeGithubSyncCommandRouter({
                     }
                   }
 
-                  // Plan 05-07 (D-12/discretion item): no streaming progress
-                  // mechanism is added for a long first run. The create list
-                  // and counts already dispatched below tell a developer how
-                  // much work this run will do before it starts, and a second
-                  // output surface beside renderStatusV1's would cost more
-                  // than the one sentence 05-08 spends documenting that a
-                  // first run on an established repository takes minutes,
-                  // and that killing it is free — every mutation is
-                  // checkpointed, so a resumed run picks up where it left off.
-                  const plan = reconcile.planReconciliation(planningDesiredState, planningRemoteSnapshot, planningStrictMap, existenceVerdicts, nowIso) as {
-                    operations: unknown[]; pendingIssueUpdates?: unknown[]; subIssueCeilingWarnings?: unknown[];
-                    adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
-                    prune?: Array<{ logicalKey: string }>;
-                  };
+                  // Plan 07-10 (D-01/D-05 gap closure): the pre-reconciliation
+                  // availability guard. `planningRemoteSnapshot` may still be
+                  // the original PROJECT_ABSENT snapshot (a first, not-yet-
+                  // gated absence, or a gated absence whose rebuild left the
+                  // project unresolved) — reconciliation, issue-update
+                  // preparation, and apply must never run against a remote
+                  // read that never actually confirmed the board's current
+                  // shape. The absence marker above has already been
+                  // classified and persisted regardless of this guard; only
+                  // the plan/apply half is withheld here.
+                  if ((planningRemoteSnapshot as { available?: unknown } | null | undefined)?.available !== true) {
+                    result = { kind: 'uncertain', reason: 'remote_unavailable' };
+                  } else {
+                    // Plan 05-07 (D-12/discretion item): no streaming progress
+                    // mechanism is added for a long first run. The create list
+                    // and counts already dispatched below tell a developer how
+                    // much work this run will do before it starts, and a second
+                    // output surface beside renderStatusV1's would cost more
+                    // than the one sentence 05-08 spends documenting that a
+                    // first run on an established repository takes minutes,
+                    // and that killing it is free — every mutation is
+                    // checkpointed, so a resumed run picks up where it left off.
+                    const plan = reconcile.planReconciliation(planningDesiredState, planningRemoteSnapshot, planningStrictMap, existenceVerdicts, nowIso) as {
+                      operations: unknown[]; pendingIssueUpdates?: unknown[]; subIssueCeilingWarnings?: unknown[];
+                      adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
+                      prune?: Array<{ logicalKey: string }>;
+                    };
 
-                  // D-13 (plan 07-05 Task 2): an issue whose (owner, repo,
-                  // number) re-resolved to a node ID different from the one
-                  // cached — `planReconciliation` already named it in
-                  // `plan.adoptions` and used the resolved id for whatever
-                  // live operation this run dispatches for it (never a stale
-                  // contentId). This step persists the correction to the
-                  // sync map through `mergeCompletion` (never a bare
-                  // `recordCompletion` built from a partial object — D-08's
-                  // wholesale-replace warning), so every other previously
-                  // recorded member of the completion (contentHash,
-                  // fieldState, issueState, any absence marker) survives
-                  // untouched. Runs only from `sync`, mirroring the project
-                  // absence-marker step above (T-07-04): `status` computes
-                  // the identical `plan.adoptions` array for its own report
-                  // but this branch never runs for it.
-                  if (Array.isArray(plan.adoptions) && plan.adoptions.length > 0 && planningStrictMap?.kind === 'valid') {
-                    const adoptionCompletions = ((planningStrictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string } | undefined>;
-                    let adoptedMap: unknown = planningStrictMap.map;
-                    for (const adoption of plan.adoptions) {
-                      const existingCompletion = adoptionCompletions[adoption.logicalKey];
-                      if (!existingCompletion) continue;
-                      const mergedAdoption = map.mergeCompletion(existingCompletion, { nodeId: adoption.resolvedNodeId });
-                      adoptedMap = map.recordCompletion(adoptedMap, mergedAdoption);
+                    // D-13 (plan 07-05 Task 2): an issue whose (owner, repo,
+                    // number) re-resolved to a node ID different from the one
+                    // cached — `planReconciliation` already named it in
+                    // `plan.adoptions` and used the resolved id for whatever
+                    // live operation this run dispatches for it (never a stale
+                    // contentId). This step persists the correction to the
+                    // sync map through `mergeCompletion` (never a bare
+                    // `recordCompletion` built from a partial object — D-08's
+                    // wholesale-replace warning), so every other previously
+                    // recorded member of the completion (contentHash,
+                    // fieldState, issueState, any absence marker) survives
+                    // untouched. Runs only from `sync`, mirroring the project
+                    // absence-marker step above (T-07-04): `status` computes
+                    // the identical `plan.adoptions` array for its own report
+                    // but this branch never runs for it.
+                    if (Array.isArray(plan.adoptions) && plan.adoptions.length > 0 && planningStrictMap?.kind === 'valid') {
+                      const adoptionCompletions = ((planningStrictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string } | undefined>;
+                      let adoptedMap: unknown = planningStrictMap.map;
+                      for (const adoption of plan.adoptions) {
+                        const existingCompletion = adoptionCompletions[adoption.logicalKey];
+                        if (!existingCompletion) continue;
+                        const mergedAdoption = map.mergeCompletion(existingCompletion, { nodeId: adoption.resolvedNodeId });
+                        adoptedMap = map.recordCompletion(adoptedMap, mergedAdoption);
+                      }
+                      map.writeSyncMapAtomically(cwd, adoptedMap);
+                      planningStrictMap = { kind: 'valid', map: adoptedMap };
                     }
-                    map.writeSyncMapAtomically(cwd, adoptedMap);
-                    planningStrictMap = { kind: 'valid', map: adoptedMap };
-                  }
 
-                  // Plan 07-06 Task 1 (D-07): the single map-shrinking step
-                  // anywhere in this phase — `plan.prune` already named the
-                  // keys (the one cell of the desired-vs-remote table where
-                  // removal destroys no information); this step is what
-                  // actually applies it, riding the exact same
-                  // read-then-write pattern the adoption step above uses.
-                  // Runs only from `sync`, never `status` (T-07-17): a
-                  // status run over prunable inputs reports `plan.prune` but
-                  // never reaches this branch, so the map file it read stays
-                  // byte-identical.
-                  if (Array.isArray(plan.prune) && plan.prune.length > 0 && planningStrictMap?.kind === 'valid') {
-                    const prunedMap = map.pruneCompletions(planningStrictMap.map, plan.prune.map((entry) => entry.logicalKey));
-                    map.writeSyncMapAtomically(cwd, prunedMap);
-                    planningStrictMap = { kind: 'valid', map: prunedMap };
-                  }
+                    // Plan 07-06 Task 1 (D-07): the single map-shrinking step
+                    // anywhere in this phase — `plan.prune` already named the
+                    // keys (the one cell of the desired-vs-remote table where
+                    // removal destroys no information); this step is what
+                    // actually applies it, riding the exact same
+                    // read-then-write pattern the adoption step above uses.
+                    // Runs only from `sync`, never `status` (T-07-17): a
+                    // status run over prunable inputs reports `plan.prune` but
+                    // never reaches this branch, so the map file it read stays
+                    // byte-identical.
+                    if (Array.isArray(plan.prune) && plan.prune.length > 0 && planningStrictMap?.kind === 'valid') {
+                      const prunedMap = map.pruneCompletions(planningStrictMap.map, plan.prune.map((entry) => entry.logicalKey));
+                      map.writeSyncMapAtomically(cwd, prunedMap);
+                      planningStrictMap = { kind: 'valid', map: prunedMap };
+                    }
 
-                  // Plan 04-04 Task 3: the read-splice-write preparation
-                  // stage runs here, between planning and applying — never
-                  // from `status`, which stays a dry run (SYNC-07/P2 D-13).
-                  // A stage that returns only reports and no operations is
-                  // not an error: the run proceeds with whatever operations
-                  // remain, and exits 0 either way (Phase 1 D-11). Prepared
-                  // operations are appended after the plan's own,
-                  // deterministically, so dispatch order is stable.
-                  const prepared = issueUpdate.prepareIssueUpdates(plan.pendingIssueUpdates ?? [], { cwd });
-                  const combinedPlan = { ...plan, operations: [...(plan.operations ?? []), ...prepared.operations] };
-                  const applyResult = apply.applyMutationPlan(combinedPlan, {
-                    cwd,
-                    map: planningStrictMap?.kind === 'valid' ? planningStrictMap.map ?? null : null,
-                  }) as Record<string, unknown>;
-                  // Plan 05-07: the plan's own reported sub-issue-ceiling
-                  // warnings ride the result beside issueUpdateReports, so a
-                  // developer running `sync` sees them without also running
-                  // `status` — never a new authority, sync still exits 0
-                  // with warnings present (the exit-0-never-gates posture).
-                  result = {
-                    ...applyResult,
-                    issueUpdateReports: prepared.reports,
-                    subIssueCeilingWarnings: plan.subIssueCeilingWarnings ?? [],
-                    adoptions: plan.adoptions ?? [],
-                    prune: plan.prune ?? [],
-                  };
+                    // Plan 04-04 Task 3: the read-splice-write preparation
+                    // stage runs here, between planning and applying — never
+                    // from `status`, which stays a dry run (SYNC-07/P2 D-13).
+                    // A stage that returns only reports and no operations is
+                    // not an error: the run proceeds with whatever operations
+                    // remain, and exits 0 either way (Phase 1 D-11). Prepared
+                    // operations are appended after the plan's own,
+                    // deterministically, so dispatch order is stable.
+                    const prepared = issueUpdate.prepareIssueUpdates(plan.pendingIssueUpdates ?? [], { cwd });
+                    const combinedPlan = { ...plan, operations: [...(plan.operations ?? []), ...prepared.operations] };
+                    const applyResult = apply.applyMutationPlan(combinedPlan, {
+                      cwd,
+                      map: planningStrictMap?.kind === 'valid' ? planningStrictMap.map ?? null : null,
+                    }) as Record<string, unknown>;
+                    // Plan 05-07: the plan's own reported sub-issue-ceiling
+                    // warnings ride the result beside issueUpdateReports, so a
+                    // developer running `sync` sees them without also running
+                    // `status` — never a new authority, sync still exits 0
+                    // with warnings present (the exit-0-never-gates posture).
+                    result = {
+                      ...applyResult,
+                      issueUpdateReports: prepared.reports,
+                      subIssueCeilingWarnings: plan.subIssueCeilingWarnings ?? [],
+                      adoptions: plan.adoptions ?? [],
+                      prune: plan.prune ?? [],
+                    };
+                  }
                 }
               }
             }

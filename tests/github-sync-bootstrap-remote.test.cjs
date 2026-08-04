@@ -245,6 +245,84 @@ describe('readBootstrapRemoteState', () => {
     assert.equal(result.projectOutcome, PROJECT_OUTCOME.ABSENT);
   });
 
+  // Plan 07-10 (D-01/D-05 gap closure): the pre-existing test above scripts
+  // the ABSENT outcome with a synthetic exit code 0 and no errors — a shape a
+  // real deleted Project never actually produces. GitHub's real envelope for
+  // a genuinely deleted board carries a non-zero exit code AND a NOT_FOUND
+  // errors entry alongside the decodable `projectV2: null` — the exact shape
+  // that made these ABSENT branches dead code before this plan's fix
+  // (`parseGraphqlEnvelope`'s unconditional `exitCode !== 0` rejection).
+  test('a real deleted-Project envelope — non-zero exit code, a NOT_FOUND errors entry, and a decodable projectV2: null — still reports the absent outcome, an available read', () => {
+    let repositoryCallsSeen = 0;
+    const result = readBootstrapRemoteState({
+      cwd: '/repo', owner: 'octo', repo: 'repo', projectNumber: 999,
+      execGh(args) {
+        const isRepoDoc = args.some((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:repository'));
+        const isFieldsDoc = args.some((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:fieldsWithTypes'));
+        const isLabelsRest = typeof args[1] === 'string' && args[1].includes('/labels');
+        const isMilestonesRest = typeof args[1] === 'string' && args[1].includes('/milestones');
+        if (isLabelsRest || isMilestonesRest) return { exitCode: 0, reason: 'ok', stderr: '', stdout: '[]' };
+        if (isRepoDoc) {
+          repositoryCallsSeen += 1;
+          return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify(repositoryResponse()) };
+        }
+        if (isFieldsDoc) {
+          return {
+            exitCode: 1,
+            reason: 'gh_exit_nonzero',
+            stderr: 'gh: Could not resolve to a ProjectV2 node with the number 999.',
+            stdout: JSON.stringify({
+              data: { repositoryOwner: { projectV2: null } },
+              errors: [{ type: 'NOT_FOUND', path: ['repositoryOwner', 'projectV2'], message: 'Could not resolve to a ProjectV2 node with the number 999.' }],
+            }),
+          };
+        }
+        throw new Error(`no scripted response for args: ${JSON.stringify(args)}`);
+      },
+    });
+    assert.equal(repositoryCallsSeen, 1);
+    assert.equal(result.available, true);
+    assert.equal(result.reason, BOOTSTRAP_REMOTE_REASON.OK);
+    assert.equal(result.projectOutcome, PROJECT_OUTCOME.ABSENT);
+    assert.equal(result.projectNodeId, null);
+    assert.deepEqual(result.fields, []);
+    // Views are read only when the project resolves (Phase 6 D-01) — an
+    // absent project never reaches that document.
+    assert.deepEqual(result.views, []);
+  });
+
+  // Companion to the two tests above: a non-NOT_FOUND error (FORBIDDEN)
+  // alongside the same null path must still fail closed to the plain
+  // unavailable result — never the absent outcome (T-07-31's mitigation,
+  // generalized from github-sync-remote.cts's own precedent).
+  test('a fields-document read that fails with a non-NOT_FOUND error alongside a null projectV2 path stays unavailable, never absent', () => {
+    const result = readBootstrapRemoteState({
+      cwd: '/repo', owner: 'octo', repo: 'repo', projectNumber: 999,
+      execGh(args) {
+        const isRepoDoc = args.some((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:repository'));
+        const isFieldsDoc = args.some((arg) => typeof arg === 'string' && arg.startsWith('query=') && arg.includes('github-sync-bootstrap:fieldsWithTypes'));
+        const isLabelsRest = typeof args[1] === 'string' && args[1].includes('/labels');
+        const isMilestonesRest = typeof args[1] === 'string' && args[1].includes('/milestones');
+        if (isLabelsRest || isMilestonesRest) return { exitCode: 0, reason: 'ok', stderr: '', stdout: '[]' };
+        if (isRepoDoc) return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify(repositoryResponse()) };
+        if (isFieldsDoc) {
+          return {
+            exitCode: 1,
+            reason: 'gh_exit_nonzero',
+            stderr: 'gh: Resource not accessible by integration.',
+            stdout: JSON.stringify({
+              data: { repositoryOwner: { projectV2: null } },
+              errors: [{ type: 'FORBIDDEN', path: ['repositoryOwner', 'projectV2'], message: 'Resource not accessible by integration.' }],
+            }),
+          };
+        }
+        throw new Error(`no scripted response for args: ${JSON.stringify(args)}`);
+      },
+    });
+    assert.equal(result.available, false);
+    assert.equal(result.projectOutcome, PROJECT_OUTCOME.UNAVAILABLE);
+  });
+
   test('a real slurped multi-page label list is decoded and attached to the snapshot alongside the existing project/fields data', () => {
     const seq = { repository: [repositoryResponse()], fields: [ownerFieldsResponse([])], labels: [repoObjectsFixture.multiPageLabelsList] };
     const { execGh } = makeExecGh(seq);

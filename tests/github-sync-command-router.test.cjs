@@ -3030,3 +3030,337 @@ describe('github-sync router: plan 07-08 — D-20 pre-pass and D-01 absence-mark
     assert.equal(process.exitCode, 0);
   });
 });
+
+// ─── Plan 07-10 (D-01/D-05 gap closure, GAP 1 of 07-VERIFICATION.md): a
+// genuinely deleted Project — the REAL `github-sync-remote.cts` and
+// `github-sync-bootstrap-remote.cts` readers, driven by a fake `execGh`
+// answering GitHub's actual deleted-project envelope — must reach the D-01
+// existence-classification block instead of returning uncertain/
+// remote_unavailable before it. `realReaderSeams` below delegates to the
+// compiled real reader modules; neither member is a hand-written stub
+// returning a snapshot shape (the unrealism this task replaces — the plan
+// 07-01 describe block's own `_remote.readRemoteSnapshot: () => ({
+// available: true })` fixture above can never be produced by the real
+// readers against a deleted board). ─────────────────────────────────────────
+
+describe('github-sync router: plan 07-10 — a genuinely deleted Project through the real readers', () => {
+  const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+  const realRemoteReader = require('../gsd-core/bin/lib/github-sync-remote.cjs');
+  const realBootstrapRemoteReader = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+  const T0 = '2026-08-01T00:00:00.000Z';
+  const T0_PLUS_60S = '2026-08-01T00:01:00.000Z';
+
+  function baseProjectCompletion(overrides = {}) {
+    return {
+      logicalKey: 'project',
+      nodeId: 'PVT_OLD',
+      completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner,
+      repo: TARGET.repo,
+      repositoryNumber: TARGET.repositoryNumber,
+      ...overrides,
+    };
+  }
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  function mapPathFor(tmpDir) {
+    return path.join(tmpDir, '.planning', '.github-sync.json');
+  }
+
+  /**
+   * `realReaderSeams`: `{ _remote, _bootstrapRemote }` whose two members
+   * delegate to the REAL compiled reader modules
+   * (`gsd-core/bin/lib/github-sync-remote.cjs` and
+   * `gsd-core/bin/lib/github-sync-bootstrap-remote.cjs`), spreading the
+   * caller-supplied `execGh` into the options object each reader already
+   * accepts. This is the whole point of this task: no member of `_remote` or
+   * `_bootstrapRemote` is a hand-written stub returning a snapshot shape.
+   */
+  function realReaderSeams(execGh) {
+    return {
+      _remote: { readRemoteSnapshot: (options) => realRemoteReader.readRemoteSnapshot({ ...options, execGh }) },
+      _bootstrapRemote: { readBootstrapRemoteState: (options) => realBootstrapRemoteReader.readBootstrapRemoteState({ ...options, execGh }) },
+    };
+  }
+
+  const REMOTE_MARKER_NAMES = ['project', 'items', 'fields', 'subIssues', 'issueId'];
+
+  /** A decodable empty-connection default for every document either real reader can issue — so a test only has to script the ONE document it is actually about. */
+  function defaultGraphqlResponse(document) {
+    switch (document) {
+      case 'project':
+        return { data: { repositoryOwner: { projectV2: { id: 'PVT_DEFAULT' } } } };
+      case 'items':
+        return { data: { repositoryOwner: { projectV2: { items: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'fields':
+        return { data: { repositoryOwner: { projectV2: { fields: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'subIssues':
+        return { data: { repository: { issue: { subIssues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'repository':
+        return { data: { repository: { id: 'R_DEFAULT', owner: { id: 'O_DEFAULT', login: TARGET.owner }, projectsV2: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } };
+      case 'fieldsWithTypes':
+        return { data: { repositoryOwner: { projectV2: { id: 'PVT_DEFAULT', fields: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'views':
+        return { data: { repositoryOwner: { projectV2: { views: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      default:
+        return { data: {} };
+    }
+  }
+
+  /**
+   * A routing fake `execGh` for the two REAL reader modules `realReaderSeams`
+   * wraps. Routes on the `-f query=` argument's embedded marker comments
+   * (`# github-sync:project`, `# github-sync:items`, ...) for the snapshot
+   * reader, on identity against `BOOTSTRAP_DOCUMENTS`' own exported values
+   * for the bootstrap reader, and on the leading `api` path argument for the
+   * two REST list reads (labels, milestones). `routes[document]` is either a
+   * `GhResult`-returning function `(callIndex) => GhResult` (so a test can
+   * script a different answer for the Nth call to the same document — the
+   * post-rebuild re-read) or a bare `GhResult`. Every call is recorded on
+   * `.calls` (`{ document, args }`); an unrouted document defaults to a
+   * decodable empty-connection response.
+   */
+  function makeRoutingExecGh(routes = {}) {
+    const calls = [];
+    const callCounts = {};
+    const execGh = (args) => {
+      let document = null;
+      if (args[0] === 'api' && args[1] !== 'graphql') {
+        if (typeof args[1] === 'string' && args[1].includes('/labels')) document = 'labels';
+        else if (typeof args[1] === 'string' && args[1].includes('/milestones')) document = 'milestones';
+      } else {
+        const queryArg = args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
+        const query = queryArg ? queryArg.slice('query='.length) : '';
+        document = REMOTE_MARKER_NAMES.find((name) => query.includes(`github-sync:${name}`)) ?? null;
+        if (!document) {
+          const bootstrapEntry = Object.entries(realBootstrapRemoteReader.BOOTSTRAP_DOCUMENTS).find(([, doc]) => doc === query);
+          document = bootstrapEntry ? bootstrapEntry[0] : null;
+        }
+      }
+      calls.push({ document, args });
+      const index = callCounts[document] ?? 0;
+      callCounts[document] = index + 1;
+      const handler = routes[document];
+      if (typeof handler === 'function') return handler(index);
+      if (handler !== undefined) return handler;
+      if (document === 'labels' || document === 'milestones') return { exitCode: 0, reason: 'ok', stdout: '[]', stderr: '' };
+      return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(defaultGraphqlResponse(document)), stderr: '' };
+    };
+    return { execGh, calls };
+  }
+
+  /** GitHub's real deleted-Project envelope: `data.repositoryOwner.projectV2` set to null, a single NOT_FOUND-typed `errors` entry, exit code 1. */
+  const DELETED_PROJECT_ENVELOPE = {
+    exitCode: 1,
+    reason: 'gh_exit_nonzero',
+    stderr: 'gh: Could not resolve to a ProjectV2 node with the number 7.',
+    stdout: JSON.stringify({
+      data: { repositoryOwner: { projectV2: null } },
+      errors: [{ type: 'NOT_FOUND', path: ['repositoryOwner', 'projectV2'], message: 'Could not resolve to a ProjectV2 node with the number 7.' }],
+    }),
+  };
+
+  /** A read that FAILED — exit code 1, a FORBIDDEN (non-NOT_FOUND) errors entry — never absence evidence (T-07-31). */
+  const FORBIDDEN_PROJECT_ENVELOPE = {
+    exitCode: 1,
+    reason: 'gh_exit_nonzero',
+    stderr: 'gh: Resource not accessible by integration.',
+    stdout: JSON.stringify({
+      data: { repositoryOwner: { projectV2: null } },
+      errors: [{ type: 'FORBIDDEN', path: ['repositoryOwner', 'projectV2'], message: 'Resource not accessible by integration.' }],
+    }),
+  };
+
+  function resolvedProjectEnvelope(nodeId) {
+    return { exitCode: 0, reason: 'ok', stderr: '', stdout: JSON.stringify({ data: { repositoryOwner: { projectV2: { id: nodeId } } } }) };
+  }
+
+  function resolvedFieldsEnvelope(nodeId) {
+    return {
+      exitCode: 0, reason: 'ok', stderr: '',
+      stdout: JSON.stringify({ data: { repositoryOwner: { projectV2: { id: nodeId, fields: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } }),
+    };
+  }
+
+  test('Test 1 (the tracer): a genuinely deleted Project, with a confirmed absence already stamped past the recreate gate, rebuilds through the real readers — both planBootstrap passes run and a create-project mutation reaches the injected apply seam', () => {
+    const tmpDir = createTempProject();
+    const bootstrapPlanCalls = [];
+    const applyCalls = [];
+    const routing = makeRoutingExecGh({
+      // Call 0: the classification read AND the router's own initial
+      // snapshot read both see the deleted board. Call 1 (post-rebuild
+      // re-read / runBootstrapTwoPass's options-pass re-read) sees the
+      // freshly created replacement.
+      project: (index) => (index === 0 ? DELETED_PROJECT_ENVELOPE : resolvedProjectEnvelope('PVT_NEW')),
+      fieldsWithTypes: (index) => (index === 0 ? DELETED_PROJECT_ENVELOPE : resolvedFieldsEnvelope('PVT_NEW')),
+    });
+    const cap = captureStdout();
+    try {
+      realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, baseProjectCompletion({ absenceCount: 1, absenceFirstSeenAt: T0 })));
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => {
+            bootstrapPlanCalls.push(options.pass);
+            if (options.pass === 'structure') {
+              return { operations: [{ logicalKey: 'project', kind: 'create' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+            }
+            return { operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] };
+          },
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: {
+          // Mirrors the REAL applier's own responsibility (github-sync-apply.cjs):
+          // a confirmed operation is persisted to disk by the applier itself, not
+          // by the router. The fake here performs that same persist so the final
+          // on-disk assertion below reflects what a real create dispatch would do.
+          applyMutationPlan: (plan) => {
+            const operation = plan.operations[0] || {};
+            applyCalls.push({ tag: operation.logicalKey ?? null, kind: operation.kind ?? null });
+            if (operation.logicalKey === 'project') {
+              const currentMap = realMap.readSyncMapStrict(tmpDir, { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber }).map;
+              const nextMap = realMap.recordCompletion(currentMap, baseProjectCompletion({ nodeId: 'PVT_NEW', issueNumber: 42, absenceCount: 2, absenceFirstSeenAt: T0 }));
+              realMap.writeSyncMapAtomically(tmpDir, nextMap);
+              return {
+                kind: 'completed',
+                outcomes: [{ logicalKey: 'project', operationKey: 'project', action: 'create', result: 'confirmed' }],
+                map: nextMap,
+              };
+            }
+            return { kind: 'completed', outcomes: [] };
+          },
+        },
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+
+    assert.deepEqual(bootstrapPlanCalls, ['structure', 'options'], 'both planBootstrap passes ran, structure before options, past the recreate gate');
+    assert.ok(
+      applyCalls.some((call) => call.tag === 'project' && call.kind === 'create'),
+      'the structure pass\'s create-project mutation reached the injected apply seam',
+    );
+    assert.ok(applyCalls.some((call) => call.tag === 'phase:01'), 'reconciliation still ran, in the same invocation, after the rebuild');
+
+    const projectCalls = routing.calls.filter((call) => call.document === 'project');
+    assert.equal(projectCalls.length, 2, 'the # github-sync:project document ran twice: the initial deleted-project read, then the post-rebuild re-read');
+
+    try {
+      const finalMap = JSON.parse(fs.readFileSync(mapPathFor(tmpDir), 'utf8'));
+      assert.equal(finalMap.completions.project.nodeId, 'PVT_NEW');
+    } finally { cleanup(tmpDir); }
+
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Test 2: the same deleted-Project input with NO prior absence marker records absenceCount 1 + absenceFirstSeenAt on the project completion, dispatches zero mutations, and returns uncertain/remote_unavailable', () => {
+    const tmpDir = createTempProject();
+    const bootstrapPlanCalls = [];
+    const applyCalls = [];
+    const routing = makeRoutingExecGh({
+      project: () => DELETED_PROJECT_ENVELOPE,
+      fieldsWithTypes: () => DELETED_PROJECT_ENVELOPE,
+    });
+    const cap = captureStdout();
+    let output;
+    try {
+      realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, baseProjectCompletion()));
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => { bootstrapPlanCalls.push(options.pass); return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] }; },
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan) => { applyCalls.push((plan.operations[0] || {}).logicalKey ?? null); return { kind: 'completed', outcomes: [] }; } },
+        _clock: { now: () => 0, nowIso: () => T0, sleep: () => {} },
+      });
+    } finally { output = cap.chunks.join(''); cap.restore(); }
+
+    assert.deepEqual(bootstrapPlanCalls, [], 'the recreate gate is not yet satisfied on a first confirmed absence — zero bootstrap passes dispatched');
+    assert.deepEqual(applyCalls, [], 'the injected apply seam received zero operations');
+
+    try {
+      const written = JSON.parse(fs.readFileSync(mapPathFor(tmpDir), 'utf8'));
+      assert.equal(written.completions.project.absenceCount, 1);
+      assert.equal(written.completions.project.absenceFirstSeenAt, T0);
+      assert.equal(written.completions.project.nodeId, 'PVT_OLD', "D-08's wholesale-replace trap: the pre-existing nodeId must survive the merge");
+    } finally { cleanup(tmpDir); }
+
+    assert.deepEqual(JSON.parse(output), { kind: 'uncertain', reason: 'remote_unavailable' });
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Test 3: a project read that FAILED (FORBIDDEN, not NOT_FOUND) leaves the on-disk sync map byte-identical, records no absence marker, and still returns uncertain/remote_unavailable', () => {
+    const tmpDir = createTempProject();
+    const bootstrapPlanCalls = [];
+    const applyCalls = [];
+    const routing = makeRoutingExecGh({
+      project: () => FORBIDDEN_PROJECT_ENVELOPE,
+      fieldsWithTypes: () => FORBIDDEN_PROJECT_ENVELOPE,
+    });
+    const cap = captureStdout();
+    let output;
+    let before;
+    try {
+      realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, baseProjectCompletion()));
+      before = fs.readFileSync(mapPathFor(tmpDir), 'utf8');
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => { bootstrapPlanCalls.push(options.pass); return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] }; },
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan) => { applyCalls.push((plan.operations[0] || {}).logicalKey ?? null); return { kind: 'completed', outcomes: [] }; } },
+        _clock: { now: () => 0, nowIso: () => T0, sleep: () => {} },
+      });
+    } finally { output = cap.chunks.join(''); cap.restore(); }
+
+    assert.deepEqual(bootstrapPlanCalls, [], 'a failed read never reaches the D-01 classification block at all');
+    assert.deepEqual(applyCalls, []);
+
+    try {
+      const after = fs.readFileSync(mapPathFor(tmpDir), 'utf8');
+      assert.equal(after, before, 'the on-disk sync map file is byte-identical before and after a run whose remote read merely failed');
+    } finally { cleanup(tmpDir); }
+
+    assert.deepEqual(JSON.parse(output), { kind: 'uncertain', reason: 'remote_unavailable' });
+    assert.equal(process.exitCode, 0);
+  });
+
+  // Test 4 (per this plan's own behavior spec): with the project resolving
+  // normally, every pre-existing behaviour in the plan 07-01 and 07-08
+  // describe blocks above still holds — run the whole file, not a new
+  // assertion here.
+});

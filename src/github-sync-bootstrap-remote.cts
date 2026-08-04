@@ -268,6 +268,50 @@ function parseGraphqlEnvelope(result: GhResult): Record<string, unknown> | null 
 }
 
 /**
+ * Plan 07-10 (D-01/D-05 gap closure): a deliberate parallel to
+ * `github-sync-remote.cts`'s own `isNotFoundOnlyErrors` — not an import,
+ * per this module's header ("these two modules do not import each other").
+ * An absent or empty `errors` array is tolerated (mirrors that module's
+ * identical predicate); a non-empty array is accepted only when every entry
+ * is typed NOT_FOUND.
+ */
+function isNotFoundOnlyErrors(errors: unknown): boolean {
+  if (!Array.isArray(errors) || errors.length === 0) return true;
+  return errors.every((entry) => (
+    entry !== null && typeof entry === 'object' && (entry as { type?: unknown }).type === 'NOT_FOUND'
+  ));
+}
+
+/**
+ * NOT_FOUND-tolerant sibling of `parseGraphqlEnvelope`, used ONLY by
+ * `readProjectFields` below. GitHub's real deleted-Project envelope carries a
+ * non-zero exit code AND a NOT_FOUND-typed `errors` entry alongside a
+ * decodable `data.repositoryOwner.projectV2: null` — `parseGraphqlEnvelope`'s
+ * unconditional `exitCode !== 0` rejection made that exact shape undecodable,
+ * which is why the `PROJECT_OUTCOME.ABSENT` returns in `readProjectFields`
+ * were dead code against a real deleted board. This decoder accepts `data`
+ * regardless of exit code as long as every accompanying error (if any) is
+ * NOT_FOUND-typed; any other error type (FORBIDDEN, rate limit, ...) still
+ * fails closed to `null`, exactly like `parseGraphqlEnvelope`. Every other
+ * caller of `parseGraphqlEnvelope` — `readRepository`, `readProjectViews`,
+ * `readRestList` — is untouched and stays fail-closed: a repository that does
+ * not resolve, or a views read that comes back malformed after the project
+ * already resolved, are not absence evidence.
+ */
+function parseProjectFieldsEnvelope(result: GhResult): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  if (!isNotFoundOnlyErrors(parsed.errors)) return null;
+  const data = parsed.data;
+  return isRecord(data) ? data : null;
+}
+
+/**
  * Decodes the widened repository document's `projectsV2` connection into a
  * three-valued link state relative to `targetProjectNumber`, reading only
  * the first page (T-03-30). Returns `undefined` on any malformed shape,
@@ -503,7 +547,10 @@ function readProjectFields(options: BootstrapRemoteOptions): { outcome: typeof P
       ],
       { cwd: options.cwd },
     );
-    const data = parseGraphqlEnvelope(result);
+    // Plan 07-10: the NOT_FOUND-tolerant decoder — the ONLY call site in this
+    // module that uses it. `readRepository`/`readProjectViews` keep
+    // `parseGraphqlEnvelope`'s unconditional fail-closed exit-code gate.
+    const data = parseProjectFieldsEnvelope(result);
     if (data === null) return undefined;
     const repositoryOwner = data.repositoryOwner;
     if (repositoryOwner === null) return { outcome: PROJECT_OUTCOME.ABSENT, fields: [], projectNodeId: null };
