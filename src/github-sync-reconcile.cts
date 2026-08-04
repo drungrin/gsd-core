@@ -9,9 +9,15 @@ import bootstrapPlanMod = require('./github-sync-bootstrap-plan.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import issueBodyMod = require('./github-sync-issue-body.cjs');
 import type { FieldValues, FieldName, ParsedFieldState, PlanStatus } from './github-sync-issue-body.cts';
+// Plan 07-04 Task 2 (D-06): safe in this one direction only —
+// `github-sync-existence.cts` must never import this module back (see that
+// module's own header comment on why the classifier lives in a dedicated file).
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import existenceMod = require('./github-sync-existence.cjs');
 
 const { OPERATION_TRANSPORT, OPERATION_ACTION, ARGV_REF_PART } = operationMod;
 const { BOOTSTRAP_LOGICAL_KEY, GSD_LABELS, STATUS_FIELD_NAME } = bootstrapPlanMod;
+const { EXISTENCE_VERDICT } = existenceMod;
 const {
   renderNewIssueBody, renderPhaseRegion, contentHash, renderFieldState, parseFieldState, changedFields,
   renderNewPlanIssueBody, renderPlanRegion, PLAN_FIELD_NAMES,
@@ -67,7 +73,42 @@ const OPERATION_REASON = Object.freeze({
   // from neither a prior run nor a plan-create this run already pushed
   // earlier in the same ascending-id pass.
   DEPENDENCY_SLOT_MISMATCH: 'dependency_slot_mismatch',
+  // Plan 07-04 Task 2 (D-06): an object whose existence this run could not
+  // determine — the bootstrap read that would confirm or deny it failed.
+  // Reported per object, with the object's logical key as `detail`, so a
+  // developer reading the report knows which object was unreadable rather
+  // than only that something was. A member of `PER_ITEM_BLOCKED_REASONS`
+  // below: one unreadable object never discards the rest of the run's plan.
+  EXISTENCE_UNKNOWN: 'existence_unknown',
 } as const);
+
+/**
+ * 07-04 Task 2 (D-06), mirroring `github-sync-bootstrap-plan.cts`'s
+ * `PER_ITEM_BLOCKED_REASONS`/`isRunFatalBlockedReason` split exactly: the
+ * closed set of `OPERATION_REASON` members whose semantics are "skip this
+ * one item" rather than "stop the whole plan's apply." Membership here is a
+ * deliberate fatality decision, made once per reason as it is introduced —
+ * omission is the safe default (`isRunFatalBlockedReason` treats every
+ * non-member as run-fatal), so a future blocked reason added to this module
+ * without updating this set still reads as run-fatal instead of silently
+ * gaining per-item dispatch permission. Today exactly one member: an object
+ * whose existence this run could not determine.
+ */
+const PER_ITEM_BLOCKED_REASONS: ReadonlySet<string> = new Set([
+  OPERATION_REASON.EXISTENCE_UNKNOWN,
+]);
+
+/**
+ * Fail-closed classifier: `false` only for a reason in
+ * `PER_ITEM_BLOCKED_REASONS`, `true` for every other string — including one
+ * this module has never heard of. Mirrors `github-sync-bootstrap-plan.cts`'s
+ * `isRunFatalBlockedReason` exactly (same name, same predicate shape) so a
+ * caller consuming both modules' blocked arrays reads one discipline, not
+ * two.
+ */
+function isRunFatalBlockedReason(reason: string): boolean {
+  return !PER_ITEM_BLOCKED_REASONS.has(reason);
+}
 
 /**
  * Plan 05-07 (D-14): GitHub's own documented ceiling on sub-issues per
@@ -187,6 +228,16 @@ interface StrictMapCompletion { nodeId: string; issueNumber?: number; contentHas
 interface StrictMap { kind: 'absent' | 'valid' | 'blocking'; reason?: string; map?: { completions?: Record<string, StrictMapCompletion> }; }
 
 /**
+ * Plan 07-04 Task 2 (D-06): the shape `classifyExistence`
+ * (`github-sync-existence.cts`) already returns — accepted here as a plain
+ * structural type rather than an imported one, since that module's own
+ * `ExistenceVerdictEntry` interface is a local, unexported type. Optional on
+ * `planReconciliation` so every pre-existing call site (which passes none)
+ * behaves identically to before this task.
+ */
+interface ExistenceVerdictLike { logicalKey: string; verdict: string; }
+
+/**
  * Plan 04-04 Task 1: the read-splice-write stage's own input shape (D-08's
  * "the pure stage emits data, not a body string"). `milestoneKey` is not one
  * of the fields the plan's own truths enumerate by name, but
@@ -241,7 +292,8 @@ interface ReconciliationPlan {
       | typeof OPERATION_REASON.REGION_DAMAGED
       | typeof OPERATION_REASON.FIELD_UNRESOLVED
       | typeof OPERATION_REASON.PARENT_UNRESOLVED
-      | typeof OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH;
+      | typeof OPERATION_REASON.DEPENDENCY_SLOT_MISMATCH
+      | typeof OPERATION_REASON.EXISTENCE_UNKNOWN;
     detail?: string;
   }>;
   uncertain: Array<{ reason: typeof OPERATION_REASON.REMOTE_UNAVAILABLE }>;
@@ -1135,7 +1187,12 @@ function planDependencyResolvable(
  * whose id is absent from the desired phase set as an orphan — reported by
  * name, never acted on.
  */
-function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, strictMap: StrictMap): ReconciliationPlan {
+function planReconciliation(
+  desired: DesiredState,
+  remote: RemoteSnapshot,
+  strictMap: StrictMap,
+  existenceVerdicts?: ExistenceVerdictLike[],
+): ReconciliationPlan {
   const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [] };
   if (!desired.available) return { ...empty, blocked: [{ reason: OPERATION_REASON.DESIRED_UNAVAILABLE, detail: desired.reason }], uncertain: [] };
   if (!remote.available) return { ...empty, blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
@@ -1545,6 +1602,18 @@ function planReconciliation(desired: DesiredState, remote: RemoteSnapshot, stric
     subIssueCeilingWarnings.push({ phaseId: phase.id, issueNumber: issueCompletion.issueNumber, count, limit: PLAN_SUB_ISSUE_LIMIT });
   }
 
+  // Plan 07-04 Task 2 (D-06): one blocked entry per object whose existence
+  // this run could not determine — reported by logical key. This function is
+  // pure and never writes the map, so the object's completion is left
+  // untouched by construction (SC2); the next run re-classifies cleanly.
+  // `EXISTENCE_UNKNOWN` sits in `PER_ITEM_BLOCKED_REASONS`, so one unreadable
+  // object costs only itself — every operation already computed above for a
+  // cleanly classified object is unaffected by this loop.
+  for (const verdict of existenceVerdicts ?? []) {
+    if (verdict.verdict !== EXISTENCE_VERDICT.UNKNOWN) continue;
+    blocked.push({ reason: OPERATION_REASON.EXISTENCE_UNKNOWN, detail: verdict.logicalKey });
+  }
+
   return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges, subIssueCeilingWarnings };
 }
 
@@ -1552,6 +1621,8 @@ export = {
   planReconciliation,
   OPERATION_KIND,
   OPERATION_REASON,
+  PER_ITEM_BLOCKED_REASONS,
+  isRunFatalBlockedReason,
   issueKeyFor,
   planKeyFor,
   planIssueKeyFor,
