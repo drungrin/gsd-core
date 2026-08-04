@@ -2953,3 +2953,80 @@ describe('github-sync router: plan 07-07 — D-20 adopt-by-marker pre-pass', () 
     assert.equal(process.exitCode, 0);
   });
 });
+
+// ─── Plan 07-08 Task 2 (07-COVERAGE-AUDIT.md, Orphan Recovery gap): the D-20
+// marker pre-pass and the D-01 project absence-marker step must compose
+// correctly when both fire in the SAME `sync` invocation. Before this task's
+// fix, the D-01 step (present since plan 07-01, predating `planningStrictMap`)
+// built its own `recordCompletion` call from the ORIGINAL `strictMap` —
+// never `planningStrictMap`, which the D-20 pre-pass (plan 07-07) may already
+// have advanced and persisted to disk. `recordCompletion`'s wholesale-replace
+// semantics then silently dropped every completion D-20 had just written,
+// and the very next line overwrote the file with the stale result — the
+// exact wholesale-replace trap D-08's own doc comment warns about, applied
+// against the wrong base map. Uses the REAL github-sync-map module (never a
+// hand-rolled stand-in), matching every other describe block in this file
+// that exercises D-08's trap, so the fix is proven against the real merge
+// semantics rather than a fake that could not reproduce the bug. ──────────
+
+describe('github-sync router: plan 07-08 — D-20 pre-pass and D-01 absence-marker composition (bug fix)', () => {
+  const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+  const { phaseMarker, FENCE_BEGIN, FENCE_END } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+  const markerSearchReal = require('../gsd-core/bin/lib/github-sync-marker-search.cjs');
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+  const T0 = '2026-08-01T00:00:00.000Z';
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  test('a marker binding and the project absence-marker advance in the SAME sync run both survive on disk — the D-20 write is never overwritten by the D-01 write that follows it', () => {
+    let stored = realMap.recordCompletion(null, {
+      logicalKey: 'project', nodeId: 'PVT_OLD', completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber,
+    });
+    const writeCalls = [];
+    const body = `${phaseMarker('01')}\n${FENCE_BEGIN}\nregion\n${FENCE_END}\n`;
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true, phases: [{ id: '01' }], plans: [] }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'valid', map: stored }),
+          recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+          mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+          writeSyncMapAtomically: (cwd, map) => { writeCalls.push(map); stored = map; },
+          pruneCompletions: (map) => map,
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'present' }) },
+        _markerSearch: {
+          readIssuesWithMarkers: () => ({ available: true, entries: [{ number: 100, nodeId: 'ISSUE_1', body }] }),
+          unboundIssueTargets: markerSearchReal.unboundIssueTargets,
+          bindMarkers: markerSearchReal.bindMarkers,
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], adoptions: [], prune: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: () => ({ kind: 'completed', outcomes: [] }) },
+        _clock: { now: () => 0, nowIso: () => T0, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+
+    assert.ok(writeCalls.length >= 2, 'both the D-20 marker write and the D-01 absence-marker write happen');
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(stored.completions, 'issue:phase:01'),
+      'the marker binding written by the D-20 pre-pass must survive the D-01 step that runs after it',
+    );
+    assert.equal(stored.completions['issue:phase:01'].nodeId, 'ISSUE_1');
+    assert.ok(Object.prototype.hasOwnProperty.call(stored.completions, 'project'), 'the project completion the D-01 step wrote is also present');
+    assert.equal(process.exitCode, 0);
+  });
+});
