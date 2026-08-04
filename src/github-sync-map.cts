@@ -20,6 +20,16 @@
  * valid under the widened allow-list, and no map has shipped to a developer
  * yet (D-09 records no installed map exists to protect), so a version bump
  * would only force a needless re-`init` for zero migration benefit.
+ *
+ * Plan 07-01 (D-08): `absenceCount` and `absenceFirstSeenAt` widen the same
+ * allow-list the identical way — two more optional flat scalars, no
+ * `SYNC_MAP_VERSION` bump, every map already on disk stays valid. D-08's own
+ * watch-out: `recordCompletion` below is a WHOLESALE REPLACE of whatever was
+ * previously recorded at a logical key — it silently wiped `contentHash`
+ * twice already (plans 05-05 and 05-06, both genuine live convergence bugs,
+ * WINDOWS #9). The absence marker must never be re-losable the same way:
+ * every capture that writes it goes through `mergeCompletion` below, never a
+ * bare `recordCompletion` call built from a partial object.
  */
 
 import fs from 'node:fs';
@@ -63,6 +73,10 @@ export interface SyncCompletion {
   fieldState?: string;
   /** D-08 (plan 05-06): the plan issue's own recorded open/closed state — see `ISSUE_STATE`. */
   issueState?: IssueStateValue;
+  /** D-08 (plan 07-01): the number of consecutive confirmed absences recorded for this key. Cleared on a `present` verdict. */
+  absenceCount?: number;
+  /** D-08 (plan 07-01): the ISO 8601 instant the FIRST confirmed absence was recorded — never restamped by later confirmations. Cleared on a `present` verdict. */
+  absenceFirstSeenAt?: string;
 }
 
 export interface SyncMap {
@@ -97,7 +111,7 @@ function isRepositoryIdentity(value: unknown): value is RepositoryIdentity {
 function isCompletion(value: unknown): value is SyncCompletion {
   if (!isRecord(value) || !hasOnlyKeys(value, [
     'logicalKey', 'nodeId', 'issueNumber', 'completedAt', 'owner', 'repo', 'repositoryNumber',
-    'contentHash', 'fieldState', 'issueState',
+    'contentHash', 'fieldState', 'issueState', 'absenceCount', 'absenceFirstSeenAt',
   ])) return false;
   if (!isNonEmptyString(value.logicalKey) || !isNonEmptyString(value.nodeId) ||
     !isNonEmptyString(value.completedAt) || !isNonEmptyString(value.owner) || !isNonEmptyString(value.repo)) return false;
@@ -108,7 +122,32 @@ function isCompletion(value: unknown): value is SyncCompletion {
   if (value.contentHash !== undefined && !isNonEmptyString(value.contentHash)) return false;
   if (value.fieldState !== undefined && !isNonEmptyString(value.fieldState)) return false;
   if (value.issueState !== undefined && value.issueState !== ISSUE_STATE.OPEN && value.issueState !== ISSUE_STATE.CLOSED) return false;
+  if (value.absenceCount !== undefined && (typeof value.absenceCount !== 'number' || !Number.isSafeInteger(value.absenceCount) || value.absenceCount <= 0)) return false;
+  if (value.absenceFirstSeenAt !== undefined && !isNonEmptyString(value.absenceFirstSeenAt)) return false;
   return typeof repositoryNumber === 'number' && Number.isSafeInteger(repositoryNumber) && repositoryNumber > 0;
+}
+
+/**
+ * D-08 (plan 07-01): merges `next` onto `previous` (when supplied), then
+ * deletes every member named in `options.clear`. Exists because
+ * `recordCompletion` below replaces the WHOLE completion object at a key
+ * rather than merging into it — every capture that must preserve
+ * previously-recorded optional members (the absence marker included) goes
+ * through this helper, never a bare object literal built from scratch. The
+ * explicit `clear` list exists so that erasing a member — which the D-08
+ * marker lifecycle requires on a `present` verdict — is always a stated
+ * intent, never an accident of omission.
+ */
+export function mergeCompletion(
+  previous: SyncCompletion | undefined,
+  next: Partial<SyncCompletion>,
+  options: { clear?: ReadonlyArray<keyof SyncCompletion> } = {},
+): SyncCompletion {
+  const merged: Partial<SyncCompletion> = { ...(previous ?? {}), ...next };
+  for (const key of options.clear ?? []) {
+    delete merged[key];
+  }
+  return merged as SyncCompletion;
 }
 
 function sameRepository(left: RepositoryIdentity, right: RepositoryIdentity): boolean {

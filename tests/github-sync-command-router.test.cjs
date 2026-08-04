@@ -2002,3 +2002,161 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
     });
   });
 });
+
+// ─── Plan 07-01 (D-01/D-05/D-08/D-09): existence classification and the
+// rebuild delegation — `sync` only, wired between the strictMap/remoteSnapshot
+// reads and `planReconciliation`. Uses the REAL github-sync-map module for
+// `recordCompletion`/`mergeCompletion` (never a hand-rolled stand-in) so the
+// wholesale-replace trap (D-08's own warning) would actually be exercised. ──
+
+describe('github-sync router: plan 07-01 — existence classification and rebuild delegation', () => {
+  const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+  const T0 = '2026-08-01T00:00:00.000Z';
+  const T0_PLUS_60S = '2026-08-01T00:01:00.000Z';
+
+  function baseProjectCompletion(overrides = {}) {
+    return {
+      logicalKey: 'project',
+      nodeId: 'PVT_OLD',
+      completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner,
+      repo: TARGET.repo,
+      repositoryNumber: TARGET.repositoryNumber,
+      ...overrides,
+    };
+  }
+
+  /** Wraps the real map module's pure functions with call-tracking read/write seams. */
+  function makeMapSeam(initialMap) {
+    let stored = initialMap;
+    const writeCalls = [];
+    return {
+      seam: {
+        readSyncMapStrict: () => ({ kind: 'valid', map: stored }),
+        recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+        mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+        writeSyncMapAtomically: (cwd, map) => { writeCalls.push(map); stored = map; },
+      },
+      writeCalls,
+      current: () => stored,
+    };
+  }
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  test('a first confirmed absence records absenceCount 1 + absenceFirstSeenAt, dispatches ZERO bootstrap operations, and still reaches reconciliation', () => {
+    const mapSeam = makeMapSeam(realMap.recordCompletion(null, baseProjectCompletion()));
+    const bootstrapPlanCalls = [];
+    const applyCalls = [];
+    const remoteCalls = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: mapSeam.seam,
+        _remote: {
+          readRemoteSnapshot: (options) => { remoteCalls.push(options); return { available: true }; },
+        },
+        _bootstrapRemote: {
+          readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }),
+        },
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => { bootstrapPlanCalls.push(options.pass); return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] }; },
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan) => { applyCalls.push((plan.operations[0] || {}).logicalKey ?? null); return { kind: 'completed', outcomes: [] }; } },
+        _clock: { now: () => 0, nowIso: () => T0, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+
+    assert.deepEqual(bootstrapPlanCalls, [], 'first confirmed absence must dispatch zero bootstrap operations');
+    assert.deepEqual(applyCalls, ['phase:01'], 'only the reconciliation apply runs');
+    assert.equal(remoteCalls.length, 1, 'no post-rebuild re-read on a non-triggering run');
+
+    assert.equal(mapSeam.writeCalls.length, 1);
+    const written = mapSeam.writeCalls[0];
+    assert.equal(written.completions.project.absenceCount, 1);
+    assert.equal(written.completions.project.absenceFirstSeenAt, T0);
+    // D-08's wholesale-replace trap: the pre-existing nodeId must survive the merge.
+    assert.equal(written.completions.project.nodeId, 'PVT_OLD');
+
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('a second confirmed absence past the 60000ms gate runs BOTH planBootstrap passes and then planReconciliation, in that order, inside one invocation', () => {
+    const mapSeam = makeMapSeam(realMap.recordCompletion(null, baseProjectCompletion({ absenceCount: 1, absenceFirstSeenAt: T0 })));
+    const bootstrapPlanCalls = [];
+    const applyCalls = [];
+    const remoteCalls = [];
+    const bootstrapRemoteCalls = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: mapSeam.seam,
+        _remote: {
+          readRemoteSnapshot: (options) => { remoteCalls.push(options); return { available: true }; },
+        },
+        _bootstrapRemote: {
+          readBootstrapRemoteState: (options) => { bootstrapRemoteCalls.push(options); return { available: true, projectOutcome: 'absent' }; },
+        },
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => {
+            bootstrapPlanCalls.push(options.pass);
+            if (options.pass === 'structure') {
+              return { operations: [{ logicalKey: 'project' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+            }
+            return { operations: [{ logicalKey: 'option:status:todo' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+          },
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: {
+          applyMutationPlan: (plan) => {
+            const tag = (plan.operations[0] || {}).logicalKey ?? null;
+            applyCalls.push(tag);
+            if (tag === 'project') {
+              return {
+                kind: 'completed',
+                outcomes: [{ logicalKey: 'project', operationKey: 'project', action: 'create', result: 'confirmed' }],
+                map: { version: '1', repository: TARGET, completions: { project: baseProjectCompletion({ nodeId: 'PVT_NEW', absenceCount: 2, absenceFirstSeenAt: T0 }) } },
+              };
+            }
+            return { kind: 'completed', outcomes: [] };
+          },
+        },
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+
+    assert.deepEqual(bootstrapPlanCalls, ['structure', 'options'], 'both planBootstrap passes run, structure before options');
+    assert.deepEqual(applyCalls, ['project', 'option:status:todo', 'phase:01'], 'the bootstrap structure apply, then the options apply, then reconciliation — in that order, one invocation');
+    assert.ok(bootstrapRemoteCalls.length >= 1, 'the bootstrap remote read backing the classification ran');
+    assert.equal(remoteCalls.length, 2, 'the post-rebuild snapshot is re-read before reconciliation plans against it');
+
+    assert.equal(mapSeam.writeCalls.length, 1, 'the absence marker write happens exactly once, before the rebuild delegation');
+    assert.equal(mapSeam.writeCalls[0].completions.project.absenceCount, 2);
+
+    assert.equal(process.exitCode, 0);
+  });
+});

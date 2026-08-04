@@ -48,6 +48,10 @@ import bootstrapConfigMod = require('./github-sync-bootstrap-config.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import bootstrapReportMod = require('./github-sync-bootstrap-report.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import existenceMod = require('./github-sync-existence.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import clockMod = require('./clock.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import operationMod = require('./github-sync-operation.cjs');
 import type { OperationOutcome } from './github-sync-operation.cts';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -102,7 +106,18 @@ interface AuthModule {
 
 interface DesiredModule { readDesiredState(cwd: string): unknown; }
 interface RemoteModule { readRemoteSnapshot(options: { cwd: string; owner: string; repo: string; repositoryNumber: number; projectNumber: number; issueNodeIdHints?: number[] }): unknown; }
-interface MapModule { readSyncMapStrict(cwd: string, repository: { owner: string; repo: string; number: number }): unknown; }
+/**
+ * Plan 07-01: widened beyond the read-only surface `status`/`sync` already
+ * used — `recordCompletion`/`writeSyncMapAtomically`/`mergeCompletion` are
+ * the durable-write half of D-08's absence marker, called only from `sync`
+ * (never `status` — T-07-04, pinned by plan 07-01 Task 2's dry-run test).
+ */
+interface MapModule {
+  readSyncMapStrict(cwd: string, repository: { owner: string; repo: string; number: number }): unknown;
+  recordCompletion(current: unknown, completion: unknown): unknown;
+  writeSyncMapAtomically(cwd: string, map: unknown): void;
+  mergeCompletion(previous: unknown, next: unknown, options?: { clear?: string[] }): unknown;
+}
 interface ReconcileModule { planReconciliation(desired: unknown, remote: unknown, map: unknown): unknown; }
 interface StatusModule { buildStatusV1(remote: unknown, plan: unknown): unknown; renderStatusV1(status: unknown, raw: boolean): string; }
 interface ApplyModule { applyMutationPlan(plan: unknown, options: { cwd: string; map: unknown }): unknown; }
@@ -156,6 +171,23 @@ interface BootstrapConfigModule {
 interface BootstrapReportModule {
   buildInitReportV1(input: unknown): unknown;
   renderInitReportV1(report: unknown, raw: boolean): string;
+}
+
+/** Plan 07-01 (D-05/D-08/D-09): the pure existence classifier `sync` delegates to. */
+interface ExistenceVerdictEntry { logicalKey: string; verdict: string; }
+interface AbsenceMarkerLike { absenceCount?: number; absenceFirstSeenAt?: string; }
+interface ExistenceModule {
+  classifyExistence(input: { completions: Record<string, unknown>; remote: unknown; bootstrapRemote: unknown }): ExistenceVerdictEntry[];
+  advanceAbsence(previous: AbsenceMarkerLike | undefined, verdict: string, nowIso?: string): AbsenceMarkerLike;
+  rebuildTriggered(verdicts: ExistenceVerdictEntry[], completions: Record<string, unknown>, nowIso?: string): boolean;
+  EXISTENCE_VERDICT: { PRESENT: string; CONFIRMED_ABSENT: string; UNKNOWN: string };
+}
+
+/** Plan 07-01 (D-09): the clock seam D-01's rebuild delegation and the absence gate thread `nowIso` through — never read via `Date.now()` inside a pure module. */
+interface ClockLike {
+  now(): number;
+  nowIso(): string;
+  sleep(ms: number): void;
 }
 
 // G-02-2: emitStatus() is a deliberate, local inversion of the family
@@ -280,6 +312,10 @@ interface RouteGithubSyncCommandRouterOptions {
   _bootstrapConfig?: BootstrapConfigModule;
   /** Test seam: inject a mock bootstrap report builder/renderer. Defaults to the real module. */
   _bootstrapReport?: BootstrapReportModule;
+  /** Test seam: inject a mock existence classifier. Defaults to the real module. */
+  _existence?: ExistenceModule;
+  /** Test seam: inject a fake clock (see `clock.cts`'s `makeFakeClock`). Defaults to `realClock`. */
+  _clock?: ClockLike;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -303,6 +339,8 @@ function routeGithubSyncCommandRouter({
   _bootstrapPlan,
   _bootstrapConfig,
   _bootstrapReport,
+  _existence,
+  _clock,
 }: RouteGithubSyncCommandRouterOptions): void {
   const activeCheck = _isCapabilityActive ?? isCapabilityActive;
 
@@ -334,7 +372,13 @@ function routeGithubSyncCommandRouter({
   const auth: AuthModule = _auth ?? authMod;
   const desired: DesiredModule = _desired ?? desiredMod;
   const remote: RemoteModule = _remote ?? remoteMod;
-  const map: MapModule = _map ?? mapMod;
+  // Cast the production module's stronger (typed) signatures down to this
+  // router's deliberately loose `unknown`-based interface — the same
+  // structural relationship every other `_xxx ?? xxxMod` default in this
+  // file relies on, made explicit here because `mergeCompletion`'s options
+  // parameter is contravariant on a `keyof SyncCompletion` literal union the
+  // router has no reason to import.
+  const map: MapModule = _map ?? (mapMod as unknown as MapModule);
   const reconcile: ReconcileModule = _reconcile ?? reconcileMod;
   const status: StatusModule = _status ?? statusMod;
   const apply: ApplyModule = _apply ?? applyMod;
@@ -344,6 +388,110 @@ function routeGithubSyncCommandRouter({
   const bootstrapPlan: BootstrapPlanModule = _bootstrapPlan ?? bootstrapPlanMod;
   const bootstrapConfig: BootstrapConfigModule = _bootstrapConfig ?? bootstrapConfigMod;
   const bootstrapReport: BootstrapReportModule = _bootstrapReport ?? bootstrapReportMod;
+  const existence: ExistenceModule = _existence ?? (existenceMod as unknown as ExistenceModule);
+  const clock: ClockLike = _clock ?? clockMod.realClock;
+
+  /**
+   * D-01: `init`'s own two-pass structure/options sequence, extracted so
+   * `sync`'s D-01 rebuild delegation calls the SAME seam rather than a
+   * second implementation that must track `init` forever. `init` retains
+   * sole ownership of target resolution, `writeProjectNumber`, its own
+   * apply-gate report shape, and the config write below — this helper only
+   * plans and applies both passes and returns enough for either caller to
+   * build its own report or continue into reconciliation.
+   */
+  interface ApplyResultLike {
+    kind: string;
+    map?: { completions?: Record<string, { issueNumber?: number }> } | null;
+    outcomes?: OperationOutcome[];
+    logicalKey?: string;
+    remediation?: string;
+  }
+  interface BootstrapTwoPassOptions {
+    cwd: string;
+    desiredState: unknown;
+    remoteSnapshot: unknown;
+    strictMap: { kind: string; map?: unknown; reason?: string };
+    baseTarget: { owner: string; repo: string; repositoryNumber: number };
+    projectNumber: number | null;
+    projectTitle: string | null;
+    viewLayout: string;
+  }
+  interface BootstrapTwoPassResult {
+    reportTarget: { owner: string; repo: string; projectNumber: number | null };
+    structurePlan: BootstrapPlanStageResult;
+    structureApply?: ApplyResultLike;
+    optionsPlan?: BootstrapPlanStageResult;
+    optionsApply?: ApplyResultLike;
+    effectiveReportTarget?: { owner: string; repo: string; projectNumber: number | null };
+    effectiveProjectNumber?: number | null;
+    finalMap: unknown;
+    blockedEarly: boolean;
+  }
+
+  function runBootstrapTwoPass(options: BootstrapTwoPassOptions): BootstrapTwoPassResult {
+    const { cwd: runCwd, desiredState, remoteSnapshot, strictMap, baseTarget, projectNumber, projectTitle, viewLayout } = options;
+    const reportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber };
+
+    const structurePlan = bootstrapPlan.planBootstrap(
+      { desired: desiredState, remote: remoteSnapshot, strictMap, target: { ...baseTarget, projectNumber }, projectTitle, viewLayout },
+      { pass: bootstrapPlan.BOOTSTRAP_PASS.STRUCTURE },
+    );
+    if (structurePlan.blocked.length > 0 || structurePlan.uncertain.length > 0) {
+      return {
+        reportTarget, structurePlan,
+        finalMap: strictMap.kind === 'valid' ? strictMap.map ?? null : null,
+        blockedEarly: true,
+      };
+    }
+
+    const structureApply = apply.applyMutationPlan(structurePlan, {
+      cwd: runCwd,
+      map: strictMap.kind === 'valid' ? strictMap.map : null,
+    }) as ApplyResultLike;
+    if (structureApply.kind !== 'completed') {
+      return {
+        reportTarget, structurePlan, structureApply,
+        finalMap: structureApply.map ?? (strictMap.kind === 'valid' ? strictMap.map ?? null : null),
+        blockedEarly: true,
+      };
+    }
+
+    const mutated = mutatedKeys(structureApply.outcomes ?? []);
+    const projectMutated = mutated.includes('project');
+    const fieldMutated = mutated.some((key: string) => key.startsWith('field:'));
+    const effectiveProjectNumber = projectMutated
+      ? structureApply.map?.completions?.project?.issueNumber ?? projectNumber
+      : projectNumber;
+    const effectiveReportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: effectiveProjectNumber };
+
+    const optionsRemote = (projectMutated || fieldMutated)
+      ? bootstrapRemote.readBootstrapRemoteState({ cwd: runCwd, owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: effectiveProjectNumber })
+      : remoteSnapshot;
+
+    const optionsStrictMap = structureApply.map ? { kind: 'valid', map: structureApply.map } : { kind: 'absent' };
+    const optionsPlan = bootstrapPlan.planBootstrap(
+      { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber }, projectTitle, viewLayout },
+      { pass: bootstrapPlan.BOOTSTRAP_PASS.OPTIONS },
+    );
+    if (runFatalBlockedEntries(optionsPlan.blocked, bootstrapPlan).length > 0 || optionsPlan.uncertain.length > 0) {
+      return {
+        reportTarget, structurePlan, structureApply, optionsPlan, effectiveReportTarget,
+        effectiveProjectNumber,
+        finalMap: structureApply.map ?? null,
+        blockedEarly: true,
+      };
+    }
+
+    const optionsApply = apply.applyMutationPlan(optionsPlan, { cwd: runCwd, map: structureApply.map ?? null }) as ApplyResultLike;
+
+    return {
+      reportTarget, structurePlan, structureApply, optionsPlan, optionsApply, effectiveReportTarget,
+      effectiveProjectNumber,
+      finalMap: optionsApply.map ?? structureApply.map ?? null,
+      blockedEarly: false,
+    };
+  }
 
   routeHubCommandFamily({
     family: 'github-sync',
@@ -421,6 +569,89 @@ function routeGithubSyncCommandRouter({
                 if (strictMap?.kind === 'blocking') {
                   result = { kind: 'blocked', reason: 'sync_map_blocking' };
                 } else {
+                  // D-01/D-05/D-08/D-09 (plan 07-01): existence classification
+                  // and the rebuild delegation run HERE — after the strictMap
+                  // and remoteSnapshot reads, before `planReconciliation` — and
+                  // ONLY from `sync`, never `status` (T-07-04). A classified
+                  // `project` completion has its absence marker advanced and
+                  // persisted through `mergeCompletion` (never a bare
+                  // `recordCompletion` built from a partial object — D-08's
+                  // wholesale-replace warning) whether or not the gate fires;
+                  // the gate firing additionally delegates to the SAME
+                  // `runBootstrapTwoPass` helper `init` uses, then falls
+                  // through into `planReconciliation` against the freshly
+                  // re-read post-rebuild snapshot — all inside this one `sync`
+                  // invocation.
+                  let planningStrictMap: { kind?: unknown; map?: unknown } = strictMap;
+                  let planningRemoteSnapshot: unknown = remoteSnapshot;
+                  if (strictMap?.kind === 'valid') {
+                    const completions = ((strictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string; issueNumber?: number; owner?: string; repo?: string; repositoryNumber?: number; completedAt?: string; absenceCount?: number; absenceFirstSeenAt?: string } | undefined>;
+                    const projectCompletion = completions.project;
+                    if (projectCompletion) {
+                      const bootstrapRemoteState = bootstrapRemote.readBootstrapRemoteState({
+                        cwd,
+                        owner: resolvedTarget.target.owner,
+                        repo: resolvedTarget.target.repo,
+                        projectNumber: resolvedTarget.target.projectNumber,
+                      });
+                      const verdicts = existence.classifyExistence({ completions, remote: remoteSnapshot, bootstrapRemote: bootstrapRemoteState });
+                      const projectVerdict = verdicts.find((entry) => entry.logicalKey === 'project');
+                      if (projectVerdict) {
+                        const nowIso = clock.nowIso();
+                        const advancedMarker = existence.advanceAbsence(
+                          { absenceCount: projectCompletion.absenceCount, absenceFirstSeenAt: projectCompletion.absenceFirstSeenAt },
+                          projectVerdict.verdict,
+                          nowIso,
+                        );
+                        const clearKeys: string[] = [];
+                        if (advancedMarker.absenceCount === undefined) clearKeys.push('absenceCount');
+                        if (advancedMarker.absenceFirstSeenAt === undefined) clearKeys.push('absenceFirstSeenAt');
+                        const mergedCompletion = map.mergeCompletion(
+                          projectCompletion,
+                          {
+                            logicalKey: 'project',
+                            nodeId: projectCompletion.nodeId,
+                            completedAt: projectCompletion.completedAt,
+                            owner: projectCompletion.owner,
+                            repo: projectCompletion.repo,
+                            repositoryNumber: projectCompletion.repositoryNumber,
+                            ...advancedMarker,
+                          },
+                          { clear: clearKeys },
+                        );
+                        const nextSyncMap = map.recordCompletion(strictMap.map, mergedCompletion);
+                        map.writeSyncMapAtomically(cwd, nextSyncMap);
+                        planningStrictMap = { kind: 'valid', map: nextSyncMap };
+
+                        if (existence.rebuildTriggered(verdicts, completions, nowIso)) {
+                          const projectTitle = bootstrapConfig.readProjectTitle(cwd);
+                          const viewLayout = bootstrapConfig.readViewLayout(cwd);
+                          const rebuildResult = runBootstrapTwoPass({
+                            cwd,
+                            desiredState,
+                            remoteSnapshot: bootstrapRemoteState,
+                            strictMap: planningStrictMap as { kind: string; map?: unknown },
+                            baseTarget: { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber },
+                            projectNumber: resolvedTarget.target.projectNumber,
+                            projectTitle,
+                            viewLayout,
+                          });
+                          const rebuiltMap = rebuildResult.finalMap ?? nextSyncMap;
+                          planningStrictMap = rebuiltMap ? { kind: 'valid', map: rebuiltMap } : planningStrictMap;
+                          const effectiveProjectNumber = rebuildResult.effectiveProjectNumber ?? resolvedTarget.target.projectNumber;
+                          planningRemoteSnapshot = remote.readRemoteSnapshot({
+                            cwd,
+                            owner: resolvedTarget.target.owner,
+                            repo: resolvedTarget.target.repo,
+                            repositoryNumber: resolvedTarget.target.repositoryNumber,
+                            projectNumber: effectiveProjectNumber,
+                            issueNodeIdHints: collectIssueNodeIdHints(planningStrictMap),
+                          });
+                        }
+                      }
+                    }
+                  }
+
                   // Plan 05-07 (D-12/discretion item): no streaming progress
                   // mechanism is added for a long first run. The create list
                   // and counts already dispatched below tell a developer how
@@ -430,7 +661,7 @@ function routeGithubSyncCommandRouter({
                   // first run on an established repository takes minutes,
                   // and that killing it is free — every mutation is
                   // checkpointed, so a resumed run picks up where it left off.
-                  const plan = reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap) as {
+                  const plan = reconcile.planReconciliation(desiredState, planningRemoteSnapshot, planningStrictMap) as {
                     operations: unknown[]; pendingIssueUpdates?: unknown[]; subIssueCeilingWarnings?: unknown[];
                   };
                   // Plan 04-04 Task 3: the read-splice-write preparation
@@ -445,7 +676,7 @@ function routeGithubSyncCommandRouter({
                   const combinedPlan = { ...plan, operations: [...(plan.operations ?? []), ...prepared.operations] };
                   const applyResult = apply.applyMutationPlan(combinedPlan, {
                     cwd,
-                    map: strictMap?.kind === 'valid' ? strictMap.map ?? null : null,
+                    map: planningStrictMap?.kind === 'valid' ? planningStrictMap.map ?? null : null,
                   }) as Record<string, unknown>;
                   // Plan 05-07: the plan's own reported sub-issue-ceiling
                   // warnings ride the result beside issueUpdateReports, so a
@@ -523,78 +754,34 @@ function routeGithubSyncCommandRouter({
           // passes can never disagree about the configured layout.
           const viewLayout = bootstrapConfig.readViewLayout(cwd);
 
-          const structurePlan = bootstrapPlan.planBootstrap(
-            { desired: desiredState, remote: remoteSnapshot, strictMap, target: { ...baseTarget, projectNumber: resolvedTarget.projectNumber }, projectTitle, viewLayout },
-            { pass: bootstrapPlan.BOOTSTRAP_PASS.STRUCTURE },
-          );
-          const reportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: resolvedTarget.projectNumber };
-          // 06-07 gap closure: this gate is deliberately left reading the
-          // bare `blocked` array, unlike the options gate below — no
-          // structure-pass stage (project/fields/labels/milestones) emits a
-          // per-item blocked reason today, so `structurePlan.blocked` is
-          // run-fatal-only by construction. Widening this to
-          // `runFatalBlockedEntries` would be scope the gap does not cover;
-          // noted here so the asymmetry between the two gates reads as a
-          // decision, not an oversight.
-          if (structurePlan.blocked.length > 0 || structurePlan.uncertain.length > 0) {
-            emitInitReport({ target: reportTarget, structurePlan }, raw, bootstrapReport);
-            return;
-          }
-
-          const structureApply = apply.applyMutationPlan(structurePlan, {
+          // D-01 (plan 07-01): the two-pass structure/options sequence below
+          // is now the shared `runBootstrapTwoPass` helper — the SAME seam
+          // `sync`'s D-01 rebuild delegation calls, so `init`'s own behaviour
+          // here is unchanged by the extraction (pinned by the pre-existing
+          // router test suite).
+          const twoPass = runBootstrapTwoPass({
             cwd,
-            map: strictMap.kind === 'valid' ? strictMap.map : null,
-          }) as { kind: string; map?: { completions?: Record<string, { issueNumber?: number }> } | null; outcomes?: OperationOutcome[]; logicalKey?: string; remediation?: string };
-          if (structureApply.kind !== 'completed') {
-            emitInitReport({ target: reportTarget, structurePlan, structureApply }, raw, bootstrapReport);
+            desiredState,
+            remoteSnapshot,
+            strictMap,
+            baseTarget,
+            projectNumber: resolvedTarget.projectNumber,
+            projectTitle,
+            viewLayout,
+          });
+          const reportTarget = twoPass.effectiveReportTarget ?? twoPass.reportTarget;
+
+          if (twoPass.blockedEarly) {
+            emitInitReport({
+              target: reportTarget,
+              structurePlan: twoPass.structurePlan,
+              structureApply: twoPass.structureApply,
+              optionsPlan: twoPass.optionsPlan,
+            }, raw, bootstrapReport);
             return;
           }
 
-          // Cycle-4 HIGH-4/HIGH-1: the effective target is recomputed from
-          // the structure pass's OWN returned map and feeds the conditional
-          // re-read AND the config write below — one value, two consumers,
-          // so they can never disagree. Reading it from resolveTarget's copy
-          // would miss a project created during this very run.
-          const mutated = mutatedKeys(structureApply.outcomes ?? []);
-          const projectMutated = mutated.includes('project');
-          const fieldMutated = mutated.some((key: string) => key.startsWith('field:'));
-          const effectiveProjectNumber = projectMutated
-            ? structureApply.map?.completions?.project?.issueNumber ?? resolvedTarget.projectNumber
-            : resolvedTarget.projectNumber;
-          const effectiveReportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: effectiveProjectNumber };
-
-          // Re-read only when the structure pass MUTATED the field/option
-          // surface (never on a mere checkpointed observation, which cannot
-          // have changed anything remotely) — this is the condition
-          // `mutatedKeys` exists to answer.
-          const optionsRemote = (projectMutated || fieldMutated)
-            ? bootstrapRemote.readBootstrapRemoteState({ cwd, owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: effectiveProjectNumber })
-            : remoteSnapshot;
-
-          const optionsStrictMap = structureApply.map ? { kind: 'valid', map: structureApply.map } : { kind: 'absent' };
-          const optionsPlan = bootstrapPlan.planBootstrap(
-            { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber }, projectTitle, viewLayout },
-            { pass: bootstrapPlan.BOOTSTRAP_PASS.OPTIONS },
-          );
-          // 06-07 gap closure (CR-01): gate on the RUN-FATAL subset of
-          // `optionsPlan.blocked` only, not the bare array length — a
-          // per-item view skip (VIEW_FIELD_UNRESOLVED) must not discard the
-          // Status merge, the Autonomous merge, or the other views that
-          // resolved cleanly. `runFatalBlockedEntries` is fail-closed: an
-          // injected plan seam predating `isRunFatalBlockedReason` still
-          // aborts on any blocked entry, exactly like before this fix. The
-          // early-return body is unchanged — a genuinely blocked run
-          // reports exactly as it did before.
-          if (runFatalBlockedEntries(optionsPlan.blocked, bootstrapPlan).length > 0 || optionsPlan.uncertain.length > 0) {
-            emitInitReport({ target: effectiveReportTarget, structurePlan, structureApply, optionsPlan }, raw, bootstrapReport);
-            return;
-          }
-
-          // HIGH-1: adapters.map is the structure pass's RETURNED map, never
-          // the head-of-run strictMap read above — seeding from the stale
-          // copy would make this single atomic write REPLACE every
-          // completion the structure pass just persisted.
-          const optionsApply = apply.applyMutationPlan(optionsPlan, { cwd, map: structureApply.map ?? null }) as { kind: string; outcomes?: OperationOutcome[]; logicalKey?: string; remediation?: string };
+          const effectiveProjectNumber = twoPass.effectiveProjectNumber ?? resolvedTarget.projectNumber;
 
           // D-02: the config write fires whenever the run started
           // unconfigured (a partial-config, gh-fallback, or crash-recovery
@@ -618,7 +805,14 @@ function routeGithubSyncCommandRouter({
             }
           }
 
-          emitInitReport({ target: effectiveReportTarget, structurePlan, structureApply, optionsPlan, optionsApply, configWriteNotice }, raw, bootstrapReport);
+          emitInitReport({
+            target: reportTarget,
+            structurePlan: twoPass.structurePlan,
+            structureApply: twoPass.structureApply,
+            optionsPlan: twoPass.optionsPlan,
+            optionsApply: twoPass.optionsApply,
+            configWriteNotice,
+          }, raw, bootstrapReport);
         } catch {
           output({ kind: 'uncertain', reason: 'init_unavailable' }, raw);
         }

@@ -374,6 +374,7 @@
       "github-sync-bootstrap-report.cjs",
       "github-sync-command-router.cjs",
       "github-sync-desired.cjs",
+      "github-sync-existence.cjs",
       "github-sync-gh.cjs",
       "github-sync-issue-body.cjs",
       "github-sync-issue-update.cjs",
