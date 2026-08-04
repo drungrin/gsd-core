@@ -50,6 +50,8 @@ import bootstrapReportMod = require('./github-sync-bootstrap-report.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import existenceMod = require('./github-sync-existence.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import markerSearchMod = require('./github-sync-marker-search.cjs');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import clockMod = require('./clock.cjs');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import operationMod = require('./github-sync-operation.cjs');
@@ -196,6 +198,15 @@ interface ClockLike {
   sleep(ms: number): void;
 }
 
+/** Plan 07-07 (D-20): the repo-scoped marker reader and its pure anti-forgery binding pass — `sync`'s adopt-by-marker pre-pass and `status`'s identical, write-nothing preview both delegate here. */
+interface MarkerSearchTargetLike { kind: string; id: string; logicalKey: string; }
+interface MarkerSearchBindingLike { logicalKey: string; nodeId: string; issueNumber: number; }
+interface MarkerSearchModule {
+  readIssuesWithMarkers(options: { cwd: string; owner: string; repo: string }): { available: boolean; entries: unknown[] };
+  unboundIssueTargets(desired: unknown, completions: Record<string, unknown>): MarkerSearchTargetLike[];
+  bindMarkers(read: { available: boolean; entries: unknown[] }, targets: MarkerSearchTargetLike[]): { bindings: MarkerSearchBindingLike[]; refusals: unknown[] };
+}
+
 // G-02-2: emitStatus() is a deliberate, local inversion of the family
 // convention. Every other router in src/ passes `undefined` as io.output()'s
 // third argument and lets its own `raw` flag pick JSON-vs-pretty-JSON.
@@ -322,6 +333,8 @@ interface RouteGithubSyncCommandRouterOptions {
   _existence?: ExistenceModule;
   /** Test seam: inject a fake clock (see `clock.cts`'s `makeFakeClock`). Defaults to `realClock`. */
   _clock?: ClockLike;
+  /** Test seam: inject a mock marker-search reader/binder. Defaults to the real module. */
+  _markerSearch?: MarkerSearchModule;
 }
 
 // ─── Implementation ───────────────────────────────────────────────────────────
@@ -347,6 +360,7 @@ function routeGithubSyncCommandRouter({
   _bootstrapReport,
   _existence,
   _clock,
+  _markerSearch,
 }: RouteGithubSyncCommandRouterOptions): void {
   const activeCheck = _isCapabilityActive ?? isCapabilityActive;
 
@@ -396,6 +410,7 @@ function routeGithubSyncCommandRouter({
   const bootstrapReport: BootstrapReportModule = _bootstrapReport ?? bootstrapReportMod;
   const existence: ExistenceModule = _existence ?? (existenceMod as unknown as ExistenceModule);
   const clock: ClockLike = _clock ?? clockMod.realClock;
+  const markerSearch: MarkerSearchModule = _markerSearch ?? (markerSearchMod as unknown as MarkerSearchModule);
 
   /**
    * D-01: `init`'s own two-pass structure/options sequence, extracted so
@@ -631,7 +646,62 @@ function routeGithubSyncCommandRouter({
             // Never gates (D-11) — leave the empty preview already assigned.
           }
 
-          const plan = reconcile.planReconciliation(desiredState, remoteSnapshot, strictMap, existenceVerdicts, nowIso);
+          // D-20 (plan 07-07): the IDENTICAL marker read + pure binding
+          // computation `sync`'s pre-pass runs — reported here through
+          // whatever bucket the resulting (would-be-bound) plan naturally
+          // falls into, written nowhere. `previewStrictMap`/
+          // `previewDesiredState` are in-memory-only projections
+          // `planReconciliation` below consumes instead of `strictMap`/
+          // `desiredState`; `map.recordCompletion`/`mergeCompletion` are
+          // pure (no I/O of their own — only `writeSyncMapAtomically`
+          // touches disk, and this handler never calls it), so reusing them
+          // here previews the exact shape `sync` would persist without
+          // persisting it. Defensively contained (D-11: never gates) — a
+          // fault anywhere in this preview degrades to the strictMap/
+          // desiredState already in scope, never to an unavailable status.
+          let previewStrictMap: { kind?: unknown; map?: unknown } = strictMap;
+          let previewDesiredState: unknown = desiredState;
+          try {
+            const preMarkerCompletions: Record<string, unknown> = previewStrictMap?.kind === 'valid'
+              ? ((previewStrictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {})
+              : {};
+            const unboundTargets = markerSearch.unboundIssueTargets(previewDesiredState, preMarkerCompletions);
+            if (unboundTargets.length > 0) {
+              const markerRead = markerSearch.readIssuesWithMarkers({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo });
+              if (markerRead.available) {
+                const markerBindingResult = markerSearch.bindMarkers(markerRead, unboundTargets);
+                if (markerBindingResult.bindings.length > 0) {
+                  let previewMap: unknown = previewStrictMap?.kind === 'valid' ? previewStrictMap.map : null;
+                  for (const binding of markerBindingResult.bindings) {
+                    const completion = map.mergeCompletion(undefined, {
+                      logicalKey: binding.logicalKey,
+                      nodeId: binding.nodeId,
+                      issueNumber: binding.issueNumber,
+                      completedAt: nowIso,
+                      owner: resolvedTarget.target.owner,
+                      repo: resolvedTarget.target.repo,
+                      repositoryNumber: resolvedTarget.target.repositoryNumber,
+                    });
+                    previewMap = map.recordCompletion(previewMap, completion);
+                  }
+                  previewStrictMap = { kind: 'valid', map: previewMap };
+                }
+              } else {
+                const unresolvedPhaseIds = new Set(unboundTargets.filter((entry) => entry.kind === 'phase').map((entry) => entry.id));
+                const unresolvedPlanIds = new Set(unboundTargets.filter((entry) => entry.kind === 'plan').map((entry) => entry.id));
+                const desiredShape = previewDesiredState as { phases?: Array<{ id: string }>; plans?: Array<{ id: string }> };
+                previewDesiredState = {
+                  ...(previewDesiredState as Record<string, unknown>),
+                  phases: (desiredShape.phases ?? []).filter((phase) => !unresolvedPhaseIds.has(phase.id)),
+                  plans: (desiredShape.plans ?? []).filter((plan) => !unresolvedPlanIds.has(plan.id)),
+                };
+              }
+            }
+          } catch {
+            // Never gates (D-11) — leave whatever preview state was already computed.
+          }
+
+          const plan = reconcile.planReconciliation(previewDesiredState, remoteSnapshot, previewStrictMap, existenceVerdicts, nowIso);
           dto = status.buildStatusV1(remoteSnapshot, plan, { verdicts: existenceVerdicts, absences, rebuildScope });
         } catch {
           dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
@@ -680,6 +750,12 @@ function routeGithubSyncCommandRouter({
                   // invocation.
                   let planningStrictMap: { kind?: unknown; map?: unknown } = strictMap;
                   let planningRemoteSnapshot: unknown = remoteSnapshot;
+                  // D-20 (plan 07-07): the marker pre-pass may exclude an
+                  // unresolved-this-run identifier from what reconciliation
+                  // sees (never from `desiredState` itself, which every
+                  // OTHER reader in this run — including the D-01 rebuild
+                  // block below — still consumes unchanged).
+                  let planningDesiredState: unknown = desiredState;
                   // Plan 07-06 Task 1 (D-07): hoisted so both the rebuild
                   // gate below AND the prune gate that follows
                   // `planReconciliation` share one instant and one
@@ -687,6 +763,78 @@ function routeGithubSyncCommandRouter({
                   // classification passes disagreeing about "now."
                   const nowIso = clock.nowIso();
                   let existenceVerdicts: ExistenceVerdictEntry[] = [];
+
+                  // D-20 (plan 07-07): adopt-by-marker pre-pass, closing P4
+                  // D-05's explicit deferral — deleting a Project does not
+                  // delete its issues, so a lost sync map still recovers
+                  // its identity from the markers already written into
+                  // each issue's body. Runs BEFORE both the D-01 rebuild
+                  // delegation and `planReconciliation`: a bound identifier
+                  // already carries a completion by the time reconciliation
+                  // runs, so it takes the SAME bind branch a pre-existing
+                  // map entry would (github-sync-reconcile.cts's decision
+                  // order is unchanged by this plan — `git diff` on that
+                  // file stays empty). Only the phase/plan issue namespaces
+                  // are in scope here; bootstrap objects (project, fields,
+                  // labels, milestones, views) are the D-01 rebuild's own
+                  // concern below, untouched by this pre-pass.
+                  {
+                    const preMarkerCompletions: Record<string, unknown> = planningStrictMap?.kind === 'valid'
+                      ? ((planningStrictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {})
+                      : {};
+                    const unboundTargets = markerSearch.unboundIssueTargets(planningDesiredState, preMarkerCompletions);
+                    if (unboundTargets.length > 0) {
+                      const markerRead = markerSearch.readIssuesWithMarkers({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo });
+                      if (markerRead.available) {
+                        const markerBindingResult = markerSearch.bindMarkers(markerRead, unboundTargets);
+                        if (markerBindingResult.bindings.length > 0) {
+                          let markerBoundMap: unknown = planningStrictMap?.kind === 'valid' ? planningStrictMap.map : null;
+                          for (const binding of markerBindingResult.bindings) {
+                            // Merge-then-record (D-08's discipline): a
+                            // brand-new key has no previous completion to
+                            // preserve, so `mergeCompletion(undefined, ...)`
+                            // is exactly `next` — the same idiom the
+                            // project-absence-marker write and the D-13
+                            // adoption write below both already use.
+                            const completion = map.mergeCompletion(undefined, {
+                              logicalKey: binding.logicalKey,
+                              nodeId: binding.nodeId,
+                              issueNumber: binding.issueNumber,
+                              completedAt: nowIso,
+                              owner: resolvedTarget.target.owner,
+                              repo: resolvedTarget.target.repo,
+                              repositoryNumber: resolvedTarget.target.repositoryNumber,
+                            });
+                            markerBoundMap = map.recordCompletion(markerBoundMap, completion);
+                          }
+                          map.writeSyncMapAtomically(cwd, markerBoundMap);
+                          planningStrictMap = { kind: 'valid', map: markerBoundMap };
+                        }
+                      } else {
+                        // An unavailable marker read must never be read as
+                        // "no markers found" (T-07-23) — that would let
+                        // every still-unmapped identifier fall straight
+                        // into reconciliation's create branch on a read
+                        // that never actually confirmed nothing claims it.
+                        // Excise them from `planningDesiredState` for THIS
+                        // RUN ONLY (never `desiredState` itself, never
+                        // written to disk, never touching an identifier
+                        // this run DID resolve): reconciliation then sees
+                        // no unmapped-and-unverified member, so it neither
+                        // creates nor reports anything for them this run —
+                        // the next `sync` tries the read again.
+                        const unresolvedPhaseIds = new Set(unboundTargets.filter((entry) => entry.kind === 'phase').map((entry) => entry.id));
+                        const unresolvedPlanIds = new Set(unboundTargets.filter((entry) => entry.kind === 'plan').map((entry) => entry.id));
+                        const desiredShape = planningDesiredState as { phases?: Array<{ id: string }>; plans?: Array<{ id: string }> };
+                        planningDesiredState = {
+                          ...(planningDesiredState as Record<string, unknown>),
+                          phases: (desiredShape.phases ?? []).filter((phase) => !unresolvedPhaseIds.has(phase.id)),
+                          plans: (desiredShape.plans ?? []).filter((plan) => !unresolvedPlanIds.has(plan.id)),
+                        };
+                      }
+                    }
+                  }
+
                   if (strictMap?.kind === 'valid') {
                     const completions = ((strictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string; issueNumber?: number; owner?: string; repo?: string; repositoryNumber?: number; completedAt?: string; absenceCount?: number; absenceFirstSeenAt?: string } | undefined>;
                     const projectCompletion = completions.project;
@@ -764,7 +912,7 @@ function routeGithubSyncCommandRouter({
                   // first run on an established repository takes minutes,
                   // and that killing it is free — every mutation is
                   // checkpointed, so a resumed run picks up where it left off.
-                  const plan = reconcile.planReconciliation(desiredState, planningRemoteSnapshot, planningStrictMap, existenceVerdicts, nowIso) as {
+                  const plan = reconcile.planReconciliation(planningDesiredState, planningRemoteSnapshot, planningStrictMap, existenceVerdicts, nowIso) as {
                     operations: unknown[]; pendingIssueUpdates?: unknown[]; subIssueCeilingWarnings?: unknown[];
                     adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
                     prune?: Array<{ logicalKey: string }>;

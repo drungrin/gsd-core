@@ -2696,3 +2696,260 @@ describe('github-sync router: plan 07-06 — prune write and status rebuild-scop
     assert.equal(seedMap.completions.project.absenceCount, undefined, 'the absence counter never advanced — status never records a marker');
   });
 });
+
+// ─── Plan 07-07 (D-20): the marker pre-pass — closing P4 D-05's deferral.
+// `sync`'s pre-pass runs before both the D-01 rebuild delegation and
+// `planReconciliation`; a bound identifier already has a completion by the
+// time reconciliation runs, so reconciliation's own decision order (frozen
+// by this plan — `git diff src/github-sync-reconcile.cts` stays empty) is
+// exercised only through a small, self-documented fake mirroring the ONE
+// decision this plan cares about: does a phase/plan identifier with a
+// completion get created, or not. Every test below mocks `_reconcile`
+// (matching this whole file's own established convention — no describe
+// block anywhere uses the real reconcile module), so "zero create
+// operations" is a property of THIS fake, not a claim about the real
+// module's full six-branch decision tree (that module's own suite, and the
+// `git diff` acceptance criterion, own that claim). Uses the REAL
+// github-sync-map module for `mergeCompletion`/`recordCompletion` (both
+// pure — no I/O), matching every other describe block in this phase, so
+// D-08's wholesale-replace trap would actually be exercised. ─────────────
+
+describe('github-sync router: plan 07-07 — D-20 adopt-by-marker pre-pass', () => {
+  const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+  const T0 = '2026-08-01T00:00:00.000Z';
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  /**
+   * A minimal reconciliation fake mirroring ONLY the create-vs-bind
+   * decision D-20's pre-pass targets: a desired phase/plan whose
+   * `issue:phase:*`/`issue:plan:*` logical key already has a completion in
+   * the strict map produces zero create operations for it; one with no
+   * completion produces exactly one `create-issue`/`create-plan-issue`
+   * operation. Never the real module (see the describe block header).
+   */
+  function fakeReconcile() {
+    const calls = [];
+    return {
+      calls,
+      planReconciliation: (desired, remote, strictMap) => {
+        calls.push({ desired, strictMap });
+        const completions = strictMap?.kind === 'valid' ? (strictMap.map?.completions ?? {}) : {};
+        const operations = [];
+        for (const phase of desired?.phases ?? []) {
+          if (!completions[`issue:phase:${phase.id}`]) operations.push({ kind: 'create-issue', logicalKey: `issue:phase:${phase.id}` });
+        }
+        for (const plan of desired?.plans ?? []) {
+          if (!completions[`issue:plan:${plan.id}`]) operations.push({ kind: 'create-plan-issue', logicalKey: `issue:plan:${plan.id}` });
+        }
+        return { operations, noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], adoptions: [], prune: [] };
+      },
+    };
+  }
+
+  test('a converged fixture (every desired identifier already mapped) makes zero issue-list invocations', () => {
+    const seedMap = realMap.recordCompletion(null, {
+      logicalKey: 'issue:phase:01', nodeId: 'ISSUE_1', issueNumber: 100, completedAt: T0,
+      owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber,
+    });
+    const markerReadCalls = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true, phases: [{ id: '01' }], plans: [] }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: { readSyncMapStrict: () => ({ kind: 'valid', map: seedMap }), writeSyncMapAtomically: () => { throw new Error('must not write'); } },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _markerSearch: { readIssuesWithMarkers: (o) => { markerReadCalls.push(o); return { available: true, entries: [] }; }, unboundIssueTargets: require('../gsd-core/bin/lib/github-sync-marker-search.cjs').unboundIssueTargets, bindMarkers: require('../gsd-core/bin/lib/github-sync-marker-search.cjs').bindMarkers },
+        _reconcile: fakeReconcile(),
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: () => ({ kind: 'completed', outcomes: [] }) },
+      });
+    } finally { cap.restore(); }
+
+    assert.equal(markerReadCalls.length, 0, 'a fully-mapped desired state never triggers the marker read');
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('a fully lost map (every completion gone) with every identifier claimed by a marker re-binds all of them and emits zero create operations', () => {
+    let stored = null;
+    const writeCalls = [];
+    let appliedOperations = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true, phases: [{ id: '01' }, { id: '02' }], plans: [{ id: '01-01' }] }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'absent' }),
+          mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+          recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+          writeSyncMapAtomically: (cwd, map) => { writeCalls.push(map); stored = map; },
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _markerSearch: {
+          readIssuesWithMarkers: () => ({
+            available: true,
+            entries: [
+              { number: 1, nodeId: 'ISSUE_01', body: '' },
+              { number: 2, nodeId: 'ISSUE_02', body: '' },
+              { number: 3, nodeId: 'ISSUE_0101', body: '' },
+            ],
+          }),
+          unboundIssueTargets: require('../gsd-core/bin/lib/github-sync-marker-search.cjs').unboundIssueTargets,
+          // Every target resolves — a hand-scripted binder standing in for
+          // the real anti-forgery pass (already exhaustively tested in
+          // tests/github-sync-marker-search.test.cjs), since this describe
+          // block's own job is the WIRING, not re-proving the binding rules.
+          bindMarkers: (read, targets) => ({
+            bindings: targets.map((t, i) => ({ logicalKey: t.logicalKey, nodeId: read.entries[i].nodeId, issueNumber: read.entries[i].number })),
+            refusals: [],
+          }),
+        },
+        _reconcile: fakeReconcile(),
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan) => { appliedOperations = plan.operations ?? []; return { kind: 'completed', outcomes: [] }; } },
+      });
+    } finally { cap.restore(); }
+
+    assert.equal(writeCalls.length, 1, 'the marker bindings are written exactly once');
+    assert.equal(Object.keys(stored.completions).sort().length, 3, 'every desired identifier is re-bound');
+    assert.ok(stored.completions['issue:phase:01'], 'phase 01 is bound');
+    assert.ok(stored.completions['issue:phase:02'], 'phase 02 is bound');
+    assert.ok(stored.completions['issue:plan:01-01'], 'plan 01-01 is bound');
+    const createKinds = ['create-issue', 'create-plan-issue'];
+    assert.deepEqual(appliedOperations.filter((op) => createKinds.includes(op.kind)), [], 'zero create operations are emitted');
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('one desired identifier unclaimed by any marker still reaches the create branch — exactly one create operation is emitted for it', () => {
+    let stored = null;
+    let appliedOperations = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true, phases: [{ id: '01' }, { id: '02' }], plans: [] }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'absent' }),
+          mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+          recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+          writeSyncMapAtomically: (cwd, map) => { stored = map; },
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _markerSearch: {
+          readIssuesWithMarkers: () => ({ available: true, entries: [{ number: 1, nodeId: 'ISSUE_01', body: '' }] }),
+          unboundIssueTargets: require('../gsd-core/bin/lib/github-sync-marker-search.cjs').unboundIssueTargets,
+          // Only phase 01's target resolves; phase 02 is left unclaimed.
+          bindMarkers: (read, targets) => ({
+            bindings: targets.filter((t) => t.id === '01').map((t) => ({ logicalKey: t.logicalKey, nodeId: 'ISSUE_01', issueNumber: 1 })),
+            refusals: [],
+          }),
+        },
+        _reconcile: fakeReconcile(),
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan) => { appliedOperations = plan.operations ?? []; return { kind: 'completed', outcomes: [] }; } },
+      });
+    } finally { cap.restore(); }
+
+    assert.ok(stored.completions['issue:phase:01'], 'the claimed identifier is bound');
+    assert.equal(stored.completions['issue:phase:02'], undefined, 'the unclaimed identifier is never bound');
+    const creates = appliedOperations.filter((op) => op.kind === 'create-issue');
+    assert.deepEqual(creates, [{ kind: 'create-issue', logicalKey: 'issue:phase:02' }], 'exactly one create operation is emitted, for the unclaimed identifier only');
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('an unavailable marker read produces zero bindings and zero creates for the unmapped identifiers in that run', () => {
+    let writeCalls = 0;
+    let markerReadCalls = 0;
+    let appliedOperations = [];
+    const reconcile = fakeReconcile();
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true, phases: [{ id: '01' }], plans: [] }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'absent' }),
+          mergeCompletion: () => { throw new Error('must not merge on an unavailable read'); },
+          recordCompletion: () => { throw new Error('must not record on an unavailable read'); },
+          writeSyncMapAtomically: () => { writeCalls += 1; },
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _markerSearch: {
+          readIssuesWithMarkers: () => { markerReadCalls += 1; return { available: false, entries: [] }; },
+          unboundIssueTargets: require('../gsd-core/bin/lib/github-sync-marker-search.cjs').unboundIssueTargets,
+          bindMarkers: () => { throw new Error('must not run the binding pass on an unavailable read'); },
+        },
+        _reconcile: reconcile,
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan) => { appliedOperations = plan.operations ?? []; return { kind: 'completed', outcomes: [] }; } },
+      });
+    } finally { cap.restore(); }
+
+    assert.equal(markerReadCalls, 1, 'the marker read is attempted exactly once');
+    assert.equal(writeCalls, 0, 'zero bindings means zero writes');
+    assert.deepEqual(reconcile.calls[0].desired.phases, [], 'the unresolved identifier never reaches reconciliation as a desired phase this run');
+    const createKinds = ['create-issue', 'create-plan-issue'];
+    assert.deepEqual(appliedOperations.filter((op) => createKinds.includes(op.kind)), [], 'zero creates for the unmapped identifier');
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('a status run over the map-lost fixture reports the bindings (no create for the now-bound identifier) and leaves the map file untouched', () => {
+    let mapWriteCalls = 0;
+    const cap = captureStdout();
+    let dto;
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _desired: { readDesiredState: () => ({ available: true, phases: [{ id: '01' }], plans: [] }) },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'absent' }),
+          mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+          recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+          writeSyncMapAtomically: () => { mapWriteCalls += 1; throw new Error('status must never persist a map'); },
+        },
+        _markerSearch: {
+          readIssuesWithMarkers: () => ({ available: true, entries: [{ number: 1, nodeId: 'ISSUE_01', body: '' }] }),
+          unboundIssueTargets: require('../gsd-core/bin/lib/github-sync-marker-search.cjs').unboundIssueTargets,
+          bindMarkers: (read, targets) => ({ bindings: targets.map((t) => ({ logicalKey: t.logicalKey, nodeId: 'ISSUE_01', issueNumber: 1 })), refusals: [] }),
+        },
+        _reconcile: fakeReconcile(),
+        _status: {
+          buildStatusV1: (remote, plan) => ({ version: 1, available: remote.available, creates: (plan?.operations ?? []).filter((op) => op.kind === 'create-issue').map((op) => op.logicalKey) }),
+          renderStatusV1: (d) => JSON.stringify(d),
+        },
+      });
+      dto = JSON.parse(cap.chunks.join(''));
+    } finally { cap.restore(); }
+
+    assert.deepEqual(dto.creates, [], 'the bound identifier reports no pending create — the preview shows what would bind');
+    assert.equal(mapWriteCalls, 0, 'status never calls the map write seam');
+    assert.equal(process.exitCode, 0);
+  });
+});
