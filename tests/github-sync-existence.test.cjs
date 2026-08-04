@@ -507,3 +507,50 @@ test('classifyExistence over a mix of bootstrap-namespace and issue-bearing keys
     { logicalKey: 'project', verdict: EXISTENCE_VERDICT.PRESENT },
   ]);
 });
+
+// ─── Plan 07-05 Task 3 (D-11/D-12 contract): every mapped issue-bearing key
+// round-trips through the (owner, repo, number) re-resolution path before
+// its existence verdict exists — the promoted-identity guard against a
+// future phase quietly reverting to a node-ID-only identity. Driven from
+// `ISSUE_LOGICAL_KEY`'s own exported membership (never a hand-written array
+// declared inside this test), so a newly admitted key form is covered
+// automatically. See the "Task 3 non-vacuity proof" note in
+// 07-05-SUMMARY.md for the exact edit that was made and reverted to prove
+// this test is not vacuous.
+
+test('CONTRACT: every issue-bearing key form named by ISSUE_LOGICAL_KEY consults the by-number re-resolution path before a confirmed-absent verdict is ever produced', () => {
+  let nextIssueNumber = 100;
+  for (const [formName, buildKey] of Object.entries(ISSUE_LOGICAL_KEY)) {
+    const issueNumber = nextIssueNumber;
+    nextIssueNumber += 1;
+    const logicalKey = buildKey('05');
+
+    const accessedNumbers = [];
+    const issueNodeIdsSpyTarget = {};
+    const issueNodeIdsProxy = new Proxy(issueNodeIdsSpyTarget, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string') accessedNumbers.push(prop);
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    // The node ID appears nowhere in the run's own items — the ONLY path
+    // left to a verdict is the by-number re-resolution this test spies on.
+    const remote = { available: true, items: [], issueNodeIds: issueNodeIdsProxy };
+    const verdicts = classifyExistence({
+      completions: { [logicalKey]: { nodeId: 'STALE_NODE_ID', issueNumber } },
+      remote,
+    });
+
+    assert.deepEqual(
+      accessedNumbers,
+      [String(issueNumber)],
+      `${formName} (${logicalKey}) must consult the by-number re-resolution path before its verdict exists`,
+    );
+    assert.deepEqual(
+      verdicts,
+      [{ logicalKey, verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }],
+      `${formName} (${logicalKey}) must reach confirmed-absent only after the re-resolution path was consulted and found nothing`,
+    );
+  }
+});
