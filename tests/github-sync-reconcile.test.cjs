@@ -271,6 +271,8 @@ test('a desired state with zero phases produces zero operations, zero blocked en
   assert.deepEqual(plan, {
     operations: [], noops: [], blocked: [], uncertain: [],
     pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
+    // Plan 07-05 Task 2 (D-13): always present, empty when nothing applies.
+    adoptions: [],
   });
 });
 
@@ -534,6 +536,111 @@ test('orphan entries are emitted in ascending logical-key order and are stable a
   const second = planReconciliation(single, remoteWith(), map);
   assert.deepEqual(first.orphans, [{ logicalKey: 'phase:02', issueNumber: 20 }, { logicalKey: 'phase:10', issueNumber: 100 }]);
   assert.deepEqual(first.orphans, second.orphans);
+});
+
+// ─── Plan 07-05 Task 2 (D-13): adopting a changed node ID ─────────────────
+//
+// Same owner, same repo, same number, different node ID — a transferred or
+// undeleted issue — is one issue with a new node ID, not a duplicate and not
+// a confirmed-absent one. `planReconciliation` detects the drift, names it
+// in `plan.adoptions`, and uses the freshly resolved node ID for whatever
+// operation this run would already dispatch.
+
+test('a phase issue whose number resolves to a node ID different from the one cached produces one adoption entry and binds using the resolved node ID, not the stale one', () => {
+  const single = desiredWithMilestone([{ id: '05', title: 'Phase Five', goal: 'g' }]);
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        // No 'phase:05' completion at all — GSD created the issue but it is
+        // not yet bound to the project board.
+        'issue:phase:05': { nodeId: 'ISSUE_NODE_OLD', issueNumber: 900, contentHash: 'hash-abc' },
+      },
+    },
+  };
+  const remoteWithDrift = remoteWith({ items: [], issueNodeIds: { 900: 'ISSUE_NODE_NEW' } });
+
+  const plan = planReconciliation(single, remoteWithDrift, map);
+
+  assert.deepEqual(plan.adoptions, [{ logicalKey: 'issue:phase:05', previousNodeId: 'ISSUE_NODE_OLD', resolvedNodeId: 'ISSUE_NODE_NEW' }]);
+  assert.equal(plan.operations.length, 1);
+  assert.equal(plan.operations[0].logicalKey, 'phase:05');
+  assert.ok(plan.operations[0].args.includes('contentId=ISSUE_NODE_NEW'), 'the bind must use the resolved node ID');
+  assert.ok(!plan.operations[0].args.includes('contentId=ISSUE_NODE_OLD'), 'the stale cached node ID must never be dispatched');
+  assert.deepEqual(plan.operations.filter((op) => op.kind === 'create-issue'), [], 'no create operation is emitted for the adopted issue');
+});
+
+test('a plan issue whose number resolves to a node ID different from the one cached produces one adoption entry and binds using the resolved node ID, not the stale one', () => {
+  const plan = planFixture();
+  const map = mapWithPhaseIssue('04', 'I_node_phase_parent', {
+    [planIssueKeyFor('04-03')]: { nodeId: 'ISSUE_NODE_PLAN_OLD', issueNumber: 500, contentHash: 'hash-plan' },
+    // No 'plan:04-03' completion — not yet bound to the board.
+  });
+  const remoteWithDrift = { ...remoteForPlans(), issueNodeIds: { 500: 'ISSUE_NODE_PLAN_NEW' } };
+
+  const result = planReconciliation(desiredWithPlans([plan]), remoteWithDrift, map);
+
+  assert.deepEqual(result.adoptions, [{ logicalKey: 'issue:plan:04-03', previousNodeId: 'ISSUE_NODE_PLAN_OLD', resolvedNodeId: 'ISSUE_NODE_PLAN_NEW' }]);
+  assert.equal(result.operations.length, 1);
+  assert.equal(result.operations[0].logicalKey, 'plan:04-03');
+  assert.ok(result.operations[0].args.includes('contentId=ISSUE_NODE_PLAN_NEW'));
+  assert.ok(!result.operations[0].args.includes('contentId=ISSUE_NODE_PLAN_OLD'));
+  assert.deepEqual(result.operations.filter((op) => op.kind === 'create-plan-issue'), []);
+});
+
+test('the adoption array is present and empty on a run where every issue-identity node ID still matches its by-number resolution', () => {
+  const single = desiredWithMilestone([{ id: '05', title: 'Phase Five', goal: 'g' }]);
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'phase:05': { nodeId: 'item-05', issueNumber: 900 },
+        'issue:phase:05': { nodeId: 'ISSUE_NODE_900', issueNumber: 900, contentHash: 'hash-abc' },
+      },
+    },
+  };
+  const remoteMatched = remoteWith({
+    items: [{ id: 'item-05', content: { id: 'ISSUE_NODE_900', number: 900 } }],
+    issueNodeIds: { 900: 'ISSUE_NODE_900' },
+  });
+  const plan = planReconciliation(single, remoteMatched, map);
+  assert.deepEqual(plan.adoptions, []);
+});
+
+test('a second run over the same inputs, with the map already carrying the adopted node ID, yields zero further adoption entries — the convergence claim', () => {
+  const single = desiredWithMilestone([{ id: '05', title: 'Phase Five', goal: 'g' }]);
+  const mapAfterAdoption = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'issue:phase:05': { nodeId: 'ISSUE_NODE_NEW', issueNumber: 900, contentHash: 'hash-abc' },
+      },
+    },
+  };
+  const remoteWithDrift = remoteWith({ items: [], issueNodeIds: { 900: 'ISSUE_NODE_NEW' } });
+  const plan = planReconciliation(single, remoteWithDrift, mapAfterAdoption);
+  assert.deepEqual(plan.adoptions, []);
+});
+
+test('adoption detection is scoped to issue:phase:*/issue:plan:* completions only — a legacy phase:<id> completion (whose nodeId is a project ITEM id, not an issue id) never produces a false adoption', () => {
+  const single = desiredWithMilestone([{ id: '09', title: 'Phase Nine', goal: 'g' }]);
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        // Legacy phase:<id>-only completion: nodeId is the project ITEM's
+        // own node id, which never equals the ISSUE node id resolvedIssueNodeId returns.
+        'phase:09': { nodeId: 'item-09-stale', issueNumber: 77 },
+      },
+    },
+  };
+  const remoteResolved = remoteWith({ items: [], issueNodeIds: { 77: 'ISSUE_NODE_77' } });
+  const plan = planReconciliation(single, remoteResolved, map);
+  assert.deepEqual(plan.adoptions, [], 'the legacy key form must never be compared against the by-number-resolved ISSUE node id');
 });
 
 // ─── Plan 05-07: the sub-issue-per-parent ceiling warning ─────────────────
