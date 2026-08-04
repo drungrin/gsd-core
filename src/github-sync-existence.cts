@@ -264,22 +264,33 @@ function absenceGateSatisfied(completion: AbsenceMarker | undefined, nowIso?: st
 }
 
 /**
- * D-01/D-02 (this plan's scope so far: the `project` key only — plan 07-04
- * Task 3 widens this to every participating namespace). Simulates the same
+ * D-01/D-02, widened by plan 07-04 Task 3 from the `project` key alone to
+ * every participating namespace: `project`, `field:*`, `option:status:*`,
+ * `option:autonomous:*`, `label:*`, `milestone:*`. Simulates the same
  * `advanceAbsence` step the caller is about to persist, so a router can ask
  * "does THIS run's verdict, once recorded, satisfy the recreate gate?"
- * without duplicating the lifecycle rule.
+ * without duplicating the lifecycle rule — for ANY single participating
+ * object, not only `project` (`init`'s converge pass repairs the whole
+ * bootstrap surface at once, so one trigger covers every damage shape).
+ *
+ * `view:*` and `project-link` are excluded by the same
+ * `participatingNamespaceKind` test `classifyExistence` uses — a
+ * defense-in-depth check independent of whatever `classifyExistence` itself
+ * happens to produce, so a future caller that hand-builds a `verdicts` array
+ * cannot smuggle either exempt namespace into a trigger decision.
  */
 function rebuildTriggered(
   verdicts: ExistenceVerdictEntry[],
   completions: Record<string, AbsenceMarker | undefined> | null | undefined,
   nowIso?: string,
 ): boolean {
-  const projectVerdict = verdicts.find((entry) => entry.logicalKey === PROJECT_KEY);
-  if (!projectVerdict || projectVerdict.verdict !== EXISTENCE_VERDICT.CONFIRMED_ABSENT) return false;
-  const previous = (completions ?? {})[PROJECT_KEY];
-  const advanced = advanceAbsence(previous, projectVerdict.verdict, nowIso);
-  return absenceGateSatisfied(advanced, nowIso);
+  const safeCompletions = completions ?? {};
+  return verdicts.some((entry) => {
+    if (participatingNamespaceKind(entry.logicalKey) === null) return false;
+    if (entry.verdict !== EXISTENCE_VERDICT.CONFIRMED_ABSENT) return false;
+    const advanced = advanceAbsence(safeCompletions[entry.logicalKey], entry.verdict, nowIso);
+    return absenceGateSatisfied(advanced, nowIso);
+  });
 }
 
 export = {
