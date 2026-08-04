@@ -122,10 +122,14 @@ interface BootstrapPlanStageResult {
   noops: Array<{ reason: string }>;
   blocked: Array<{ reason: string; detail?: string }>;
   uncertain: Array<{ reason: string }>;
+  /** 06-07 gap closure: per-item blocked entries (e.g. VIEW_FIELD_UNRESOLVED) that do NOT suppress this pass's apply — carried alongside `blocked` for the report to name. */
+  partial?: Array<{ reason: string; detail?: string }>;
 }
 interface BootstrapPlanModule {
   planBootstrap(input: unknown, options: { pass: string }): BootstrapPlanStageResult;
   BOOTSTRAP_PASS: { STRUCTURE: string; OPTIONS: string };
+  /** 06-07 gap closure: fail-closed run-fatal classifier — absent on a legacy/injected seam, in which case `runFatalBlockedEntries` treats every blocked entry as run-fatal (today's pre-fix behavior, never silently more permissive). */
+  isRunFatalBlockedReason?(reason: string): boolean;
 }
 
 interface ResolvedTargetLike { owner: string; repo: string; repositoryNumber: number; projectNumber: number | null; }
@@ -220,6 +224,25 @@ function collectIssueNodeIdHints(strictMap: unknown): number[] {
     .map(([, completion]) => completion?.issueNumber)
     .filter((issueNumber): issueNumber is number => typeof issueNumber === 'number' && Number.isSafeInteger(issueNumber) && issueNumber > 0);
   return [...new Set(hints)].sort((left, right) => left - right);
+}
+
+/**
+ * 06-07 gap closure (CR-01): returns the subset of `entries` the plan
+ * module classifies run-fatal via `planModule.isRunFatalBlockedReason`, the
+ * subset that must still suppress the pass's apply. When the injected
+ * `planModule` carries no such member — an `_bootstrapPlan` test seam or a
+ * legacy caller written before this predicate existed — every entry is
+ * returned unchanged (deliberately fail-closed): the pre-fix conservative
+ * behavior (any blocked entry aborts the apply) is what a caller without
+ * the predicate keeps, never a new, silently more permissive default.
+ */
+function runFatalBlockedEntries(
+  entries: Array<{ reason: string; detail?: string }>,
+  planModule: BootstrapPlanModule,
+): Array<{ reason: string; detail?: string }> {
+  const isRunFatal = planModule.isRunFatalBlockedReason;
+  if (typeof isRunFatal !== 'function') return entries;
+  return entries.filter((entry) => isRunFatal(entry.reason));
 }
 
 interface RouteGithubSyncCommandRouterOptions {
@@ -496,6 +519,14 @@ function routeGithubSyncCommandRouter({
             { pass: bootstrapPlan.BOOTSTRAP_PASS.STRUCTURE },
           );
           const reportTarget = { owner: baseTarget.owner, repo: baseTarget.repo, projectNumber: resolvedTarget.projectNumber };
+          // 06-07 gap closure: this gate is deliberately left reading the
+          // bare `blocked` array, unlike the options gate below — no
+          // structure-pass stage (project/fields/labels/milestones) emits a
+          // per-item blocked reason today, so `structurePlan.blocked` is
+          // run-fatal-only by construction. Widening this to
+          // `runFatalBlockedEntries` would be scope the gap does not cover;
+          // noted here so the asymmetry between the two gates reads as a
+          // decision, not an oversight.
           if (structurePlan.blocked.length > 0 || structurePlan.uncertain.length > 0) {
             emitInitReport({ target: reportTarget, structurePlan }, raw, bootstrapReport);
             return;
@@ -536,7 +567,16 @@ function routeGithubSyncCommandRouter({
             { desired: desiredState, remote: optionsRemote, strictMap: optionsStrictMap, target: { ...baseTarget, projectNumber: effectiveProjectNumber }, projectTitle, viewLayout },
             { pass: bootstrapPlan.BOOTSTRAP_PASS.OPTIONS },
           );
-          if (optionsPlan.blocked.length > 0 || optionsPlan.uncertain.length > 0) {
+          // 06-07 gap closure (CR-01): gate on the RUN-FATAL subset of
+          // `optionsPlan.blocked` only, not the bare array length — a
+          // per-item view skip (VIEW_FIELD_UNRESOLVED) must not discard the
+          // Status merge, the Autonomous merge, or the other views that
+          // resolved cleanly. `runFatalBlockedEntries` is fail-closed: an
+          // injected plan seam predating `isRunFatalBlockedReason` still
+          // aborts on any blocked entry, exactly like before this fix. The
+          // early-return body is unchanged — a genuinely blocked run
+          // reports exactly as it did before.
+          if (runFatalBlockedEntries(optionsPlan.blocked, bootstrapPlan).length > 0 || optionsPlan.uncertain.length > 0) {
             emitInitReport({ target: effectiveReportTarget, structurePlan, structureApply, optionsPlan }, raw, bootstrapReport);
             return;
           }

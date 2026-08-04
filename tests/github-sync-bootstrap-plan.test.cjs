@@ -1977,12 +1977,16 @@ describe('planBootstrap run-fatal suppression', () => {
     // structure pass's own field-create path above) — the same omission
     // also leaves Table-by-Phase's AND By-Wave's declared visible fields
     // unresolved in the options pass (By-Wave declares Phase too, beyond
-    // Wave), two blocked entries independent of the Status merge this test
-    // otherwise exercises.
+    // Wave), two per-item view skips independent of the Status merge this
+    // test otherwise exercises. 06-07 gap closure: a per-item skip is never
+    // run-fatal, so it lands in `partial`, not `blocked` — `blocked` stays
+    // empty and the Status-merge operation this test already asserts on
+    // above proves the apply is never suppressed by these two skips.
     const optionsPlan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target: fatalTarget() }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.ok(optionsPlan.operations.length > 0, 'options pass must plan the missing Status option');
-    assert.equal(optionsPlan.blocked.length, 2);
-    assert.ok(optionsPlan.blocked.every((b) => b.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED));
+    assert.equal(optionsPlan.blocked.length, 0);
+    assert.equal(optionsPlan.partial.length, 2);
+    assert.ok(optionsPlan.partial.every((b) => b.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED));
   });
 
   // ── plan 03-05 Task 3: the run-fatal criterion plan 03-04 could not carry ──
@@ -2081,14 +2085,15 @@ describe('planBootstrap options pass: views wiring (plan 06-01)', () => {
     assert.ok(plan.checkpoints.some((c) => c.logicalKey === BOOTSTRAP_LOGICAL_KEY.view('Backlog') && c.nodeId === 'PVTV_1'));
   });
 
-  test('a view whose declared field is unresolved contributes a blocked entry to the composed plan (Status merge itself dispatches fine; only the fields snapshot planViews reads from lacks Status)', () => {
+  test('a view whose declared field is unresolved contributes a partial entry to the composed plan, never blocked (Status merge itself dispatches fine; only the fields snapshot planViews reads from lacks Status)', () => {
     // statusField (planStatusOptionMerge's own input) is present and
     // divergent, so the merge dispatches an operation rather than blocking —
     // isolating planViews' own VIEW_FIELD_UNRESOLVED contribution from
-    // planStatusOptionMerge's independent MISSING_STATUS_FIELD block.
+    // planStatusOptionMerge's independent MISSING_STATUS_FIELD block. 06-07
+    // gap closure: this per-item skip lands in `partial`, not `blocked`.
     const remote = { available: true, projectOutcome: 'resolved', statusField: statusField([]), fields: [], views: [] };
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
-    assert.ok(plan.blocked.some((b) => b.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED));
+    assert.ok(plan.partial.some((b) => b.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED));
   });
 });
 

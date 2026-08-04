@@ -46,6 +46,52 @@ const BOOTSTRAP_OPERATION_REASON = Object.freeze({
   VIEW_FIELD_UNRESOLVED: 'view_field_unresolved',
 } as const);
 
+/**
+ * 06-07 gap closure (CR-01): the closed set of `BOOTSTRAP_OPERATION_REASON`
+ * members whose semantics are "skip this one item" rather than "stop the
+ * whole pass's apply." Membership here is a deliberate fatality decision,
+ * made once per reason as it is introduced — omission is the safe default
+ * (`isRunFatalBlockedReason` treats every non-member as run-fatal), so a
+ * future blocked reason added without updating this set still aborts the
+ * apply instead of silently gaining dispatch permission. Today exactly one
+ * member: a per-view visible-field resolution failure (`planViews`' own doc
+ * comment: "a blocked view is a per-view skip: it does not suppress any
+ * other view's plan").
+ */
+const PER_ITEM_BLOCKED_REASONS: ReadonlySet<string> = new Set([
+  BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED,
+]);
+
+/**
+ * Fail-closed classifier: `false` only for a reason in `PER_ITEM_BLOCKED_REASONS`,
+ * `true` for every other string — including one this module has never heard
+ * of. The router's `runFatalBlockedEntries` gates `applyMutationPlan` on this
+ * predicate's `true` result, so an unrecognized reason aborts the apply
+ * rather than being guessed as "probably just a skip."
+ */
+function isRunFatalBlockedReason(reason: string): boolean {
+  return !PER_ITEM_BLOCKED_REASONS.has(reason);
+}
+
+/**
+ * Splits a pass's raw blocked-entry list into the subset that must still
+ * abort the whole pass's apply (`runFatal`) and the subset that is a
+ * per-item skip carried forward for the apply to still process
+ * (`perItem`) — order preserved within each bucket, since `planViews`'
+ * own iteration order (GSD_VIEWS declaration order) is a stated guarantee
+ * downstream consumers (the report's rendered notes) rely on.
+ */
+function partitionBlockedByFatality(
+  entries: Array<{ reason: string; detail?: string }>,
+): { runFatal: Array<{ reason: string; detail?: string }>; perItem: Array<{ reason: string; detail?: string }> } {
+  const runFatal: Array<{ reason: string; detail?: string }> = [];
+  const perItem: Array<{ reason: string; detail?: string }> = [];
+  for (const entry of entries) {
+    (isRunFatalBlockedReason(entry.reason) ? runFatal : perItem).push(entry);
+  }
+  return { runFatal, perItem };
+}
+
 const BOOTSTRAP_PASS = Object.freeze({
   STRUCTURE: 'structure',
   OPTIONS: 'options',
@@ -1552,12 +1598,22 @@ interface BootstrapPlan {
   operations: MutationOperation[];
   checkpoints: AdoptionCheckpoint[];
   noops: Array<{ reason: string }>;
+  /** Run-fatal only (post 06-07): a non-empty `blocked` means the pass's apply must not run. A per-item skip lives in `partial` instead. */
   blocked: Array<{ reason: string; detail?: string }>;
   uncertain: Array<{ reason: string }>;
+  /**
+   * 06-07 gap closure: per-item blocked entries (today only
+   * VIEW_FIELD_UNRESOLVED) that do NOT suppress the pass's apply — the
+   * apply still runs and dispatches every operation the pass planned;
+   * each entry here is a diagnostic the report surfaces (plan 06-07 Task
+   * 2), never a reason to withhold dispatch. Seeded `[]` by `emptyPlan()`
+   * so no consumer ever reads `undefined`.
+   */
+  partial: Array<{ reason: string; detail?: string }>;
 }
 
 function emptyPlan(): BootstrapPlan {
-  return { operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [] };
+  return { operations: [], checkpoints: [], noops: [], blocked: [], uncertain: [], partial: [] };
 }
 
 /**
@@ -1572,6 +1628,14 @@ function emptyPlan(): BootstrapPlan {
  * checkpoints) when it blocks — plans 03-04/03-05 fill in the rest of the
  * structure pass on top of this. The options pass calls
  * `planStatusOptionMerge`.
+ *
+ * 06-07 gap closure: the returned `blocked`/`partial` split is the single
+ * invariant every consumer (the router's apply gate, the composition
+ * suite's mirror, the report) must honor identically — `blocked` means the
+ * pass's apply must not run at all; `partial` means the apply runs and
+ * these items were individually skipped. `partitionBlockedByFatality`
+ * (through `isRunFatalBlockedReason`) is the one place that decides which
+ * bucket a `planViews` blocked entry lands in.
  */
 function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPass }): BootstrapPlan {
   if (!input.desired.available) {
@@ -1651,6 +1715,19 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
   // and blocked entries into every return path below.
   const viewsPlan = planViews(input.remote, input.strictMap, context);
 
+  // 06-07 gap closure (CR-01): `planViews`' own `blocked` field carries
+  // exactly one reason today (VIEW_FIELD_UNRESOLVED), and that reason is a
+  // per-item skip, not a run-fatal one — folding it into this composed
+  // plan's `blocked` unchanged (as every OPTIONS return path below used to)
+  // let a single unresolved view field discard the Status merge, the
+  // Autonomous merge, and every other view's operations, contradicting
+  // `planViews`' own documented per-view-skip guarantee. Partitioning here,
+  // through the same fail-closed predicate the router uses, means a future
+  // run-fatal reason `planViews` might one day emit still aborts correctly
+  // (it lands in `runFatal`) while today's only member routes to `partial`
+  // instead.
+  const { runFatal: viewsRunFatal, perItem: viewsPerItem } = partitionBlockedByFatality(viewsPlan.blocked);
+
   // Phase 6 D-09..D-11/plan 06-04: the leftmost-view retype runs immediately
   // after planViews, folded into every return path the same way — an
   // un-updated caller (viewLayout absent) still gets the documented `board`
@@ -1664,7 +1741,8 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
       noops: [{ reason: merge.reason }],
       operations: [...autonomousPlan.operations, ...viewsPlan.operations, ...leftmostViewPlan.operations],
       checkpoints: [...autonomousPlan.checkpoints, ...viewsPlan.checkpoints, ...leftmostViewPlan.checkpoints],
-      blocked: viewsPlan.blocked,
+      blocked: viewsRunFatal,
+      partial: viewsPerItem,
     };
   }
   if (merge.kind === 'converged') {
@@ -1672,14 +1750,16 @@ function planBootstrap(input: PlanBootstrapInput, { pass }: { pass: BootstrapPas
       ...emptyPlan(),
       checkpoints: [...merge.checkpoints, ...autonomousPlan.checkpoints, ...viewsPlan.checkpoints, ...leftmostViewPlan.checkpoints],
       operations: [...autonomousPlan.operations, ...viewsPlan.operations, ...leftmostViewPlan.operations],
-      blocked: viewsPlan.blocked,
+      blocked: viewsRunFatal,
+      partial: viewsPerItem,
     };
   }
   return {
     ...emptyPlan(),
     operations: [merge.operation, ...autonomousPlan.operations, ...viewsPlan.operations, ...leftmostViewPlan.operations],
     checkpoints: [...autonomousPlan.checkpoints, ...viewsPlan.checkpoints, ...leftmostViewPlan.checkpoints],
-    blocked: viewsPlan.blocked,
+    blocked: viewsRunFatal,
+    partial: viewsPerItem,
   };
 }
 
@@ -1695,6 +1775,7 @@ export = {
   planLeftmostViewLayout,
   parseMilestoneVersionToken,
   validateFatalConditions,
+  isRunFatalBlockedReason,
   optionInputArgv,
   viewFieldIdsArgv,
   BOOTSTRAP_LOGICAL_KEY,
