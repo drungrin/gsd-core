@@ -1,6 +1,11 @@
 'use strict';
 /** JSON-safe versioned DTO and concise renderer for read-only github-sync status. */
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import operationMod = require('./github-sync-operation.cjs');
+
+const { statusBucketForKind, STATUS_BUCKET } = operationMod;
+
 const STATUS_SCHEMA_VERSION = 1;
 const UNAVAILABLE_MESSAGE = 'github-sync status is unavailable because GitHub could not be read. Retry shortly.';
 
@@ -95,8 +100,12 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null): St
   const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], pendingFieldChanges: [], orphans: [], subIssueCeilingWarnings: [] };
   return {
     version: STATUS_SCHEMA_VERSION, available: true,
-    creates: safePlan.operations.filter((operation) => operation.kind === 'create').map((operation) => operation.logicalKey),
-    updates: safePlan.operations.filter((operation) => operation.kind === 'update').map((operation) => operation.logicalKey),
+    // WINDOWS #8: the shared, exhaustively-tested catalog decides the
+    // bucket — never a literal `operation.kind === 'create'` comparison,
+    // which only ever matched the bind-to-project operation's kind and hid
+    // every other real create/update kind from both arrays.
+    creates: safePlan.operations.filter((operation) => statusBucketForKind(operation.kind) === STATUS_BUCKET.CREATES).map((operation) => operation.logicalKey),
+    updates: safePlan.operations.filter((operation) => statusBucketForKind(operation.kind) === STATUS_BUCKET.UPDATES).map((operation) => operation.logicalKey),
     noops: safePlan.noops.map((operation) => operation.logicalKey),
     blocked: safePlan.blocked.map(({ reason, detail }) => detail === undefined ? { reason } : { reason, detail }),
     uncertain: safePlan.uncertain.map(({ reason }) => ({ reason })),

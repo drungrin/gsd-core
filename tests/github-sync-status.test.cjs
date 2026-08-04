@@ -6,10 +6,19 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { buildStatusV1, renderStatusV1, STATUS_SCHEMA_VERSION } = require('../gsd-core/bin/lib/github-sync-status.cjs');
 const { SYNC_TARGET_FIELD } = require('../gsd-core/bin/lib/github-sync-target.cjs');
+const operationMod = require('../gsd-core/bin/lib/github-sync-operation.cjs');
+const { planReconciliation, issueKeyFor, planKeyFor, planIssueKeyFor } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
+const { BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
+const { renderPlanRegion, contentHash, renderFieldState, PLAN_FIELD_NAMES, FENCE_BEGIN, FENCE_END } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
+const { prepareIssueUpdates } = require('../gsd-core/bin/lib/github-sync-issue-update.cjs');
 
 test('buildStatusV1 groups a complete reconciliation plan into the documented compact DTO', () => {
   const result = buildStatusV1({ available: true, reason: 'ok' }, {
-    operations: [{ kind: 'create', logicalKey: 'phase:02' }, { kind: 'update', logicalKey: 'phase:01' }],
+    // WINDOWS #8: 'create' and 'update-field-value' are real
+    // MutationOperation.kind values (the bind-to-project kind, and a real
+    // field-value write) — not the old fixture's synthetic 'create'/'update'
+    // literals, which no producer has ever emitted for the latter.
+    operations: [{ kind: 'create', logicalKey: 'phase:02' }, { kind: 'update-field-value', logicalKey: 'phase:01' }],
     noops: [{ logicalKey: 'phase:00' }],
     blocked: [{ reason: 'map_blocking', detail: 'repository_mismatch' }],
     uncertain: [{ reason: 'remote_unavailable' }],
@@ -246,4 +255,152 @@ test('every target_unavailable message is distinct from every other and from the
 test('a target_unavailable blocked entry renders through the human path with its field as detail (D-13)', () => {
   const dto = buildStatusV1({ available: false, reason: 'target_unavailable', field: 'repository_number' }, null);
   assert.equal(renderStatusV1(dto, false), `${dto.message}\n`);
+});
+
+// ─── WINDOWS #8 (plan 07-03): the shared, exhaustively-tested mutation-kind catalog ─
+
+const MILESTONE_VERSION = 'v1.0';
+const MILESTONE_KEY = BOOTSTRAP_LOGICAL_KEY.milestone(MILESTONE_VERSION);
+
+/** Plan 05-05's plan-item field bootstrap completions — mirrors tests/github-sync-reconcile.test.cjs's own fixture so a brand-new plan's field writes resolve instead of blocking. */
+function planFieldBootstrapCompletions() {
+  return {
+    [BOOTSTRAP_LOGICAL_KEY.field('GSD ID')]: { nodeId: 'FIELD_GSD_ID' },
+    [BOOTSTRAP_LOGICAL_KEY.field('Phase')]: { nodeId: 'FIELD_PHASE' },
+    [BOOTSTRAP_LOGICAL_KEY.field('Requirements')]: { nodeId: 'FIELD_REQUIREMENTS' },
+    [BOOTSTRAP_LOGICAL_KEY.field('Status')]: { nodeId: 'FIELD_STATUS' },
+    [BOOTSTRAP_LOGICAL_KEY.field('Wave')]: { nodeId: 'FIELD_WAVE' },
+    [BOOTSTRAP_LOGICAL_KEY.field('Autonomous')]: { nodeId: 'FIELD_AUTONOMOUS' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('Todo')]: { nodeId: 'OPTION_TODO' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('In Progress')]: { nodeId: 'OPTION_IN_PROGRESS' },
+    [BOOTSTRAP_LOGICAL_KEY.statusOption('Done')]: { nodeId: 'OPTION_DONE' },
+    [BOOTSTRAP_LOGICAL_KEY.autonomousOption('Yes')]: { nodeId: 'OPTION_AUTONOMOUS_YES' },
+    [BOOTSTRAP_LOGICAL_KEY.autonomousOption('No')]: { nodeId: 'OPTION_AUTONOMOUS_NO' },
+  };
+}
+
+test('exhaustiveness: every distinct MutationOperation.kind reachable from planReconciliation and prepareIssueUpdates across a fixture exercising create, bind, update, field-change, sub-issue, and state-change paths is a member of the shared catalog', () => {
+  const kinds = new Set();
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 42, projectNumber: 7, projectNodeId: 'PVT_proj_node_1' };
+  const MILESTONES = [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }];
+
+  // create-issue + create (bind-to-project): a brand-new phase with a resolvable milestone.
+  const phasePlan = planReconciliation(
+    { available: true, reason: 'ok', currentPhase: '04', phases: [{ id: '04', title: 'Phase Four', goal: 'ship it' }], plans: [], milestones: MILESTONES },
+    { available: true, reason: 'ok', target: TARGET, items: [], fields: [], subIssues: [], issueNodeIds: {} },
+    { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 } } } },
+  );
+  for (const op of phasePlan.operations) kinds.add(op.kind);
+
+  // create-plan-issue + add-sub-issue + create (bind) + update-field-value: a brand-new plan with a resolvable parent and full field completions.
+  const planId = '04-03';
+  const planFixture = { id: planId, phaseId: '04', title: '04-03 — Splice a region', tasks: ['Task 1: First'], status: 'Todo' };
+  const createPlanResult = planReconciliation(
+    { available: true, reason: 'ok', currentPhase: null, phases: [], plans: [planFixture], milestones: MILESTONES },
+    { available: true, reason: 'ok', target: TARGET, items: [], fields: [], subIssues: [], issueNodeIds: {} },
+    {
+      kind: 'valid',
+      map: {
+        completions: {
+          [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+          [issueKeyFor('04')]: { nodeId: 'I_node_phase_parent', issueNumber: 40 },
+          ...planFieldBootstrapCompletions(),
+        },
+      },
+    },
+  );
+  assert.deepEqual(createPlanResult.blocked, [], 'the create-plan fixture must resolve every field, not block, so update-field-value actually appears');
+  for (const op of createPlanResult.operations) kinds.add(op.kind);
+
+  // update-plan-issue-state: a plan already bound and content/field-converged, but whose recorded state disagrees with plan.complete.
+  const stateePlan = {
+    id: planId, phaseId: '04', title: '04-03 — Splice a region', tasks: ['Task 1: First'],
+    status: 'In Progress', wave: 2, autonomous: true, requirements: ['PLAN-01'], complete: true,
+  };
+  const stateRegion = renderPlanRegion({ id: stateePlan.id, title: stateePlan.title, status: stateePlan.status, tasks: stateePlan.tasks });
+  const stateHash = contentHash({ title: stateePlan.title, region: stateRegion, milestoneNumber: 3 });
+  const stateFieldState = renderFieldState(
+    { gsdId: planKeyFor(planId), phaseId: stateePlan.phaseId, requirements: stateePlan.requirements, status: stateePlan.status, wave: stateePlan.wave, autonomous: stateePlan.autonomous },
+    PLAN_FIELD_NAMES,
+  );
+  const stateResult = planReconciliation(
+    { available: true, reason: 'ok', currentPhase: null, phases: [], plans: [stateePlan], milestones: MILESTONES },
+    { available: true, reason: 'ok', target: TARGET, items: [{ id: 'item-plan-0403', content: { id: 'ISSUE_NODE_PLAN_0403', number: 88 } }], fields: [], subIssues: [], issueNodeIds: {} },
+    {
+      kind: 'valid',
+      map: {
+        completions: {
+          [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+          [planKeyFor(planId)]: { nodeId: 'item-plan-0403', issueNumber: 88, fieldState: stateFieldState },
+          [planIssueKeyFor(planId)]: { nodeId: 'ISSUE_NODE_PLAN_0403', issueNumber: 88, contentHash: stateHash, issueState: 'open' },
+        },
+      },
+    },
+  );
+  assert.equal(stateResult.operations.filter((op) => op.kind === 'update-plan-issue-state').length, 1, 'the state fixture must actually emit exactly one state PATCH');
+  for (const op of stateResult.operations) kinds.add(op.kind);
+
+  // update-issue: a content PATCH through prepareIssueUpdates's own read-splice-write path.
+  const body = `${FENCE_BEGIN}\nold\n${FENCE_END}`;
+  const issueUpdateResult = prepareIssueUpdates([{
+    logicalKey: 'phase:04', issueKey: 'issue:phase:04', issueNumber: 55, issueNodeId: 'ISSUE_NODE_04',
+    title: 'Phase Four', region: 'fresh interior', milestoneNumber: 3, milestoneKey: MILESTONE_KEY,
+    contentHash: 'freshhash123', completionContext: { owner: 'octo', repo: 'repo', repositoryNumber: 42 },
+  }], { cwd: '/fixture', execGh: () => ({ exitCode: 0, stdout: JSON.stringify({ node_id: 'ISSUE_NODE_04', number: 55, body }), stderr: '' }) });
+  assert.deepEqual(issueUpdateResult.reports, [], 'the update-issue fixture must actually produce an operation, not a damaged/unreadable report');
+  for (const op of issueUpdateResult.operations) kinds.add(op.kind);
+
+  assert.deepEqual(
+    [...kinds].sort(),
+    Object.keys(operationMod.MUTATION_KIND_BUCKET).sort(),
+    'every kind a real fixture reaches must be a member of the catalog, and the catalog must carry no dead entry the fixture never reaches',
+  );
+});
+
+test('the exhaustiveness catalog fails closed: removing a member from the fixture-reached kind set would no longer set-equal the catalog (sanity control for the assertion above, not a catalog mutation)', () => {
+  const reachedKinds = new Set(['create', 'create-issue', 'create-plan-issue', 'update-field-value', 'add-sub-issue', 'update-plan-issue-state', 'update-issue']);
+  const withOneRemoved = new Set(reachedKinds);
+  withOneRemoved.delete('add-sub-issue');
+  assert.notDeepEqual([...withOneRemoved].sort(), Object.keys(operationMod.MUTATION_KIND_BUCKET).sort());
+  assert.deepEqual([...reachedKinds].sort(), Object.keys(operationMod.MUTATION_KIND_BUCKET).sort());
+});
+
+test('statusBucketForKind classifies every real kind into creates or updates, and returns null for an unrecognised kind', () => {
+  assert.equal(operationMod.statusBucketForKind('create'), operationMod.STATUS_BUCKET.CREATES);
+  assert.equal(operationMod.statusBucketForKind('create-issue'), operationMod.STATUS_BUCKET.CREATES);
+  assert.equal(operationMod.statusBucketForKind('create-plan-issue'), operationMod.STATUS_BUCKET.CREATES);
+  assert.equal(operationMod.statusBucketForKind('update-field-value'), operationMod.STATUS_BUCKET.UPDATES);
+  assert.equal(operationMod.statusBucketForKind('add-sub-issue'), operationMod.STATUS_BUCKET.UPDATES);
+  assert.equal(operationMod.statusBucketForKind('update-plan-issue-state'), operationMod.STATUS_BUCKET.UPDATES);
+  assert.equal(operationMod.statusBucketForKind('update-issue'), operationMod.STATUS_BUCKET.UPDATES);
+  assert.equal(operationMod.statusBucketForKind('delete-everything'), null);
+});
+
+test('buildStatusV1 on a plan carrying a field-value operation emits that operation\'s logical key in the updates array (WINDOWS #8: field-value writes used to vanish from status entirely)', () => {
+  const result = buildStatusV1({ available: true, reason: 'ok' }, {
+    operations: [{ kind: 'update-field-value', logicalKey: 'plan:04-03' }],
+    noops: [], blocked: [], uncertain: [],
+  });
+  assert.deepEqual(result.creates, []);
+  assert.deepEqual(result.updates, ['plan:04-03']);
+  assert.ok(JSON.parse(renderStatusV1(result, true)).updates.includes('plan:04-03'));
+});
+
+test('buildStatusV1 on a plan carrying a sub-issue-link, a plan-issue-state, and an issue-content-PATCH operation puts all three in the updates array (WINDOWS #8)', () => {
+  const result = buildStatusV1({ available: true, reason: 'ok' }, {
+    operations: [
+      { kind: 'add-sub-issue', logicalKey: 'issue:plan:04-03' },
+      { kind: 'update-plan-issue-state', logicalKey: 'issue:plan:04-04' },
+      { kind: 'update-issue', logicalKey: 'issue:phase:04' },
+    ],
+    noops: [], blocked: [], uncertain: [],
+  });
+  assert.deepEqual(result.creates, []);
+  assert.deepEqual(result.updates.sort(), ['issue:phase:04', 'issue:plan:04-03', 'issue:plan:04-04'].sort());
+});
+
+test('buildStatusV1 on a plan carrying zero operations still produces empty creates and updates arrays without throwing', () => {
+  const result = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] });
+  assert.deepEqual(result.creates, []);
+  assert.deepEqual(result.updates, []);
 });

@@ -93,6 +93,56 @@ export const OPERATION_OUTCOME = Object.freeze({
 } as const);
 export type OperationOutcomeResult = typeof OPERATION_OUTCOME[keyof typeof OPERATION_OUTCOME];
 
+/**
+ * D-07/WINDOWS #8 (plan 07-03): the exhaustive catalog of every
+ * `MutationOperation.kind` value `planReconciliation`
+ * (`github-sync-reconcile.cts`) and `prepareIssueUpdates`
+ * (`github-sync-issue-update.cts`) can emit, paired with the status bucket
+ * `statusBucketForKind` resolves it to. `buildStatusV1`'s creates/updates
+ * filter used to compare `operation.kind` against this module's
+ * `OPERATION_ACTION` literals ('create'/'update') — action values, never a
+ * real `MutationOperation.kind` any producer emits, except by coincidence
+ * (the bind-to-project operation's own `kind`, `github-sync-reconcile.cts`'s
+ * `OPERATION_KIND.CREATE`, happens to share the literal string 'create').
+ * Every other real kind (`create-issue`, `create-plan-issue`,
+ * `update-field-value`, `add-sub-issue`, `update-plan-issue-state`,
+ * `update-issue`) therefore silently vanished from both buckets. P2 D-12's
+ * shared-predicate rule: this catalog and the bucket decision are one
+ * thing, so a diagnosis can never disagree with the outcome —
+ * `tests/github-sync-status.test.cjs` asserts every kind a real fixture
+ * reaches is a member of `MUTATION_KIND_BUCKET`'s key set (a set-equality
+ * exhaustiveness check), so a future unclassified kind fails the suite
+ * instead of silently hiding from `status`.
+ */
+export const STATUS_BUCKET = Object.freeze({
+  CREATES: 'creates',
+  UPDATES: 'updates',
+} as const);
+export type StatusBucket = typeof STATUS_BUCKET[keyof typeof STATUS_BUCKET];
+
+export const MUTATION_KIND_BUCKET: Readonly<Record<string, StatusBucket>> = Object.freeze({
+  // The bind-to-project operation (`operationFor` in
+  // github-sync-reconcile.cts): adds an already-existing issue to the
+  // project board. Its `kind` is the literal 'create'
+  // (github-sync-reconcile.cts's own two-member OPERATION_KIND) — the one
+  // kind the pre-fix literal filter matched, so this bucket assignment is a
+  // no-op for it, not a behavior change.
+  create: STATUS_BUCKET.CREATES,
+  'create-issue': STATUS_BUCKET.CREATES,
+  'create-plan-issue': STATUS_BUCKET.CREATES,
+  'update-field-value': STATUS_BUCKET.UPDATES,
+  // A sub-issue link modifies an already-existing parent issue rather than
+  // creating content, so it belongs with the updates.
+  'add-sub-issue': STATUS_BUCKET.UPDATES,
+  'update-plan-issue-state': STATUS_BUCKET.UPDATES,
+  'update-issue': STATUS_BUCKET.UPDATES,
+});
+
+/** Returns the status bucket a known `MutationOperation.kind` belongs to, or `null` for anything unrecognised — never a string-prefix guess (D-12's shared-predicate rule). */
+export function statusBucketForKind(kind: string): StatusBucket | null {
+  return Object.prototype.hasOwnProperty.call(MUTATION_KIND_BUCKET, kind) ? MUTATION_KIND_BUCKET[kind] : null;
+}
+
 /** The repository binding every `SyncCompletion` carries (checkpoint contract clause 1a). */
 export interface CompletionContext {
   owner: string;
