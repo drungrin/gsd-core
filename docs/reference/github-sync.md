@@ -208,6 +208,101 @@ gsd-tools github-sync sync [--raw]
 Reconciles phase and plan state into GitHub Issues linked to the Project board, following the
 same one-way, checkpointed-apply discipline `init` uses for the board's own structure.
 
+### Existence classification and the recreate grace interval
+
+Every mapped object in the `project`, `field:*`, `option:status:*`, `option:autonomous:*`,
+`label:*`, `milestone:*`, and issue (`issue:phase:*` / `issue:plan:*`, plus the legacy
+`phase:*` / `plan:*` project-item keys) namespaces is classified on each `sync` and `status`
+run as one of three verdicts, derived structurally from the same enumerations the run already
+makes — never from a dedicated probe:
+
+- **present** — the mapped ID appears in a read that succeeded.
+- **confirmed-absent** — a read that succeeded did not contain it.
+- **unknown** — the read itself failed. An unknown object is reported per-object and never
+  treated as absent; a token that has silently lost its `project` scope, or a transient GitHub
+  outage, must never be indistinguishable from "this object was deleted."
+
+For an issue-bearing key, re-resolution by `(owner, repo, number)` runs **before** the absence
+verdict — a cached node ID that no longer matches is not treated as gone until the number lookup
+also fails against the same successful read. This is what makes visibility lag harmless without a
+larger timeout: an issue that exists but is not yet enumerable by its old node ID still resolves
+by number. If the number lookup succeeds with a **different** node ID than the one cached — the
+signature of a repository transfer — the new ID is adopted and recorded, reported by name in the
+run's output, and converges to zero on the next run.
+
+**Recreating a confirmed-absent object requires two confirmed absences separated by a minimum
+elapsed wall-clock gap of 60 seconds.** A single absence is recorded and never acted on; only a
+**second** confirmed absence, at least 60 seconds after the first, triggers recreation. A verdict
+of `present` at any point clears the marker entirely — the count only ever advances across
+genuinely *consecutive* absences, so one present read between two absent ones resets the clock.
+An `unknown` verdict neither advances nor clears the marker, so a single flaky read never costs
+progress toward, or falsely accelerates, the gate.
+
+That 60-second interval is a fixed constant, not a configuration key. It is scaled from
+[`04-LAG-MEASUREMENT.md`](../../.planning/phases/04-phase-issue-sync/04-LAG-MEASUREMENT.md) —
+a live measurement of GitHub Projects v2's creation-visibility lag against one account, one
+board, and one session: **six samples** (n=6), ranging 2.351 s to 4.712 s, mean 3.881 s, zero
+censored observations. 60 seconds is roughly 12× the observed maximum. State plainly what that
+measurement does **not** rule out, in its own words: "one account, one board, one session... the
+community-reported multi-hour figure may describe a real but rare tail behavior... that six
+samples in one session cannot rule out." The real backstop against that unruled-out tail is not a
+larger timeout — it is the by-number re-resolution described above, which runs on every read and
+recovers an object the moment it becomes enumerable again, however long that takes. Raising the
+grace interval was considered and rejected (D-10): no developer has needed it, and the number
+would still be a guess dressed as a fix.
+
+### Rebuild from disk
+
+When a bootstrap-namespace object reaches its second confirmed absence past the 60-second gate,
+`sync` delegates to the same `planBootstrap` two-pass sequence `init` runs — recreating every
+bootstrap object `.planning/` still wants, not only the one that triggered the rebuild — and then
+continues into phase/plan reconciliation in the **same run**. This is a literal reading of "the
+next `sync` rebuilds the mirror from `.planning/`": deleting the Project on GitHub, or hand-
+deleting a single custom field, both self-heal on the next `sync` once the gate is satisfied,
+with zero duplicated bootstrap logic (`sync` calls the identical function `init` does).
+
+**This run can be long, and it is always safe to interrupt.** A full rebuild dispatches every
+bootstrap-structure mutation the board needs (fields, options, labels, milestones, views) plus
+every phase and plan issue's create-and-field-write sequence — potentially hundreds of mutations
+against GitHub's secondary rate ceiling. There is no confirmation gate before a rebuild starts
+and no `--rebuild` flag to opt in: `sync` reports the rebuild scope and runs, matching this
+capability's non-interactive, hook-safe design. Every individual mutation is checkpointed to the
+local sync map as it completes, exactly as an ordinary `sync` run already is, so killing a
+rebuilding run and re-running `sync` resumes from wherever it stopped rather than duplicating
+anything already created.
+
+`status` predicts this exact scope without writing anything: it runs the same existence
+classification and the same `planBootstrap` passes `sync` would, with apply and map-write
+authority withheld, so a developer can see what a rebuild would do before it happens.
+
+### Marker-based adoption
+
+Deleting a Project v2 board does not delete the issues it once tracked — issues are repository-
+scoped and survive a project deletion untouched. If `.planning/.github-sync.json` is lost or
+corrupted while those issues still exist, `sync` recovers their identity from the markers already
+written into each issue's first line — `<!-- gsd:phase id="NN" -->` / `<!-- gsd:plan id="NN-PP" -->`
+(see [Identity marker](#identity-marker) below) — instead of creating duplicates.
+
+A binding requires **all three** of: the exact marker literal (a near-miss — different spacing,
+quoting, or comment form — matches nothing), that occurrence lying inside the fenced structure
+GSD itself writes, and **exactly one** issue claiming the identifier. Any ambiguity — two issues
+claiming the same identifier, or one issue claiming two different identifiers — refuses and
+reports rather than guessing; nothing is bound for either side of an ambiguous claim. This
+adoption pass runs before both the rebuild described above and ordinary reconciliation, so an
+identifier a marker successfully claims is bound rather than created in the same run. `status`
+runs the identical read-and-bind computation and reports what it would bind, writing nothing.
+
+### Nothing on GitHub is ever deleted
+
+No `sync` behavior — rebuild, adoption, or ordinary reconciliation — ever deletes, closes, or
+unlinks anything on GitHub. The only removal anywhere in this capability is a **local** sync-map
+entry, and only for an object the remote has confirmed absent twice, past the same 60-second
+gate that governs recreation: disk does not want it, and the remote agrees it is gone, twice.
+Because `.planning/.github-sync.json` is committed, a wrong prune is recoverable from git
+history — the same argument that made `.planning/` tracked in the first place. An object the
+remote still reports present, but that disk no longer wants, is reported as an orphan exactly as
+before and is never pruned or touched.
+
 ## Phase Issues
 
 `sync` mirrors every `.planning/ROADMAP.md` phase into a repository Issue: created if none is
@@ -536,3 +631,16 @@ meaning of an existing key never changes; and the map's `version` stays `1` (`SY
 for as long as that promise holds. Enumerating the keyspace here means a reader can tell whether
 the file in front of them is current, rather than the documented keyspace silently falling behind
 the code.
+
+### New members: `absenceCount` and `absenceFirstSeenAt`
+
+Every completion — regardless of which reserved prefix above it belongs to — may now optionally
+carry two members recording [existence classification](#existence-classification-and-the-recreate-grace-interval)
+state: `absenceCount` (how many consecutive confirmed absences have been recorded since the
+object was last seen present) and `absenceFirstSeenAt` (the ISO timestamp of the first of those
+absences, the input to the 60-second gate). Both are added the same way `contentHash`,
+`fieldState`, and `issueState` were before them — as optional members on an existing completion —
+so this is purely **additive**: the two new members may be present or absent on any completion,
+their meaning matches what this section states above and will not change, and `SYNC_MAP_VERSION`
+stays `1`. A map written before this release simply lacks both members on every completion until
+its object's existence is classified for the first time.
