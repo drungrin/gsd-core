@@ -7,8 +7,8 @@
  * imports, no filesystem, no subprocess.
  *
  * **The outcome journal is the report's only source of counts; the plan is
- * the only source of the noop notes it renders; a note never increments a
- * quantity.** Reading counts off the plan instead would let the report claim
+ * the only source of the noop/partial notes it renders; a note never
+ * increments a quantity.** Reading counts off the plan instead would let the report claim
  * an object was created when its mutation failed (the composition suite's
  * partial-failure case would catch that); reading them off a bare confirmed-
  * key list would report five adopted `Status` options as five creations
@@ -43,6 +43,14 @@
  * label was adopted under, that a stage found nothing to do — attributed to
  * a stage by the noop's own reason (a closed catalog), rendered under that
  * stage's line in the human form.
+ *
+ * **`partial` entries (06-07 gap closure) become notes the same way, never
+ * a count and never `blocked`.** A plan's `partial` field (see
+ * `github-sync-bootstrap-plan.cts`'s `BootstrapPlan.partial`) carries a
+ * per-item skip whose apply still ran — `tallyPartials` renders each entry
+ * through `reasonSentence` so the note names the specific view and field,
+ * while `deriveOutcome` never reads `partial` at all: a run that applied
+ * everything it could stays `completed`.
  */
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -98,6 +106,13 @@ interface PlanLike {
   noops?: NoopLike[];
   blocked?: BlockedLike[];
   uncertain?: UncertainLike[];
+  /**
+   * 06-07 gap closure (CR-01 Task 2): per-item blocked entries the plan
+   * layer no longer routes through `blocked` (a producer that predates
+   * this field, or an injected test seam, still builds a report without
+   * it — optional for that reason).
+   */
+  partial?: BlockedLike[];
 }
 interface OutcomeLike { logicalKey: string; operationKey: string | null; action: string; result: string; }
 interface ApplyResultLike {
@@ -202,6 +217,11 @@ function attributeNoopStage(reason: string): ReportStage | null {
   if (reason === BOOTSTRAP_OPERATION_REASON.LABEL_EXISTS) return REPORT_STAGE.LABELS;
   if (reason === BOOTSTRAP_OPERATION_REASON.MILESTONE_EXISTS) return REPORT_STAGE.MILESTONES;
   if (reason === BOOTSTRAP_OPERATION_REASON.PROJECT_UNSET) return REPORT_STAGE.PROJECT;
+  // 06-07 gap closure (CR-01 Task 2): a per-item view skip is attributed to
+  // the VIEWS stage — the same stage a `view:*` outcome resolves to in
+  // `resolveStage` above — so its note lands beside the rest of that
+  // stage's activity rather than nowhere.
+  if (reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED) return REPORT_STAGE.VIEWS;
   return null;
 }
 
@@ -252,6 +272,27 @@ function tallyNoops(noops: NoopLike[] | undefined, stageMap: Map<ReportStage, In
     const stage = attributeNoopStage(noop.reason);
     if (!stage) continue;
     stageMap.get(stage)?.notes.push(noteText(noop));
+  }
+}
+
+/**
+ * 06-07 gap closure (CR-01 Task 2): mirrors `tallyNoops`' shape but reads a
+ * pass's `partial` array (its per-item, non-fatal blocked entries — see
+ * `PlanLike.partial`'s doc comment) instead of `noops`, and renders each
+ * entry through `reasonSentence` rather than `noteText`'s bare
+ * `reason: detail` pairing — a `partial` entry's `detail` carries the view
+ * name and the missing field name a developer needs to see, and
+ * `reasonSentence`'s `view_field_unresolved` case is the one place that
+ * composes the full, actionable sentence around it. Increments no counter:
+ * a skipped view dispatched nothing, so it produced no outcome-journal
+ * entry, and this module's own header states a note never increments a
+ * quantity — do not "fix" this back into a skipped/blocked count.
+ */
+function tallyPartials(partials: BlockedLike[] | undefined, stageMap: Map<ReportStage, InitReportStage>): void {
+  for (const entry of partials ?? []) {
+    const stage = attributeNoopStage(entry.reason);
+    if (!stage) continue;
+    stageMap.get(stage)?.notes.push(reasonSentence(entry.reason as ReportReason, entry.detail));
   }
 }
 
@@ -408,6 +449,11 @@ function buildInitReportV1(input: BuildInitReportInput): InitReportV1 {
   tallyOutcomes(input.optionsApply?.outcomes ?? [], allEntries, stageMap);
   tallyNoops(input.structurePlan?.noops, stageMap);
   tallyNoops(input.optionsPlan?.noops, stageMap);
+  // 06-07 gap closure (CR-01 Task 2): notes from the plan's `partial`
+  // entries, immediately after the two `tallyNoops` calls — the ordering
+  // rule stays "counts from the journal, notes from the plan".
+  tallyPartials(input.structurePlan?.partial, stageMap);
+  tallyPartials(input.optionsPlan?.partial, stageMap);
 
   return {
     version: REPORT_SCHEMA_VERSION,
