@@ -16,17 +16,29 @@
  * must never import this module back.
  *
  * Plan 07-01 wired exactly one reserved logical key end to end: `project`.
- * Plan 07-04 widens classification to every namespace REC-02 (as amended by
- * D-22) names as participating: `project`, `field:*`, `option:status:*`,
- * `option:autonomous:*`, `label:*`, `milestone:*`. Two namespaces stay
- * exempt, each for a stated reason (D-14): `view:*` (a view carries no body,
- * comments, history, or sub-issue relations, so `planViews`' own
- * recreate-on-unresolved-ID path destroys nothing) and `project-link` (it
- * records a relationship `planProject` already repairs on its own read, not
- * an object with an absence to gate). The issue namespaces are deliberately
- * NOT classified here either — D-12 requires re-resolution by
- * `(owner, repo, number)` to run before any issue's absence verdict, which
- * plan 07-05 adds together with that re-resolution.
+ * Plan 07-04 widened classification to every bootstrap namespace REC-02 (as
+ * amended by D-22) names as participating: `project`, `field:*`,
+ * `option:status:*`, `option:autonomous:*`, `label:*`, `milestone:*`. Two
+ * namespaces stay exempt, each for a stated reason (D-14): `view:*` (a view
+ * carries no body, comments, history, or sub-issue relations, so
+ * `planViews`' own recreate-on-unresolved-ID path destroys nothing) and
+ * `project-link` (it records a relationship `planProject` already repairs on
+ * its own read, not an object with an absence to gate).
+ *
+ * Plan 07-05 (D-11/D-12) completes REC-02's namespace list with the
+ * issue-bearing keys: the phase issue's own identity (`issue:phase:<id>`),
+ * the plan issue's own identity (`issue:plan:<id>`), and the legacy
+ * pre-Phase-4 phase project-item key (`phase:<id>`) that also carries a real
+ * issue number. Unlike the bootstrap namespaces (classified by direct node-ID
+ * membership against an enumeration), an issue's verdict is reached only
+ * after re-resolving by `(owner, repo, number)` — D-12's ordering
+ * requirement — because a node ID appearing to be missing from the board's
+ * item list is not evidence the underlying issue is gone: the issue may
+ * simply not be bound to the project, or may have been transferred/restored
+ * under a new node ID. `classifyIssueBearing` below is that re-resolution,
+ * generalizing `github-sync-reconcile.cts`'s existing
+ * `bindingOnBoard`/`resolvedIssueNodeId` two-tier check into a verdict rather
+ * than a boolean.
  */
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -92,12 +104,25 @@ interface BootstrapRemoteLike {
   milestones?: RemoteEntryLike[];
 }
 
+/** A project item as `RemoteSnapshot.items` (`github-sync-remote.cjs`) carries it: the item's own node id, and — when bound to an issue — that issue's node id and number nested under `content`. */
+interface RemoteItemLike {
+  id?: string;
+  content?: { id?: string; number?: number } | null;
+}
+
+/** The subset of `RemoteSnapshot` (`github-sync-remote.cjs`) D-12's issue re-resolution consults. */
+interface RemoteSnapshotLike {
+  available?: boolean;
+  items?: RemoteItemLike[];
+  /** Keyed by issue number (as a string), populated only for issue-bearing keys the router already hinted (`collectIssueNodeIdHints`, plan 04-06's allow-list) — D-11's own discipline, upstream of this module. */
+  issueNodeIds?: Record<string, string>;
+}
+
 interface ClassifyExistenceInput {
   /** The current sync map's completions, keyed by logical key. */
-  completions?: Record<string, { nodeId?: string } | undefined> | null;
-  /** `RemoteSnapshot`-shaped read (`github-sync-remote.cjs`) — reserved for
-   *  a future plan's issue-bearing namespaces (D-12); not consulted here. */
-  remote?: unknown;
+  completions?: Record<string, { nodeId?: string; issueNumber?: number } | undefined> | null;
+  /** `RemoteSnapshot`-shaped read (`github-sync-remote.cjs`) — the classification input for every issue-bearing key (D-11/D-12). */
+  remote?: RemoteSnapshotLike | null;
   /** `BootstrapRemoteState`-shaped read (`github-sync-bootstrap-remote.cjs`)
    *  — the classification input for every participating bootstrap-namespace key. */
   bootstrapRemote?: BootstrapRemoteLike | null;
@@ -139,6 +164,46 @@ function participatingNamespaceKind(logicalKey: string): ParticipatingNamespace 
   if (logicalKey.startsWith(LABEL_PREFIX)) return 'label';
   if (logicalKey.startsWith(MILESTONE_PREFIX)) return 'milestone';
   return null;
+}
+
+/**
+ * D-11 (plan 07-05): the three issue-bearing logical-key generators —
+ * exactly the key forms `src/github-sync-command-router.cts`'s
+ * `isIssueBearingLogicalKey` allow-lists (built in plan 04-06, with its own
+ * RED-first regression test): the phase issue's own identity, the plan
+ * issue's own identity, and the legacy pre-Phase-4 phase project-item key
+ * that also carries a real issue number. Mirrors that module's own
+ * `startsWith('issue:') || startsWith('phase:')` predicate, expressed here as
+ * three separate prefixes (rather than two) so this module's own contract
+ * test (plan 07-05 Task 3) can enumerate each key FORM independently instead
+ * of collapsing `issue:phase:*` and `issue:plan:*` into one generic `issue:`
+ * membership check. Exported so that test drives its assertion from this
+ * catalog's own membership rather than a second, hand-written list that
+ * could silently drift from it — the same discipline `BOOTSTRAP_LOGICAL_KEY`
+ * already establishes for the bootstrap namespaces above.
+ *
+ * `github-sync-command-router.cts` cannot import this module for its own
+ * copy: it already imports `github-sync-existence.cjs`, and this module must
+ * never import that one back (this module's own header explains why). The
+ * two predicates are therefore deliberately parallel, not shared — exactly
+ * the same one-directional constraint `BOOTSTRAP_LOGICAL_KEY` already lives
+ * under here.
+ */
+const ISSUE_LOGICAL_KEY = Object.freeze({
+  phaseIssue: (id: string): string => `issue:phase:${id}`,
+  planIssue: (id: string): string => `issue:plan:${id}`,
+  legacyPhase: (id: string): string => `phase:${id}`,
+});
+
+const ISSUE_BEARING_KEY_PREFIXES: readonly string[] = Object.freeze([
+  ISSUE_LOGICAL_KEY.phaseIssue(''),
+  ISSUE_LOGICAL_KEY.planIssue(''),
+  ISSUE_LOGICAL_KEY.legacyPhase(''),
+]);
+
+/** D-11: `true` for a phase-issue key, a plan-issue key, or the legacy phase project-item key — the only key forms whose `issueNumber` may ever reach a by-number lookup. */
+function isIssueBearingLogicalKey(logicalKey: string): boolean {
+  return ISSUE_BEARING_KEY_PREFIXES.some((prefix) => logicalKey.startsWith(prefix));
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -190,12 +255,73 @@ function classifyByNamespace(
 }
 
 /**
- * D-05/D-02/D-22 (this plan's widened scope): every mapped ID in a
- * participating bootstrap namespace — `project`, `field:*`,
- * `option:status:*`, `option:autonomous:*`, `label:*`, `milestone:*` —
- * receives a verdict. `view:*` and `project-link` (D-14) and every
- * issue-bearing key (D-12, plan 07-05) are excluded from the returned
- * collection entirely, not present in it with a null verdict.
+ * D-12's fast path: does `nodeId` appear anywhere in the run's own project
+ * item enumeration (`remote.items`, already read for every `sync`/`status`
+ * invocation)? Checks BOTH node-id semantics a cached completion's `nodeId`
+ * may carry — an item's own id (the legacy `phase:<id>` project-item
+ * completion) or its bound issue's content id (`issue:phase:<id>` /
+ * `issue:plan:<id>`) — generalizing `bindingOnBoard`'s item-id check
+ * (`github-sync-reconcile.cts`) to the second semantic that module's own
+ * function never needed. A hit here means no by-number lookup is required at
+ * all — the property the router's contract test (Task 3) pins.
+ */
+function issueNodeIdAppearsInItems(nodeId: string | undefined, items: RemoteItemLike[] | undefined): boolean {
+  if (!isNonEmptyString(nodeId)) return false;
+  for (const item of items ?? []) {
+    if (isNonEmptyString(item.id) && item.id === nodeId) return true;
+    const content = item.content;
+    if (content !== null && typeof content === 'object' && isNonEmptyString(content.id) && content.id === nodeId) return true;
+  }
+  return false;
+}
+
+/**
+ * D-12's re-resolution path: `remote.issueNodeIds` is populated only for
+ * issue-bearing numbers the router already hinted
+ * (`collectIssueNodeIdHints`'s allow-list, upstream of this module) — a
+ * direct `(owner, repo, number)` read, independent of project-board
+ * membership. Returns the freshly resolved node id, or `null` when the
+ * number was never hinted or the issue does not resolve against a
+ * successful read.
+ */
+function numberResolvedNodeId(issueNodeIds: RemoteSnapshotLike['issueNodeIds'], issueNumber: number | undefined): string | null {
+  if (typeof issueNumber !== 'number' || issueNodeIds === null || typeof issueNodeIds !== 'object') return null;
+  const value = issueNodeIds[String(issueNumber)];
+  return isNonEmptyString(value) ? value : null;
+}
+
+/**
+ * D-05/D-11/D-12: the issue-bearing verdict. Branches on `remote.available`
+ * BEFORE touching either lookup (T-07-01's discipline, generalized to the
+ * issue namespaces) — an unavailable read yields `unknown` regardless of
+ * which of the two checks below would have failed. Order is the requirement,
+ * not an optimisation (D-12): the node-ID fast path runs first, and only a
+ * miss there reaches the by-number re-resolution — `confirmed-absent` is
+ * reachable only when BOTH fail against a read that succeeded.
+ */
+function classifyIssueBearing(
+  completion: { nodeId?: string; issueNumber?: number },
+  remote: RemoteSnapshotLike | null | undefined,
+): ExistenceVerdictValue {
+  if (!remote || remote.available !== true) return EXISTENCE_VERDICT.UNKNOWN;
+  if (issueNodeIdAppearsInItems(completion.nodeId, remote.items)) return EXISTENCE_VERDICT.PRESENT;
+  return numberResolvedNodeId(remote.issueNodeIds, completion.issueNumber) !== null
+    ? EXISTENCE_VERDICT.PRESENT
+    : EXISTENCE_VERDICT.CONFIRMED_ABSENT;
+}
+
+/**
+ * D-05/D-02/D-22/D-11/D-12: every mapped ID in a participating bootstrap
+ * namespace — `project`, `field:*`, `option:status:*`,
+ * `option:autonomous:*`, `label:*`, `milestone:*` — receives a verdict
+ * against `bootstrapRemote`'s direct enumerations, and every mapped
+ * issue-bearing key — `issue:phase:*`, `issue:plan:*`, the legacy
+ * `phase:*` project-item form — receives a verdict against `remote` through
+ * D-12's re-resolve-before-verdict path. `view:*` and `project-link` (D-14)
+ * are excluded from the returned collection entirely, not present in it
+ * with a null verdict — the two axes are mutually exclusive by construction
+ * (`participatingNamespaceKind` and `isIssueBearingLogicalKey` share no
+ * prefix), so every mapped completion is classified by at most one path.
  */
 function classifyExistence(input: ClassifyExistenceInput): ExistenceVerdictEntry[] {
   const completions = input.completions ?? {};
@@ -204,8 +330,13 @@ function classifyExistence(input: ClassifyExistenceInput): ExistenceVerdictEntry
   for (const [logicalKey, completion] of Object.entries(completions)) {
     if (!completion) continue;
     const namespace = participatingNamespaceKind(logicalKey);
-    if (namespace === null) continue;
-    entries.push({ logicalKey, verdict: classifyByNamespace(namespace, completion.nodeId, input.bootstrapRemote) });
+    if (namespace !== null) {
+      entries.push({ logicalKey, verdict: classifyByNamespace(namespace, completion.nodeId, input.bootstrapRemote) });
+      continue;
+    }
+    if (isIssueBearingLogicalKey(logicalKey)) {
+      entries.push({ logicalKey, verdict: classifyIssueBearing(completion, input.remote) });
+    }
   }
 
   // Exactly `collectOrphans`' own sort (github-sync-reconcile.cts): logical
@@ -296,6 +427,8 @@ function rebuildTriggered(
 export = {
   EXISTENCE_VERDICT,
   RECREATE_GRACE_MS,
+  ISSUE_LOGICAL_KEY,
+  isIssueBearingLogicalKey,
   classifyExistence,
   advanceAbsence,
   absenceGateSatisfied,
