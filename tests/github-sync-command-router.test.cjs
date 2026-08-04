@@ -2193,4 +2193,73 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
     assert.deepEqual(bootstrapCalls, [], 'status never runs bootstrap-remote reads — it has no classification path at all');
     assert.deepEqual(initialMap.completions.project, baseProjectCompletion(), 'the map object itself is untouched across three status invocations — sync-map file equality, not merely no error thrown');
   });
+
+  // ─── Plan 07-04 Task 3 (D-02): the rebuild trigger widens to every
+  // participating reserved-namespace object, not only `project`. The router
+  // call site built in plan 07-01 (`existence.rebuildTriggered(verdicts,
+  // completions, nowIso)`) needs no change — `verdicts` already carries every
+  // participating namespace's entry once Task 1 widens classifyExistence, and
+  // rebuildTriggered's own widening (Task 3) considers all of them. Uses the
+  // REAL existence module (no `_existence` override), matching plan 07-01's
+  // own tests. ─────────────────────────────────────────────────────────────
+
+  test('D-02: a single custom field confirmed absent twice past the 60000ms gate triggers the bootstrap rebuild delegation even though the project itself is present', () => {
+    const seedMap = realMap.recordCompletion(
+      realMap.recordCompletion(null, baseProjectCompletion({ nodeId: 'PVT_LIVE' })),
+      {
+        logicalKey: 'field:gsd-id',
+        nodeId: 'PVTF_GSDID',
+        completedAt: '2026-07-01T00:00:00.000Z',
+        owner: TARGET.owner,
+        repo: TARGET.repo,
+        repositoryNumber: TARGET.repositoryNumber,
+        // Simulates a field already confirmed absent once by a prior run.
+        absenceCount: 1,
+        absenceFirstSeenAt: T0,
+      },
+    );
+    const mapSeam = makeMapSeam(seedMap);
+    const bootstrapPlanCalls = [];
+    const applyCalls = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: mapSeam.seam,
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _bootstrapRemote: {
+          // The project itself resolves; the custom field's array is empty —
+          // a successful read that enumerates zero matches for it (confirmed
+          // absent, never unknown).
+          readBootstrapRemoteState: () => ({
+            available: true,
+            projectOutcome: 'resolved',
+            fields: [],
+            statusField: null,
+            labels: [],
+            milestones: [],
+            views: [],
+          }),
+        },
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => { bootstrapPlanCalls.push(options.pass); return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] }; },
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan) => { applyCalls.push((plan.operations[0] || {}).logicalKey ?? null); return { kind: 'completed', outcomes: [] }; } },
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+
+    assert.deepEqual(bootstrapPlanCalls, ['structure', 'options'], 'a field-only second confirmed absence past the gate triggers both bootstrap passes, unchanged call site');
+    assert.ok(applyCalls.includes('phase:01'), 'reconciliation still runs after the rebuild delegation');
+    assert.equal(process.exitCode, 0);
+  });
 });

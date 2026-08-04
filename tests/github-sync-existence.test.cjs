@@ -312,3 +312,51 @@ test('classifyExistence returns byte-identical, key-sorted collections across tw
   const sortedByKey = [...first].sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, undefined, { numeric: true }));
   assert.deepEqual(first, sortedByKey);
 });
+
+// ─── Plan 07-04 Task 3: widen rebuildTriggered to every participating
+// namespace (D-02). The gate itself (two confirmed absences + RECREATE_GRACE_MS
+// elapsed) is unchanged — only the set of keys that can reach it widens.
+
+const TRIGGER_PARTICIPATING_KEYS = ['project', 'field:gsd-id', 'option:status:todo', 'option:autonomous:yes', 'label:gsd-phase', 'milestone:v1-0'];
+
+for (const logicalKey of TRIGGER_PARTICIPATING_KEYS) {
+  test(`rebuildTriggered is true when ${logicalKey} alone reaches its second confirmed absence past the 60000ms gate`, () => {
+    const verdicts = [{ logicalKey, verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }];
+    const completions = { [logicalKey]: { absenceCount: 1, absenceFirstSeenAt: T0 } };
+    assert.equal(rebuildTriggered(verdicts, completions, T0_PLUS_60S), true);
+  });
+
+  test(`rebuildTriggered is false when ${logicalKey} alone is confirmed absent for the first time, regardless of elapsed time`, () => {
+    const verdicts = [{ logicalKey, verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }];
+    assert.equal(rebuildTriggered(verdicts, {}, T0_PLUS_60S), false);
+  });
+}
+
+test('rebuildTriggered is true for a single non-project participating key past the gate even though the project itself is present — a single key is sufficient, not project specifically', () => {
+  const verdicts = [
+    { logicalKey: 'project', verdict: EXISTENCE_VERDICT.PRESENT },
+    { logicalKey: 'field:gsd-id', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT },
+  ];
+  const completions = { 'field:gsd-id': { absenceCount: 1, absenceFirstSeenAt: T0 } };
+  assert.equal(rebuildTriggered(verdicts, completions, T0_PLUS_60S), true);
+});
+
+test('rebuildTriggered never fires for a confirmed-absent view key, at any absence count, even seeded directly past the gate (D-14)', () => {
+  const verdicts = [{ logicalKey: 'view:roadmap', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }];
+  const completions = { 'view:roadmap': { absenceCount: 5, absenceFirstSeenAt: T0 } };
+  assert.equal(rebuildTriggered(verdicts, completions, T0_PLUS_60S), false);
+});
+
+test('rebuildTriggered never fires for a confirmed-absent project-link key, even seeded directly past the gate (D-14)', () => {
+  const verdicts = [{ logicalKey: 'project-link', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }];
+  const completions = { 'project-link': { absenceCount: 5, absenceFirstSeenAt: T0 } };
+  assert.equal(rebuildTriggered(verdicts, completions, T0_PLUS_60S), false);
+});
+
+test('rebuildTriggered never fires for an unknown verdict, regardless of absence count, across every participating namespace', () => {
+  for (const logicalKey of TRIGGER_PARTICIPATING_KEYS) {
+    const verdicts = [{ logicalKey, verdict: EXISTENCE_VERDICT.UNKNOWN }];
+    const completions = { [logicalKey]: { absenceCount: 5, absenceFirstSeenAt: T0 } };
+    assert.equal(rebuildTriggered(verdicts, completions, T0_PLUS_60S), false, logicalKey);
+  }
+});
