@@ -86,8 +86,45 @@ function readPath(value: unknown, path: string[]): unknown {
   return current;
 }
 
+/**
+ * Strictly narrower than `isNotFoundOnlyErrors` below: requires an explicit,
+ * non-empty, NOT_FOUND-only `errors` array, never treating an ABSENT/empty
+ * `errors` array as equivalent. `decodePage` (below) needs this stricter
+ * gate — unlike `decodeIssueNodeId`'s single-field `issue: null` case, an
+ * unexpectedly-shaped response (e.g. the pre-generalization viewer-rooted
+ * form the HIGH-H regression test pins) also decodes its target `path` to
+ * `undefined` with ZERO errors, and that case must keep failing closed as a
+ * genuine decode mismatch, not be reinterpreted as "confirmed empty."
+ */
+function hasExplicitNotFoundError(errors: unknown): boolean {
+  return Array.isArray(errors) && errors.length > 0 && errors.every((entry) => (
+    entry !== null && typeof entry === 'object' && (entry as { type?: unknown }).type === 'NOT_FOUND'
+  ));
+}
+
+/**
+ * Live finding, plan 07-09 Task 2, the same bug class `decodeIssueNodeId`
+ * carried: `subIssues` is rooted at `repository(owner,name){ issue(number:)
+ * { subIssues {...} } }` -- the identical shape that produces a `NOT_FOUND`
+ * on `repository.issue` (confirmed live: a project item's `content` silently
+ * follows its issue across a transfer, so `collectIssueNumbers` can hand this
+ * reader a number that no longer resolves in the configured repository, even
+ * though the item itself is still board-bound). `readPath`'s own null-check-
+ * before-indexing means a null intermediate ONE level above the connection
+ * field (`repository.issue` here, `subIssues` still unread) makes the
+ * traversal return `undefined`, not `null` — so `connection` is `undefined`
+ * here, not `null`. An explicit, non-empty NOT_FOUND-only `errors` array is
+ * REQUIRED to take this branch regardless (unlike `decodeIssueNodeId`, which
+ * also tolerates an absent `errors` array) — an unresolved connection with
+ * zero accompanying errors is exactly the shape a decode-mismatch (wrong
+ * response root, malformed payload) produces, and that must keep failing
+ * closed, as the HIGH-H viewer-rooted regression test pins. `project`/
+ * `items`/`fields` connections share this decoder but are only ever read
+ * after `readProjectNodeId` has already confirmed the project resolves, so
+ * widening this does not weaken their existing "project genuinely gone"
+ * detection (that gate runs earlier and returns `unavailable()` first).
+ */
 function decodePage(result: GhResult, path: string[]): Page | null {
-  if (result.exitCode !== 0) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(result.stdout);
@@ -96,10 +133,11 @@ function decodePage(result: GhResult, path: string[]): Page | null {
   }
   if (parsed === null || typeof parsed !== 'object') return null;
   const envelope = parsed as { data?: unknown; errors?: unknown };
-  if (Array.isArray(envelope.errors) && envelope.errors.length > 0) return null;
 
   const connection = readPath(envelope.data, path);
-  if (connection === null || typeof connection !== 'object') return null;
+  if (connection === null || typeof connection !== 'object') {
+    return hasExplicitNotFoundError(envelope.errors) ? { nodes: [], hasNextPage: false, endCursor: null } : null;
+  }
   const nodes = (connection as { nodes?: unknown }).nodes;
   const pageInfo = (connection as { pageInfo?: unknown }).pageInfo;
   if (!Array.isArray(nodes) || pageInfo === null || typeof pageInfo !== 'object') return null;
@@ -147,8 +185,38 @@ function normalizeIssueNodeIdHints(hints: number[] | undefined): number[] {
   return [...new Set(hints.filter((hint) => Number.isSafeInteger(hint) && hint > 0))].sort((left, right) => left - right);
 }
 
+/**
+ * Live finding, plan 07-09 Task 2: `repository(owner,name){ issue(number:) }`
+ * against a genuinely absent issue number (e.g. one transferred to another
+ * repository, per `07-TRANSFER-OBSERVATION.md`) resolves `data.repository.issue`
+ * to `null` while ALSO populating a top-level `errors` entry (`type: "NOT_FOUND"`)
+ * -- confirmed live against `gh` 2.96.0. `gh api graphql` itself exits non-zero
+ * whenever `errors` is non-empty, even though `data` decoded a legitimate,
+ * expected "this number does not exist" result. The pre-existing check here
+ * (`exitCode !== 0` / `errors.length > 0` -> unconditional `undefined`)
+ * therefore misclassified a `null` (D-05's own "confirmed-absent") result as
+ * `undefined` ("unknown" / the whole read failed) on every genuinely-absent
+ * issue number -- which is precisely the input D-12's re-resolution exists to
+ * evaluate. `readIssueNodeIds` in turn treats any single `undefined` hint as
+ * cause to fail the ENTIRE snapshot, so one transferred-away issue made
+ * `status`/`sync` report the whole remote as unavailable.
+ *
+ * Fixed by consulting the decoded envelope FIRST, never `exitCode`: `data`
+ * being present at all (even alongside `errors`) is GraphQL's own signal that
+ * the query executed. Only a bare `NOT_FOUND` on this exact path is trusted
+ * as confirmed-absent (`isNotFoundOnlyErrors` below) -- any other error type
+ * (`FORBIDDEN`, rate-limit, ...) alongside a null path still returns
+ * `undefined`, preserving D-05's own guarantee that a token which silently
+ * lost read access is never indistinguishable from a genuinely deleted issue.
+ */
+function isNotFoundOnlyErrors(errors: unknown): boolean {
+  if (!Array.isArray(errors) || errors.length === 0) return true;
+  return errors.every((entry) => (
+    entry !== null && typeof entry === 'object' && (entry as { type?: unknown }).type === 'NOT_FOUND'
+  ));
+}
+
 function decodeIssueNodeId(result: GhResult): string | null | undefined {
-  if (result.exitCode !== 0) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(result.stdout);
@@ -157,9 +225,8 @@ function decodeIssueNodeId(result: GhResult): string | null | undefined {
   }
   if (parsed === null || typeof parsed !== 'object') return undefined;
   const envelope = parsed as { data?: unknown; errors?: unknown };
-  if (Array.isArray(envelope.errors) && envelope.errors.length > 0) return undefined;
   const issue = readPath(envelope.data, ['repository', 'issue']);
-  if (issue === null) return null;
+  if (issue === null) return isNotFoundOnlyErrors(envelope.errors) ? null : undefined;
   if (issue === undefined || typeof issue !== 'object') return undefined;
   const issueNodeId = (issue as { id?: unknown }).id;
   return typeof issueNodeId === 'string' && issueNodeId.length > 0 ? issueNodeId : undefined;

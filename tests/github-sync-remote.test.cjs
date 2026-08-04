@@ -244,6 +244,156 @@ describe('readRemoteSnapshot', () => {
     });
   });
 
+  // Live finding, plan 07-09 Task 2: `gh api graphql` exits non-zero and
+  // populates `errors` whenever GitHub's response carries ANY errors entry —
+  // even a legitimate, expected `NOT_FOUND` on `repository.issue` for an
+  // issue number that genuinely does not exist (e.g. one transferred to
+  // another repository; confirmed live against gh 2.96.0,
+  // 07-TRANSFER-OBSERVATION.md). Before this fix, that exact response
+  // misclassified a confirmed-absent issue number as an unreadable remote.
+  test('a hinted issue number whose response carries data.repository.issue: null alongside a NOT_FOUND-only errors entry resolves confirmed-absent, not unavailable', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp',
+      owner: 'octo',
+      repo: 'example',
+      repositoryNumber: 1,
+      projectNumber: 1,
+      issueNodeIdHints: [404],
+      execGh(args) {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('project', fixtures.empty.project)), stderr: '' };
+        }
+        if (query.includes('github-sync:items')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('items', fixtures.empty.items[0])), stderr: '' };
+        }
+        if (query.includes('github-sync:fields')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('fields', fixtures.empty.fields[0])), stderr: '' };
+        }
+        if (query.includes('github-sync:issueId')) {
+          // Verbatim shape observed live: gh exits 1, but stdout still
+          // carries the full envelope — a null path plus one NOT_FOUND entry.
+          return {
+            exitCode: 1,
+            reason: 'gh_exit_nonzero',
+            stdout: JSON.stringify({
+              data: { repository: { issue: null } },
+              errors: [{ type: 'NOT_FOUND', path: ['repository', 'issue'], message: 'Could not resolve to an Issue with the number of 404.' }],
+            }),
+            stderr: 'gh: Could not resolve to an Issue with the number of 404.',
+          };
+        }
+        throw new Error(`unexpected query: ${query}`);
+      },
+    });
+
+    assert.equal(result.available, true);
+    assert.deepEqual(result.issueNodeIds, {});
+  });
+
+  test('a hinted issue number whose response carries a non-NOT_FOUND error alongside a null path still fails closed to unavailable', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp',
+      owner: 'octo',
+      repo: 'example',
+      repositoryNumber: 1,
+      projectNumber: 1,
+      issueNodeIdHints: [404],
+      execGh(args) {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('project', fixtures.empty.project)), stderr: '' };
+        }
+        if (query.includes('github-sync:items')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('items', fixtures.empty.items[0])), stderr: '' };
+        }
+        if (query.includes('github-sync:fields')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('fields', fixtures.empty.fields[0])), stderr: '' };
+        }
+        if (query.includes('github-sync:issueId')) {
+          // A token that silently lost read access must never be
+          // indistinguishable from a genuinely deleted issue (D-05) — a null
+          // path accompanied by a FORBIDDEN (not NOT_FOUND) error stays unknown.
+          return {
+            exitCode: 1,
+            reason: 'gh_exit_nonzero',
+            stdout: JSON.stringify({
+              data: { repository: { issue: null } },
+              errors: [{ type: 'FORBIDDEN', path: ['repository', 'issue'], message: 'Resource not accessible.' }],
+            }),
+            stderr: 'gh: Resource not accessible.',
+          };
+        }
+        throw new Error(`unexpected query: ${query}`);
+      },
+    });
+
+    assert.deepEqual(result, {
+      available: false,
+      reason: REMOTE_REASON.UNAVAILABLE,
+      items: [],
+      fields: [],
+      subIssues: [],
+    });
+  });
+
+  // Live finding, plan 07-09 Task 2: a Project v2 item's `content` silently
+  // follows its issue across a repository transfer — the item stays
+  // board-bound (`bindingOnBoard` still finds its own id) but now names a
+  // number this reader's `subIssues` query, rooted at the CONFIGURED
+  // repository, cannot resolve. `decodePage`'s `subIssues` read for that
+  // number must decode to an empty page (this parent issue has zero
+  // sub-issues, from this repository's point of view), not fail the whole
+  // snapshot — the same fix class as `decodeIssueNodeId` above, applied to
+  // the sibling decoder that shares the `repository(owner,name){issue(number:)}` root.
+  test('a subIssues read for a number whose response carries a NOT_FOUND-only error decodes to an empty page, not an unavailable snapshot', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp',
+      owner: 'octo',
+      repo: 'example',
+      repositoryNumber: 1,
+      projectNumber: 1,
+      execGh(args) {
+        const query = args.find((arg) => arg.startsWith('query='));
+        if (query.includes('github-sync:project')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('project', fixtures.empty.project)), stderr: '' };
+        }
+        if (query.includes('github-sync:items')) {
+          return {
+            exitCode: 0,
+            reason: 'ok',
+            stdout: JSON.stringify(envelope('items', {
+              nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE-ELSEWHERE', number: 999 } }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            })),
+            stderr: '',
+          };
+        }
+        if (query.includes('github-sync:fields')) {
+          return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('fields', fixtures.empty.fields[0])), stderr: '' };
+        }
+        if (query.includes('github-sync:subIssues')) {
+          // Verbatim shape observed live: the item's content number (999)
+          // does not resolve against the CONFIGURED repository, because its
+          // content silently followed the issue to a different repository.
+          return {
+            exitCode: 1,
+            reason: 'gh_exit_nonzero',
+            stdout: JSON.stringify({
+              data: { repository: { issue: null } },
+              errors: [{ type: 'NOT_FOUND', path: ['repository', 'issue'], message: 'Could not resolve to an Issue with the number of 999.' }],
+            }),
+            stderr: 'gh: Could not resolve to an Issue with the number of 999.',
+          };
+        }
+        throw new Error(`unexpected query: ${query}`);
+      },
+    });
+
+    assert.equal(result.available, true);
+    assert.deepEqual(result.subIssues, []);
+  });
+
   test('returns typed unavailable data without raw GraphQL output for errors and non-progressing cursors', () => {
     const graphqlError = readRemoteSnapshot({
       cwd: '/tmp',
