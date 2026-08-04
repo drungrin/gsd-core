@@ -268,6 +268,20 @@ interface OrphanEntry {
 }
 
 /**
+ * Plan 07-05 Task 2 (D-13): an issue-identity completion (`issue:phase:<id>`
+ * / `issue:plan:<id>`) whose `(owner, repo, number)` re-resolution succeeded
+ * with a node ID different from the one cached — the transfer/undelete case.
+ * `previousNodeId`/`resolvedNodeId` name both sides so a developer reading
+ * the report (or the router's own map-maintenance write) never has to
+ * re-derive which value is which.
+ */
+interface AdoptionEntry {
+  logicalKey: string;
+  previousNodeId: string;
+  resolvedNodeId: string;
+}
+
+/**
  * Plan 05-07 (D-14): a phase whose parent issue's sub-issue count has
  * reached or passed `PLAN_SUB_ISSUE_WARN_THRESHOLD` — reported, never acted
  * on. `count` and `limit` ride the warning itself so a renderer never has to
@@ -316,6 +330,14 @@ interface ReconciliationPlan {
    * warning (pinned by test, not merely by convention).
    */
   subIssueCeilingWarnings: SubIssueCeilingWarning[];
+  /**
+   * Plan 07-05 Task 2 (D-13): always present, empty when nothing applies —
+   * matches every neighbouring array above. Never gates: an issue whose
+   * node ID is adopted here still dispatches whatever operation it would
+   * have dispatched anyway, using the freshly resolved node ID rather than
+   * the stale cached one.
+   */
+  adoptions: AdoptionEntry[];
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -1133,6 +1155,42 @@ function resolvedIssueNodeId(issueNodeIds: RemoteSnapshot['issueNodeIds'], issue
 }
 
 /**
+ * Plan 07-05 Task 2 (D-13): the two logical-key prefixes whose cached
+ * `nodeId` is the ISSUE's own node id (not a project item's) — the only two
+ * shapes a stale-vs-resolved node ID comparison is meaningful for. The
+ * legacy `phase:<id>`/`plan:<id>` project-item keys are deliberately
+ * excluded: their `nodeId` is the project ITEM's node id
+ * (`addProjectV2ItemById.item.id`), a different object than the issue
+ * `resolvedIssueNodeId` resolves, so comparing the two would misfire an
+ * adoption on every run.
+ */
+const ADOPTABLE_KEY_PREFIXES: readonly string[] = [ISSUE_PHASE_KEY_PREFIX, ISSUE_PLAN_KEY_PREFIX];
+
+/**
+ * D-13: one adoption entry per issue-identity completion whose
+ * `(owner, repo, number)` re-resolution succeeds with a node ID different
+ * from the one cached — computed once, over every completion in the map,
+ * independent of which decision-order branch (if any) a phase/plan reaches
+ * this run. Sorted by logical key (matching `collectOrphans`' own sort) so
+ * the result is deterministic and stable across runs with identical input.
+ */
+function detectAdoptions(
+  completions: Record<string, StrictMapCompletion>,
+  issueNodeIds: RemoteSnapshot['issueNodeIds'],
+): AdoptionEntry[] {
+  const adoptions: AdoptionEntry[] = [];
+  for (const [logicalKey, entry] of Object.entries(completions)) {
+    if (!entry || !isNonEmptyString(entry.nodeId)) continue;
+    if (!ADOPTABLE_KEY_PREFIXES.some((prefix) => logicalKey.startsWith(prefix))) continue;
+    const resolved = resolvedIssueNodeId(issueNodeIds, entry.issueNumber);
+    if (resolved !== null && resolved !== entry.nodeId) {
+      adoptions.push({ logicalKey, previousNodeId: entry.nodeId, resolvedNodeId: resolved });
+    }
+  }
+  return adoptions.sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, undefined, { numeric: true }));
+}
+
+/**
  * Plan 05-06 Task 2: whether `depId`'s plan-issue completion will be
  * resolvable by the time an `ArgvRef` naming it dispatches — either from a
  * prior run's own `issue:plan:<depId>` completion (a non-empty node id), or
@@ -1193,7 +1251,7 @@ function planReconciliation(
   strictMap: StrictMap,
   existenceVerdicts?: ExistenceVerdictLike[],
 ): ReconciliationPlan {
-  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [] };
+  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [], adoptions: [] };
   if (!desired.available) return { ...empty, blocked: [{ reason: OPERATION_REASON.DESIRED_UNAVAILABLE, detail: desired.reason }], uncertain: [] };
   if (!remote.available) return { ...empty, blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
   if (strictMap.kind === 'blocking') return { ...empty, blocked: [{ reason: OPERATION_REASON.MAP_BLOCKING, detail: strictMap.reason ?? 'invalid' }], uncertain: [] };
@@ -1213,6 +1271,14 @@ function planReconciliation(
   const context: CompletionContext = { owner: remote.target.owner, repo: remote.target.repo, repositoryNumber: remote.target.repositoryNumber };
   const milestoneVersion = currentMilestoneVersion(desired.milestones);
   const milestoneKey = milestoneVersion !== null ? BOOTSTRAP_LOGICAL_KEY.milestone(milestoneVersion) : null;
+
+  // D-13: computed once, before either loop, so an adoption is detected
+  // regardless of which decision-order branch (if any) the phase/plan
+  // reaches this run. `adoptedNodeIdFor` is the resolved-node-id lookup the
+  // two "issue exists but not yet bound" branches below consult instead of
+  // the completion's own (possibly stale) `nodeId`.
+  const adoptions = detectAdoptions(completions, remote.issueNodeIds);
+  const adoptedNodeIdFor = new Map(adoptions.map((entry) => [entry.logicalKey, entry.resolvedNodeId]));
 
   const operations: ReconciliationPlan['operations'] = [];
   const noops: ReconciliationPlan['noops'] = [];
@@ -1283,7 +1349,11 @@ function planReconciliation(
     }
 
     if (issueCompletion) {
-      operations.push(operationFor(logicalKey, remote.target.projectNodeId, issueCompletion.nodeId, remote.target));
+      // D-13: bind using the freshly re-resolved node ID when this issue was
+      // adopted this run — the stale cached one would fail the mutation live
+      // (a transferred/undeleted issue's old node id no longer resolves).
+      const bindContentId = adoptedNodeIdFor.get(issueKey) ?? issueCompletion.nodeId;
+      operations.push(operationFor(logicalKey, remote.target.projectNodeId, bindContentId, remote.target));
       continue;
     }
 
@@ -1458,7 +1528,10 @@ function planReconciliation(
     if (planIssueCompletion) {
       // GSD created this plan issue on an earlier run but it is not yet
       // bound to the project — bind it via a literal content id, no create.
-      operations.push(operationFor(planLogicalKey, remote.target.projectNodeId, planIssueCompletion.nodeId, remote.target));
+      // D-13: use the freshly re-resolved node ID when this plan issue was
+      // adopted this run, mirroring the phase loop's identical guard above.
+      const planBindContentId = adoptedNodeIdFor.get(planIssueKey) ?? planIssueCompletion.nodeId;
+      operations.push(operationFor(planLogicalKey, remote.target.projectNodeId, planBindContentId, remote.target));
       continue;
     }
 
@@ -1614,7 +1687,7 @@ function planReconciliation(
     blocked.push({ reason: OPERATION_REASON.EXISTENCE_UNKNOWN, detail: verdict.logicalKey });
   }
 
-  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges, subIssueCeilingWarnings };
+  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges, subIssueCeilingWarnings, adoptions };
 }
 
 export = {
