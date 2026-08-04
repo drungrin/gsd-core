@@ -8,7 +8,7 @@ const {
   buildFieldValueOperations, buildPlanFieldValueOperations, PLAN_FIELD_VALUE_SPEC,
   planKeyFor, planIssueKeyFor, buildCreatePlanIssueOperation, buildAddSubIssueOperation, ADD_SUB_ISSUE_DOCUMENT,
   UPDATE_FIELD_VALUE_NUMBER_DOCUMENT, bodyArgvEntry, buildPlanIssueStateOperation, PLAN_ISSUE_STATE,
-  PLAN_SUB_ISSUE_LIMIT, PLAN_SUB_ISSUE_WARN_THRESHOLD,
+  PLAN_SUB_ISSUE_LIMIT, PLAN_SUB_ISSUE_WARN_THRESHOLD, PER_ITEM_BLOCKED_REASONS, isRunFatalBlockedReason,
 } = require('../gsd-core/bin/lib/github-sync-reconcile.cjs');
 const { GSD_LABELS, BOOTSTRAP_LOGICAL_KEY } = require('../gsd-core/bin/lib/github-sync-bootstrap-plan.cjs');
 const {
@@ -16,6 +16,7 @@ const {
   DEPENDENCY_REF_SENTINEL,
 } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
 const { resolveArgv } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
+const { EXISTENCE_VERDICT } = require('../gsd-core/bin/lib/github-sync-existence.cjs');
 
 /** Recursively asserts no object among `inputs` carries a `body` key anywhere — proves SYNC-05/D-08's "no remote body read at all" structurally, not by convention. */
 function assertNoRemoteBodyInInputs(...inputs) {
@@ -2014,4 +2015,66 @@ test('planReconciliation: no code path writes a value from a GitHub response bac
   for (const arg of stateOp.args) {
     if (typeof arg === 'string') assert.doesNotMatch(arg, /\.planning/, 'no argv value names a .planning/ path');
   }
+});
+
+// ─── Plan 07-04 Task 2: the unknown-existence reason (D-06) ───────────────
+//
+// `OPERATION_REASON.EXISTENCE_UNKNOWN` is per-item (in
+// `PER_ITEM_BLOCKED_REASONS`), reported once per object with the object's
+// logical key as `detail`, and never suppresses operations for any other,
+// cleanly classified object in the same run. `planReconciliation` accepts an
+// optional 4th `existenceVerdicts` argument — omitted, every pre-existing
+// call site (and every pre-existing test above) behaves identically.
+
+test('OPERATION_REASON.EXISTENCE_UNKNOWN is a member of PER_ITEM_BLOCKED_REASONS and isRunFatalBlockedReason classifies it per-item', () => {
+  assert.ok(PER_ITEM_BLOCKED_REASONS.has(OPERATION_REASON.EXISTENCE_UNKNOWN));
+  assert.equal(isRunFatalBlockedReason(OPERATION_REASON.EXISTENCE_UNKNOWN), false);
+});
+
+test('every OPERATION_REASON member other than EXISTENCE_UNKNOWN is classified run-fatal by isRunFatalBlockedReason, iterating the enum rather than listing values by hand', () => {
+  for (const value of Object.values(OPERATION_REASON)) {
+    const expectRunFatal = value !== OPERATION_REASON.EXISTENCE_UNKNOWN;
+    assert.equal(isRunFatalBlockedReason(value), expectRunFatal, `reason ${value} expected run-fatal=${expectRunFatal}`);
+  }
+});
+
+test('a plan produced over a map containing one unknown-classified object carries exactly one blocked entry for that object, naming EXISTENCE_UNKNOWN and its logical key, while every operation planned for the cleanly classified objects is still present', () => {
+  const single = desiredWithMilestone([{ id: '04', title: 'Phase Four', goal: 'ship it' }]);
+  const map = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 } } } };
+  const verdicts = [{ logicalKey: 'field:gsd-id', verdict: EXISTENCE_VERDICT.UNKNOWN }];
+
+  const withoutVerdicts = planReconciliation(single, remoteWith(), map);
+  const withVerdicts = planReconciliation(single, remoteWith(), map, verdicts);
+
+  assert.deepEqual(withVerdicts.operations, withoutVerdicts.operations, 'operations for the cleanly classified objects are unaffected');
+  assert.deepEqual(withVerdicts.blocked, [
+    ...withoutVerdicts.blocked,
+    { reason: OPERATION_REASON.EXISTENCE_UNKNOWN, detail: 'field:gsd-id' },
+  ]);
+});
+
+test('a present or confirmed-absent existence verdict never produces an EXISTENCE_UNKNOWN blocked entry', () => {
+  const single = desiredWithMilestone([{ id: '04', title: 'Phase Four', goal: 'ship it' }]);
+  const map = { kind: 'valid', map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 } } } };
+  const verdicts = [
+    { logicalKey: 'project', verdict: EXISTENCE_VERDICT.PRESENT },
+    { logicalKey: 'field:gsd-id', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT },
+  ];
+
+  const plan = planReconciliation(single, remoteWith(), map, verdicts);
+  assert.deepEqual(plan.blocked.filter((entry) => entry.reason === OPERATION_REASON.EXISTENCE_UNKNOWN), []);
+});
+
+test('the unknown object\'s sync-map entry is byte-identical before and after a run containing it, including any absence members already recorded on it — planReconciliation never writes the map (D-06/SC2)', () => {
+  const fieldCompletion = { nodeId: 'PVTF_1', absenceCount: 1, absenceFirstSeenAt: '2026-08-01T00:00:00.000Z' };
+  const map = {
+    kind: 'valid',
+    map: { completions: { 'field:gsd-id': { ...fieldCompletion }, [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 } } },
+  };
+  const before = JSON.parse(JSON.stringify(map.map.completions['field:gsd-id']));
+
+  planReconciliation(desiredWithMilestone([]), remoteWith(), map, [{ logicalKey: 'field:gsd-id', verdict: EXISTENCE_VERDICT.UNKNOWN }]);
+
+  assert.deepEqual(map.map.completions['field:gsd-id'], before);
+  assert.deepEqual(map.map.completions['field:gsd-id'], fieldCompletion);
 });
