@@ -16,6 +16,7 @@ const {
   planLeftmostViewLayout,
   parseMilestoneVersionToken,
   validateFatalConditions,
+  isRunFatalBlockedReason,
   optionInputArgv,
   viewFieldIdsArgv,
   BOOTSTRAP_LOGICAL_KEY,
@@ -2088,6 +2089,75 @@ describe('planBootstrap options pass: views wiring (plan 06-01)', () => {
     const remote = { available: true, projectOutcome: 'resolved', statusField: statusField([]), fields: [], views: [] };
     const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
     assert.ok(plan.blocked.some((b) => b.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED));
+  });
+});
+
+// ─── 06-07 gap closure (CR-01): a per-item VIEW_FIELD_UNRESOLVED skip must
+// land in BootstrapPlan.partial, never blocked — only a genuinely run-fatal
+// reason may occupy `blocked`, since `blocked` is what gates the router's
+// apply decision (06-REVIEW.md CR-01, 06-VERIFICATION.md gaps[0]) ───────────
+
+describe('planBootstrap OPTIONS pass: partial vs blocked classification (06-07 gap closure, CR-01)', () => {
+  const target = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+
+  test('a view whose visible field is unresolved lands in partial, never blocked, and the options pass still plans the Status merge', () => {
+    const remote = { available: true, projectOutcome: 'resolved', statusField: statusField([opt('id-todo', 'Todo', 'GRAY', '')]), fields: [], views: [] };
+    const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
+    assert.equal(plan.blocked.length, 0);
+    assert.ok(plan.partial.length >= 1);
+    assert.ok(plan.partial.every((entry) => entry.reason === BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED));
+    assert.ok(plan.operations.length > 0, 'the Status merge must still be planned');
+  });
+
+  test('isRunFatalBlockedReason is fail-closed: false only for view_field_unresolved, true for a known run-fatal reason and for an unrecognized string', () => {
+    assert.equal(isRunFatalBlockedReason(BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED), false);
+    assert.equal(isRunFatalBlockedReason(BOOTSTRAP_OPERATION_REASON.FIELD_TYPE_MISMATCH), true);
+    assert.equal(isRunFatalBlockedReason('reason_invented_by_a_future_phase'), true);
+  });
+
+  test('a run-fatal reason and a per-item view skip in the same OPTIONS pass separate: the run-fatal reason lands in blocked with zero operations, never merged into partial', () => {
+    // A wrong-typed Wave field is run-fatal at validateFatalConditions, which
+    // runs before any stage (including planViews) contributes anything — so
+    // this proves the run-fatal gate wins outright, not merely that the two
+    // buckets stay distinct when both would otherwise fire.
+    const statusFieldValue = { id: 'F_status', name: 'Status', dataType: 'SINGLE_SELECT', options: [opt('id-todo', 'Todo', 'GRAY', '')] };
+    const remote = {
+      available: true, projectOutcome: 'resolved',
+      repository: { nodeId: 'R_1', ownerNodeId: 'O_1', ownerLogin: 'octo', linkState: 'linked' },
+      projectNodeId: 'PVT_adopted',
+      fields: [
+        { id: 'F_id', name: 'GSD ID', dataType: 'TEXT', options: null },
+        { id: 'F_wave', name: 'Wave', dataType: 'TEXT', options: null }, // wrong type -> run-fatal
+        statusFieldValue,
+      ],
+      statusField: statusFieldValue,
+      views: [],
+    };
+    const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target: { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 9 } }, { pass: BOOTSTRAP_PASS.OPTIONS });
+    assert.equal(plan.operations.length, 0);
+    assert.equal(plan.blocked.length, 1);
+    assert.equal(plan.blocked[0].reason, BOOTSTRAP_OPERATION_REASON.FIELD_TYPE_MISMATCH);
+    assert.equal(plan.partial.length, 0);
+  });
+
+  test('two views missing different fields produce partial entries in GSD_VIEWS declaration order', () => {
+    // Fields snapshot carries Status only — Table-by-Phase (needs Phase,
+    // Status) and By-Wave (needs Wave, Phase, Status) each block on their
+    // FIRST unresolved declared name; GSD_VIEWS iterates Roadmap, Board,
+    // Table-by-Phase, By-Wave, Backlog, so Table-by-Phase's skip is always
+    // observed before By-Wave's.
+    const remote = {
+      available: true, projectOutcome: 'resolved',
+      statusField: statusField([opt('id-todo', 'Todo', 'GRAY', '')]),
+      fields: [{ id: 'F_status', name: 'Status', dataType: 'SINGLE_SELECT', options: [opt('id-todo', 'Todo', 'GRAY', '')] }],
+      views: [],
+    };
+    const plan = planBootstrap({ desired: { available: true }, remote, strictMap: { kind: 'absent' }, target }, { pass: BOOTSTRAP_PASS.OPTIONS });
+    assert.equal(plan.partial.length, 2);
+    assert.equal(plan.partial[0].reason, BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED);
+    assert.equal(plan.partial[0].detail, 'view "Table-by-Phase" needs field "Phase", not found on the remote');
+    assert.equal(plan.partial[1].reason, BOOTSTRAP_OPERATION_REASON.VIEW_FIELD_UNRESOLVED);
+    assert.equal(plan.partial[1].detail, 'view "By-Wave" needs field "Wave", not found on the remote');
   });
 });
 

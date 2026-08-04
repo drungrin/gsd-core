@@ -1842,4 +1842,163 @@ describe('github-sync router: init (plan 03-02, plan 03-03)', () => {
     assert.equal(parsed.kind, 'blocked');
     assert.equal(parsed.reason, 'preflight_unavailable');
   });
+
+  // ─── 06-07 gap closure (CR-01): the options-pass apply gate must read only
+  // run-fatal blocked entries, never the bare array length — a per-view
+  // VIEW_FIELD_UNRESOLVED skip must not discard the Status merge, the
+  // Autonomous merge, or the other views that resolved cleanly. These tests
+  // drive the REAL bootstrapPlan module (no `_bootstrapPlan` stub) —
+  // stubbing it is exactly why the pre-existing blocked-outcome tests above
+  // could not observe this defect (06-REVIEW.md CR-01).
+
+  describe('github-sync router: init options-pass dispatch on a per-item view skip (06-07 gap closure, CR-01)', () => {
+    /**
+     * A resolved, linked project whose fields cover every GSD field except
+     * `Wave` (so `planFields`' structure-pass create for Wave, and
+     * `planViews`' By-Wave visible-field resolution, both exercise real
+     * code) and whose Status/Autonomous options are each one short of GSD's
+     * declared set (so both merges genuinely dispatch, not merely
+     * checkpoint). `waveDataType` set makes Wave present-but-wrong-typed
+     * instead of absent, driving the run-fatal FIELD_TYPE_MISMATCH case.
+     */
+    function crRemote({ waveDataType } = {}) {
+      const statusFieldValue = { id: 'F_status', name: 'Status', dataType: 'SINGLE_SELECT', options: [{ id: 'id-todo', name: 'Todo', color: 'GRAY', description: '' }] };
+      const fields = [
+        { id: 'F_id', name: 'GSD ID', dataType: 'TEXT', options: null },
+        { id: 'F_phase', name: 'Phase', dataType: 'TEXT', options: null },
+        { id: 'F_req', name: 'Requirements', dataType: 'TEXT', options: null },
+        { id: 'F_auto', name: 'Autonomous', dataType: 'SINGLE_SELECT', options: [{ id: 'id-yes', name: 'Yes', color: 'GREEN', description: '' }] },
+        statusFieldValue,
+      ];
+      if (waveDataType) fields.push({ id: 'F_wave', name: 'Wave', dataType: waveDataType, options: null });
+      return {
+        available: true, projectOutcome: 'resolved',
+        repository: { nodeId: 'R_1', ownerNodeId: 'O_1', ownerLogin: 'octo', linkState: 'linked' },
+        projectNodeId: 'PVT_1',
+        statusField: statusFieldValue,
+        fields,
+        labels: [], milestones: [], views: [],
+      };
+    }
+
+    function recordingApply() {
+      const calls = [];
+      return {
+        calls,
+        applyMutationPlan(plan, options) {
+          calls.push(plan);
+          return { kind: 'completed', map: options.map ?? null, outcomes: [] };
+        },
+      };
+    }
+
+    test('CR-01 regression: a run whose only blocked-class entry is VIEW_FIELD_UNRESOLVED (Wave missing) still dispatches the Status merge, the Autonomous merge, and the four cleanly-resolved views', () => {
+      process.exitCode = 0;
+      const apply = recordingApply();
+      const cap = captureStdout();
+      try {
+        routeGithubSyncCommandRouter({
+          args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+          error: (message) => { throw new Error(message); },
+          _isCapabilityActive: () => true,
+          _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+          _desired: { readDesiredState: () => ({ available: true }) },
+          _bootstrapConfig: bootstrapConfigStub(TARGET),
+          _bootstrapRemote: { readBootstrapRemoteState: () => crRemote() }, // Wave absent
+          _apply: apply,
+        });
+      } finally { cap.restore(); }
+
+      assert.equal(apply.calls.length, 2, 'applyMutationPlan must be called once per pass');
+      const optionsCall = apply.calls[1];
+      assert.ok(optionsCall.operations.length > 0);
+      assert.ok(optionsCall.operations.some((o) => o.logicalKey === 'field:status'), 'the Status option merge must dispatch');
+      assert.ok(optionsCall.operations.some((o) => o.logicalKey === 'field:autonomous'), 'the Autonomous option merge must dispatch');
+      for (const key of ['view:roadmap', 'view:board', 'view:table-by-phase', 'view:backlog']) {
+        assert.ok(optionsCall.operations.some((o) => o.logicalKey === key), `${key} must dispatch`);
+      }
+      assert.ok(!optionsCall.operations.some((o) => o.logicalKey === 'view:by-wave'), 'view:by-wave must not dispatch — its visible field is unresolved');
+
+      const parsed = JSON.parse(cap.chunks.join(''));
+      assert.equal(parsed.outcome.kind, 'completed');
+    });
+
+    test('exit posture: the CR-01 scenario leaves process.exitCode at 0', () => {
+      process.exitCode = 0;
+      const apply = recordingApply();
+      const cap = captureStdout();
+      try {
+        routeGithubSyncCommandRouter({
+          args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+          error: (message) => { throw new Error(message); },
+          _isCapabilityActive: () => true,
+          _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+          _desired: { readDesiredState: () => ({ available: true }) },
+          _bootstrapConfig: bootstrapConfigStub(TARGET),
+          _bootstrapRemote: { readBootstrapRemoteState: () => crRemote() },
+          _apply: apply,
+        });
+      } finally { cap.restore(); }
+      assert.equal(process.exitCode, 0);
+    });
+
+    test('a genuinely run-fatal blocked reason (field_type_mismatch) still aborts before either pass reaches apply: zero applyMutationPlan calls, a blocked outcome', () => {
+      process.exitCode = 0;
+      const apply = recordingApply();
+      const cap = captureStdout();
+      try {
+        routeGithubSyncCommandRouter({
+          args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+          error: (message) => { throw new Error(message); },
+          _isCapabilityActive: () => true,
+          _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+          _desired: { readDesiredState: () => ({ available: true }) },
+          _bootstrapConfig: bootstrapConfigStub(TARGET),
+          _bootstrapRemote: { readBootstrapRemoteState: () => crRemote({ waveDataType: 'TEXT' }) }, // Wave present, wrong type
+          _apply: apply,
+        });
+      } finally { cap.restore(); }
+
+      assert.equal(apply.calls.length, 0, 'a run-fatal condition suppresses both passes before either reaches apply');
+      assert.equal(process.exitCode, 0);
+      const parsed = JSON.parse(cap.chunks.join(''));
+      assert.equal(parsed.outcome.kind, 'blocked');
+      assert.equal(parsed.outcome.reason, 'field_type_mismatch');
+    });
+
+    test('fail-closed seam: an injected _bootstrapPlan that omits isRunFatalBlockedReason is treated as run-fatal on any blocked entry — the options-pass apply is skipped, matching every pre-existing router test above', () => {
+      process.exitCode = 0;
+      const apply = recordingApply();
+      const cap = captureStdout();
+      try {
+        routeGithubSyncCommandRouter({
+          args: ['github-sync', 'init'], cwd: '/fixture', raw: true,
+          error: (message) => { throw new Error(message); },
+          _isCapabilityActive: () => true,
+          _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+          _desired: { readDesiredState: () => ({ available: true }) },
+          _bootstrapConfig: bootstrapConfigStub(TARGET),
+          _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'resolved', statusField: null }) },
+          _bootstrapPlan: {
+            // Deliberately no isRunFatalBlockedReason — a legacy/injected
+            // seam that predates this predicate.
+            BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+            planBootstrap(_input, { pass }) {
+              if (pass === 'structure') return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+              return {
+                operations: [{ logicalKey: 'view:backlog', args: [], kind: 'create-view' }],
+                noops: [], blocked: [{ reason: 'view_field_unresolved', detail: 'view "By-Wave" needs field "Wave"' }], uncertain: [], checkpoints: [],
+              };
+            },
+          },
+          _apply: apply,
+        });
+      } finally { cap.restore(); }
+
+      assert.equal(apply.calls.length, 1, 'only the structure pass reaches apply; the options pass is skipped by the fail-closed fallback');
+      assert.equal(process.exitCode, 0);
+      const parsed = JSON.parse(cap.chunks.join(''));
+      assert.equal(parsed.outcome.kind, 'blocked');
+    });
+  });
 });
