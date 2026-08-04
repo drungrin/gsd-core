@@ -30,6 +30,16 @@
  * WINDOWS #9). The absence marker must never be re-losable the same way:
  * every capture that writes it goes through `mergeCompletion` below, never a
  * bare `recordCompletion` call built from a partial object.
+ *
+ * Plan 07-06 Task 1 (D-07): `pruneCompletions` below is the single function
+ * anywhere in this phase that removes data from the map — a mapped entry
+ * disk no longer wants AND the remote has confirmed gone, twice past the
+ * same elapsed gate that governs recreation (`github-sync-existence.cts`'s
+ * `rebuildTriggerKeys` sibling logic in `github-sync-reconcile.cts`'s
+ * `planReconciliation`). It rides the existing atomic write path
+ * (`writeSyncMapAtomically`) exactly like every other map mutation here —
+ * the caller reads the pruned map back through the ordinary
+ * `readSyncMapStrict`/`writeSyncMapAtomically` pair, never a bespoke one.
  */
 
 import fs from 'node:fs';
@@ -217,6 +227,24 @@ export function recordCompletion(current: SyncMap | null, completion: SyncComple
     repository: { ...repository },
     completions: { ...(current?.completions ?? {}), [completion.logicalKey]: { ...completion } },
   };
+}
+
+/**
+ * Plan 07-06 Task 1 (D-07): returns a new map with every logical key in
+ * `logicalKeys` removed from `completions` — every other completion carries
+ * forward byte-identical (verified by test key-by-key, not by object
+ * identity). An empty `logicalKeys` returns `map` unchanged (not merely
+ * equal — the identical reference), so a caller that computes zero prunes
+ * this run never triggers a needless write. `version`/`repository` are
+ * carried forward verbatim; this function performs no repository-identity
+ * check of its own, because it operates on a map already read (and
+ * bound-checked) through `readSyncMapStrict`.
+ */
+export function pruneCompletions(map: SyncMap, logicalKeys: readonly string[]): SyncMap {
+  if (logicalKeys.length === 0) return map;
+  const completions = { ...map.completions };
+  for (const key of logicalKeys) delete completions[key];
+  return { version: map.version, repository: { ...map.repository }, completions };
 }
 
 /**

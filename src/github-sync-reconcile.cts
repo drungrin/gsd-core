@@ -17,7 +17,7 @@ import existenceMod = require('./github-sync-existence.cjs');
 
 const { OPERATION_TRANSPORT, OPERATION_ACTION, ARGV_REF_PART } = operationMod;
 const { BOOTSTRAP_LOGICAL_KEY, GSD_LABELS, STATUS_FIELD_NAME } = bootstrapPlanMod;
-const { EXISTENCE_VERDICT } = existenceMod;
+const { EXISTENCE_VERDICT, advanceAbsence, absenceGateSatisfied } = existenceMod;
 const {
   renderNewIssueBody, renderPhaseRegion, contentHash, renderFieldState, parseFieldState, changedFields,
   renderNewPlanIssueBody, renderPlanRegion, PLAN_FIELD_NAMES,
@@ -224,7 +224,16 @@ interface RemoteSnapshot {
   subIssues?: RemoteSubIssueNode[];
   issueNodeIds?: Record<string, string> | Record<number, string>;
 }
-interface StrictMapCompletion { nodeId: string; issueNumber?: number; contentHash?: string; fieldState?: string; issueState?: PlanIssueStateValue; }
+interface StrictMapCompletion {
+  nodeId: string;
+  issueNumber?: number;
+  contentHash?: string;
+  fieldState?: string;
+  issueState?: PlanIssueStateValue;
+  /** D-08/D-09, consulted by Task 1's prune gate (D-07): the same two-flat-scalar absence marker `github-sync-existence.cts` widens `SyncCompletion` with. */
+  absenceCount?: number;
+  absenceFirstSeenAt?: string;
+}
 interface StrictMap { kind: 'absent' | 'valid' | 'blocking'; reason?: string; map?: { completions?: Record<string, StrictMapCompletion> }; }
 
 /**
@@ -338,6 +347,19 @@ interface ReconciliationPlan {
    * the stale cached one.
    */
   adoptions: AdoptionEntry[];
+  /**
+   * Plan 07-06 Task 1 (D-07): always present, empty when nothing applies —
+   * matches every neighbouring array above. The single cell of the
+   * desired-vs-mapped × remote-existence table where removal destroys no
+   * information: a `phase:*`/`plan:*`/`issue:phase:*`/`issue:plan:*`
+   * completion disk no longer wants (an orphan, per `collectOrphans` below)
+   * AND the remote has confirmed absent, twice, past the same elapsed gate
+   * `rebuildTriggerKeys` uses for recreation. This function only NAMES the
+   * key; it never removes it — the caller (`sync`'s map-maintenance step,
+   * never `status`) applies the removal through `github-sync-map.cts`'s
+   * `pruneCompletions`.
+   */
+  prune: Array<{ logicalKey: string }>;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -1250,8 +1272,10 @@ function planReconciliation(
   remote: RemoteSnapshot,
   strictMap: StrictMap,
   existenceVerdicts?: ExistenceVerdictLike[],
+  /** Plan 07-06 Task 1 (D-09 discretion): the clock input the prune gate's elapsed-time rule needs — an injected instant, never read via `Date.now()` inside this pure stage. Omitted (or empty), the gate can never be satisfied, so a pre-existing call site that never threads a clock produces zero prunes, unchanged from before this task. */
+  now?: string,
 ): ReconciliationPlan {
-  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [], adoptions: [] };
+  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [], adoptions: [], prune: [] };
   if (!desired.available) return { ...empty, blocked: [{ reason: OPERATION_REASON.DESIRED_UNAVAILABLE, detail: desired.reason }], uncertain: [] };
   if (!remote.available) return { ...empty, blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
   if (strictMap.kind === 'blocking') return { ...empty, blocked: [{ reason: OPERATION_REASON.MAP_BLOCKING, detail: strictMap.reason ?? 'invalid' }], uncertain: [] };
@@ -1651,6 +1675,43 @@ function planReconciliation(
     ...collectOrphans(desiredPlanIds, orphanPlanIdFromKey, PLAN_KEY_PREFIX),
   ];
 
+  // Plan 07-06 Task 1 (D-07): crosses the desired-vs-mapped axis above
+  // (`orphanPhaseIdFromKey`/`orphanPlanIdFromKey` — the SAME two
+  // discriminators `collectOrphans` uses, not a second orphan concept) with
+  // the remote-existence axis (`existenceVerdicts`, D-05/D-11/D-12).
+  // Deliberately per-KEY, not per-collapsed-orphan-id: `phase:<id>` and
+  // `issue:phase:<id>` each carry their own node id, their own verdict, and
+  // their own absence marker, so a phase whose legacy project-item key and
+  // whose issue-identity key are both orphaned is evaluated (and, once
+  // gated, pruned) independently for each — exactly matching the "exactly
+  // one prune entry and exactly one removed map key" per-key discipline the
+  // task's own acceptance criteria pin. A key wanted by disk is never
+  // reached here at all (the same desired-id skip `collectOrphans` applies);
+  // an `unknown` verdict, at any absence count, never prunes (T-07-17 —
+  // pruning is a subset of confirmed-absent, never a default for "could not
+  // tell"). Uses the SAME `advanceAbsence`/`absenceGateSatisfied` lifecycle
+  // `rebuildTriggerKeys` (`github-sync-existence.cts`) applies to
+  // recreation — D-07's own text: "behind the same two-absence gate as
+  // recreation."
+  const verdictByKey = new Map((existenceVerdicts ?? []).map((entry) => [entry.logicalKey, entry.verdict]));
+  const prune: ReconciliationPlan['prune'] = [];
+  for (const [key, entry] of Object.entries(completions)) {
+    const phaseId = orphanPhaseIdFromKey(key);
+    const planId = phaseId === null ? orphanPlanIdFromKey(key) : null;
+    if (phaseId !== null) {
+      if (desiredPhaseIds.has(phaseId)) continue;
+    } else if (planId !== null) {
+      if (desiredPlanIds.has(planId)) continue;
+    } else {
+      continue;
+    }
+    if (verdictByKey.get(key) !== EXISTENCE_VERDICT.CONFIRMED_ABSENT) continue;
+    const advanced = advanceAbsence({ absenceCount: entry.absenceCount, absenceFirstSeenAt: entry.absenceFirstSeenAt }, EXISTENCE_VERDICT.CONFIRMED_ABSENT, now);
+    if (!absenceGateSatisfied(advanced, now)) continue;
+    prune.push({ logicalKey: key });
+  }
+  prune.sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, undefined, { numeric: true }));
+
   // Plan 05-07 (D-14): a per-parent sub-issue count, computed entirely from
   // `remote.subIssues` — the paginated read this run already performed
   // (`github-sync-remote.cts`'s `readRemoteSnapshot`), never a new remote
@@ -1687,7 +1748,7 @@ function planReconciliation(
     blocked.push({ reason: OPERATION_REASON.EXISTENCE_UNKNOWN, detail: verdict.logicalKey });
   }
 
-  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges, subIssueCeilingWarnings, adoptions };
+  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges, subIssueCeilingWarnings, adoptions, prune };
 }
 
 export = {

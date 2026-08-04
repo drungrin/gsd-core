@@ -273,6 +273,8 @@ test('a desired state with zero phases produces zero operations, zero blocked en
     pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
     // Plan 07-05 Task 2 (D-13): always present, empty when nothing applies.
     adoptions: [],
+    // Plan 07-06 Task 1 (D-07): always present, empty when nothing applies.
+    prune: [],
   });
 });
 
@@ -2184,4 +2186,121 @@ test('the unknown object\'s sync-map entry is byte-identical before and after a 
 
   assert.deepEqual(map.map.completions['field:gsd-id'], before);
   assert.deepEqual(map.map.completions['field:gsd-id'], fieldCompletion);
+});
+
+// ─── Plan 07-06 Task 1 (D-07): the prune array — the desired-vs-mapped axis
+// crossed with the remote-existence axis, gated behind the same two-absence
+// plus elapsed-gap discipline that governs recreation. ─────────────────────
+
+const T0 = '2026-08-01T00:00:00.000Z';
+const T0_PLUS_60S = '2026-08-01T00:01:00.000Z';
+
+test('the four-cell desired-vs-remote table: exactly one cell (not wanted, confirmed absent, twice past the gate) produces a prune entry', () => {
+  const desired = desiredWithPlans([planFixture({ id: '01' }), planFixture({ id: '02' })]);
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        ...planFieldBootstrapCompletions(),
+        // Cell 1: wanted, present — untouched, no prune, no orphan.
+        'plan:01': { nodeId: 'item-01', issueNumber: 101 },
+        // Cell 2: wanted, confirmed absent (even with a satisfied absence
+        // gate) — the recreate path owns this cell, never the prune path.
+        'plan:02': { nodeId: 'item-02', issueNumber: 102, absenceCount: 2, absenceFirstSeenAt: T0 },
+        // Cell 3: not wanted, present — the existing report-only orphan
+        // behaviour, unchanged.
+        'plan:03': { nodeId: 'item-03', issueNumber: 103 },
+        // Cell 4: not wanted, confirmed absent, twice past the gate — the
+        // one prunable cell.
+        'plan:04': { nodeId: 'item-04', issueNumber: 104, absenceCount: 1, absenceFirstSeenAt: T0 },
+      },
+    },
+  };
+  const verdicts = [
+    { logicalKey: 'plan:01', verdict: EXISTENCE_VERDICT.PRESENT },
+    { logicalKey: 'plan:02', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT },
+    { logicalKey: 'plan:03', verdict: EXISTENCE_VERDICT.PRESENT },
+    { logicalKey: 'plan:04', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT },
+  ];
+
+  const result = planReconciliation(desired, remoteForPlans(), map, verdicts, T0_PLUS_60S);
+
+  assert.deepEqual(result.prune, [{ logicalKey: 'plan:04' }], 'exactly one prunable cell');
+  assert.deepEqual(result.orphans.map((entry) => entry.logicalKey).sort(), ['plan:03', 'plan:04'], 'cell 3 and cell 4 both remain named as orphans — pruning does not withhold the orphan report');
+});
+
+test('not wanted and confirmed absent on its FIRST absence (no prior marker) never prunes', () => {
+  const map = {
+    kind: 'valid',
+    map: { completions: { [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 }, 'plan:09-09': { nodeId: 'item-orphan', issueNumber: 500 } } },
+  };
+  const verdicts = [{ logicalKey: 'plan:09-09', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }];
+  const result = planReconciliation(desiredWithPlans([]), remoteForPlans(), map, verdicts, T0);
+  assert.deepEqual(result.prune, []);
+  assert.deepEqual(result.orphans, [{ logicalKey: 'plan:09-09', issueNumber: 500 }]);
+});
+
+test('not wanted and confirmed absent, second absence but BEFORE the elapsed gate, never prunes', () => {
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'plan:09-09': { nodeId: 'item-orphan', issueNumber: 500, absenceCount: 1, absenceFirstSeenAt: T0 },
+      },
+    },
+  };
+  const verdicts = [{ logicalKey: 'plan:09-09', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }];
+  // Only 1ms after the first absence — nowhere near RECREATE_GRACE_MS.
+  const result = planReconciliation(desiredWithPlans([]), remoteForPlans(), map, verdicts, '2026-08-01T00:00:00.001Z');
+  assert.deepEqual(result.prune, []);
+});
+
+test('not wanted and unknown never prunes, regardless of how many prior absences are already recorded', () => {
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'plan:09-09': { nodeId: 'item-orphan', issueNumber: 500, absenceCount: 5, absenceFirstSeenAt: T0 },
+      },
+    },
+  };
+  const verdicts = [{ logicalKey: 'plan:09-09', verdict: EXISTENCE_VERDICT.UNKNOWN }];
+  const result = planReconciliation(desiredWithPlans([]), remoteForPlans(), map, verdicts, T0_PLUS_60S);
+  assert.deepEqual(result.prune, []);
+});
+
+test('a pruned run never touches the actual map object — planReconciliation only NAMES the key, the caller applies the removal — and no operation anywhere carries a destructive action', () => {
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'plan:09-09': { nodeId: 'item-orphan', issueNumber: 500, absenceCount: 1, absenceFirstSeenAt: T0 },
+      },
+    },
+  };
+  const before = JSON.parse(JSON.stringify(map.map.completions));
+  const verdicts = [{ logicalKey: 'plan:09-09', verdict: EXISTENCE_VERDICT.CONFIRMED_ABSENT }];
+  const result = planReconciliation(desiredWithPlans([]), remoteForPlans(), map, verdicts, T0_PLUS_60S);
+  assert.deepEqual(result.prune, [{ logicalKey: 'plan:09-09' }]);
+  assert.deepEqual(map.map.completions, before, 'planReconciliation never mutates the map it read — it only reports what a caller should prune');
+  const DESTRUCTIVE_ACTIONS = new Set(['close', 'unlink', 'delete']);
+  assert.ok(result.operations.every((op) => !DESTRUCTIVE_ACTIONS.has(op.action)));
+});
+
+test('omitting existenceVerdicts and now (every pre-07-06 call site) produces zero prunes, unchanged from before this task', () => {
+  const map = {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: 3 },
+        'plan:09-09': { nodeId: 'item-orphan', issueNumber: 500, absenceCount: 5, absenceFirstSeenAt: T0 },
+      },
+    },
+  };
+  const result = planReconciliation(desiredWithPlans([]), remoteForPlans(), map);
+  assert.deepEqual(result.prune, []);
 });

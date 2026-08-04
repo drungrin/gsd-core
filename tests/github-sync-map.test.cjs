@@ -14,7 +14,7 @@ const path = require('node:path');
 const { createTempDir, cleanup } = require('./helpers.cjs');
 
 const mapMod = require('../gsd-core/bin/lib/github-sync-map.cjs');
-const { readSyncMapStrict, recordCompletion, writeSyncMapAtomically, mergeCompletion, SYNC_MAP_FILE_NAME, ISSUE_STATE } = mapMod;
+const { readSyncMapStrict, recordCompletion, writeSyncMapAtomically, mergeCompletion, pruneCompletions, SYNC_MAP_FILE_NAME, ISSUE_STATE } = mapMod;
 
 const REPOSITORY = { owner: 'open-gsd', repo: 'gsd-core', number: 42 };
 
@@ -391,4 +391,57 @@ test('writeSyncMapAtomically reports directory fsync uncertainty after installin
 
   assert.throws(() => writeSyncMapAtomically(repoDir, next), /directory fsync/i);
   assert.deepEqual(JSON.parse(fs.readFileSync(mapPath(repoDir), 'utf8')), next);
+});
+
+// ─── Plan 07-06 Task 1 (D-07): pruneCompletions — the single map-shrinking
+// function this phase adds. ─────────────────────────────────────────────
+
+test('pruneCompletions removes only the named key; every other completion carries forward byte-identical, compared key by key', () => {
+  const survivor = makeCompletion({ logicalKey: 'plan:01', nodeId: 'item-01', issueNumber: 1 });
+  const other = makeCompletion({ logicalKey: 'phase:02', nodeId: 'item-02', issueNumber: 2, contentHash: 'hash-x' });
+  const doomed = makeCompletion({ logicalKey: 'plan:09-09', nodeId: 'item-orphan', issueNumber: 500, absenceCount: 2, absenceFirstSeenAt: '2026-08-01T00:00:00.000Z' });
+  const map = makeMap({ 'plan:01': survivor, 'phase:02': other, 'plan:09-09': doomed });
+
+  const pruned = pruneCompletions(map, ['plan:09-09']);
+
+  assert.equal(Object.prototype.hasOwnProperty.call(pruned.completions, 'plan:09-09'), false);
+  assert.deepEqual(Object.keys(pruned.completions).sort(), ['phase:02', 'plan:01']);
+  // Key by key, not merely "the object looks similar" — every field on
+  // every surviving completion is untouched.
+  assert.deepEqual(pruned.completions['plan:01'], survivor);
+  assert.deepEqual(pruned.completions['phase:02'], other);
+  assert.equal(pruned.version, map.version);
+  assert.deepEqual(pruned.repository, map.repository);
+});
+
+test('pruneCompletions with an empty key list returns the identical map reference, not merely an equal one', () => {
+  const map = makeMap({ 'plan:01': makeCompletion({ logicalKey: 'plan:01' }) });
+  assert.equal(pruneCompletions(map, []), map);
+});
+
+test('pruneCompletions can remove more than one key in a single call, leaving every other completion untouched', () => {
+  const map = makeMap({
+    'plan:01': makeCompletion({ logicalKey: 'plan:01', nodeId: 'item-01' }),
+    'plan:02': makeCompletion({ logicalKey: 'plan:02', nodeId: 'item-02' }),
+    'plan:03': makeCompletion({ logicalKey: 'plan:03', nodeId: 'item-03' }),
+  });
+  const pruned = pruneCompletions(map, ['plan:01', 'plan:03']);
+  assert.deepEqual(Object.keys(pruned.completions), ['plan:02']);
+  assert.deepEqual(pruned.completions['plan:02'], map.completions['plan:02']);
+});
+
+test('pruneCompletions round-trips through writeSyncMapAtomically/readSyncMapStrict — the pruned key is genuinely gone on disk, not merely gone from the in-memory object', (t) => {
+  const repoDir = createTempDir('github-sync-map-prune-');
+  t.after(() => cleanup(repoDir));
+  const map = makeMap({
+    'plan:01': makeCompletion({ logicalKey: 'plan:01', nodeId: 'item-01' }),
+    'plan:09-09': makeCompletion({ logicalKey: 'plan:09-09', nodeId: 'item-orphan', issueNumber: 500 }),
+  });
+  writeMap(repoDir, map);
+  const pruned = pruneCompletions(map, ['plan:09-09']);
+  writeSyncMapAtomically(repoDir, pruned);
+
+  const reread = readSyncMapStrict(repoDir, REPOSITORY);
+  assert.equal(reread.kind, 'valid');
+  assert.deepEqual(Object.keys(reread.map.completions), ['plan:01']);
 });

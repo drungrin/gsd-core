@@ -409,19 +409,33 @@ function absenceGateSatisfied(completion: AbsenceMarker | undefined, nowIso?: st
  * defense-in-depth check independent of whatever `classifyExistence` itself
  * happens to produce, so a future caller that hand-builds a `verdicts` array
  * cannot smuggle either exempt namespace into a trigger decision.
+ *
+ * Plan 07-06 Task 2 (D-03): returns every logical key that independently
+ * satisfies the trigger condition, not merely a boolean — `status`'s
+ * rebuild-scope preview names these keys as "what triggered this."
+ * `rebuildTriggered` below is now defined in terms of this array's
+ * non-emptiness, so the two can never disagree (P2 D-12's shared-predicate
+ * rule).
  */
+function rebuildTriggerKeys(
+  verdicts: ExistenceVerdictEntry[],
+  completions: Record<string, AbsenceMarker | undefined> | null | undefined,
+  nowIso?: string,
+): string[] {
+  const safeCompletions = completions ?? {};
+  return verdicts
+    .filter((entry) => participatingNamespaceKind(entry.logicalKey) !== null)
+    .filter((entry) => entry.verdict === EXISTENCE_VERDICT.CONFIRMED_ABSENT)
+    .filter((entry) => absenceGateSatisfied(advanceAbsence(safeCompletions[entry.logicalKey], entry.verdict, nowIso), nowIso))
+    .map((entry) => entry.logicalKey);
+}
+
 function rebuildTriggered(
   verdicts: ExistenceVerdictEntry[],
   completions: Record<string, AbsenceMarker | undefined> | null | undefined,
   nowIso?: string,
 ): boolean {
-  const safeCompletions = completions ?? {};
-  return verdicts.some((entry) => {
-    if (participatingNamespaceKind(entry.logicalKey) === null) return false;
-    if (entry.verdict !== EXISTENCE_VERDICT.CONFIRMED_ABSENT) return false;
-    const advanced = advanceAbsence(safeCompletions[entry.logicalKey], entry.verdict, nowIso);
-    return absenceGateSatisfied(advanced, nowIso);
-  });
+  return rebuildTriggerKeys(verdicts, completions, nowIso).length > 0;
 }
 
 export = {
@@ -433,4 +447,5 @@ export = {
   advanceAbsence,
   absenceGateSatisfied,
   rebuildTriggered,
+  rebuildTriggerKeys,
 };
