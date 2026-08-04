@@ -5,6 +5,7 @@
  * becomes a fixed unavailable result rather than raw operator output.
  */
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import ghMod = require('./github-sync-gh.cjs');
 
 const REMOTE_REASON = Object.freeze({
@@ -107,7 +108,7 @@ function decodePage(result: GhResult, path: string[]): Page | null {
   const endCursor = (pageInfo as { endCursor?: unknown }).endCursor;
   if (typeof hasNextPage !== 'boolean' || (endCursor !== null && typeof endCursor !== 'string')) return null;
   if (hasNextPage && (!endCursor || endCursor.length === 0)) return null;
-  return { nodes: nodes as RemoteNode[], hasNextPage, endCursor: endCursor as string | null };
+  return { nodes: nodes as RemoteNode[], hasNextPage, endCursor };
 }
 
 function readProjectNodeId(options: ReadRemoteSnapshotOptions): string | null {

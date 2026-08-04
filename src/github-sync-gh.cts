@@ -91,10 +91,6 @@ function splitIncludedResponse(stdout: string): { response: GhResponseMetadata; 
   };
 }
 
-function parseIncludedResponse(stdout: string): GhResponseMetadata {
-  return splitIncludedResponse(stdout).response;
-}
-
 /**
  * Spawn `gh` with the given argument array and a bounded timeout (default
  * 15s — long enough for a single `gh api graphql` round trip, short enough
