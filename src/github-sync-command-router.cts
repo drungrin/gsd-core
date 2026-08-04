@@ -663,7 +663,37 @@ function routeGithubSyncCommandRouter({
                   // checkpointed, so a resumed run picks up where it left off.
                   const plan = reconcile.planReconciliation(desiredState, planningRemoteSnapshot, planningStrictMap) as {
                     operations: unknown[]; pendingIssueUpdates?: unknown[]; subIssueCeilingWarnings?: unknown[];
+                    adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
                   };
+
+                  // D-13 (plan 07-05 Task 2): an issue whose (owner, repo,
+                  // number) re-resolved to a node ID different from the one
+                  // cached — `planReconciliation` already named it in
+                  // `plan.adoptions` and used the resolved id for whatever
+                  // live operation this run dispatches for it (never a stale
+                  // contentId). This step persists the correction to the
+                  // sync map through `mergeCompletion` (never a bare
+                  // `recordCompletion` built from a partial object — D-08's
+                  // wholesale-replace warning), so every other previously
+                  // recorded member of the completion (contentHash,
+                  // fieldState, issueState, any absence marker) survives
+                  // untouched. Runs only from `sync`, mirroring the project
+                  // absence-marker step above (T-07-04): `status` computes
+                  // the identical `plan.adoptions` array for its own report
+                  // but this branch never runs for it.
+                  if (Array.isArray(plan.adoptions) && plan.adoptions.length > 0 && planningStrictMap?.kind === 'valid') {
+                    const adoptionCompletions = ((planningStrictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string } | undefined>;
+                    let adoptedMap: unknown = planningStrictMap.map;
+                    for (const adoption of plan.adoptions) {
+                      const existingCompletion = adoptionCompletions[adoption.logicalKey];
+                      if (!existingCompletion) continue;
+                      const mergedAdoption = map.mergeCompletion(existingCompletion, { nodeId: adoption.resolvedNodeId });
+                      adoptedMap = map.recordCompletion(adoptedMap, mergedAdoption);
+                    }
+                    map.writeSyncMapAtomically(cwd, adoptedMap);
+                    planningStrictMap = { kind: 'valid', map: adoptedMap };
+                  }
+
                   // Plan 04-04 Task 3: the read-splice-write preparation
                   // stage runs here, between planning and applying — never
                   // from `status`, which stays a dry run (SYNC-07/P2 D-13).
@@ -683,7 +713,7 @@ function routeGithubSyncCommandRouter({
                   // developer running `sync` sees them without also running
                   // `status` — never a new authority, sync still exits 0
                   // with warnings present (the exit-0-never-gates posture).
-                  result = { ...applyResult, issueUpdateReports: prepared.reports, subIssueCeilingWarnings: plan.subIssueCeilingWarnings ?? [] };
+                  result = { ...applyResult, issueUpdateReports: prepared.reports, subIssueCeilingWarnings: plan.subIssueCeilingWarnings ?? [], adoptions: plan.adoptions ?? [] };
                 }
               }
             }
