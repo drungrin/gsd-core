@@ -212,9 +212,12 @@ same one-way, checkpointed-apply discipline `init` uses for the board's own stru
 
 Every mapped object in the `project`, `field:*`, `option:status:*`, `option:autonomous:*`,
 `label:*`, `milestone:*`, and issue (`issue:phase:*` / `issue:plan:*`, plus the legacy
-`phase:*` / `plan:*` project-item keys) namespaces is classified on each `sync` and `status`
+`phase:*` project-item key) namespaces is classified on each `sync` and `status`
 run as one of three verdicts, derived structurally from the same enumerations the run already
-makes — never from a dedicated probe:
+makes — never from a dedicated probe. The legacy `plan:*` project-item key is **not** currently
+classified: it matches none of the namespaces above, so a `plan:*` completion receives no
+verdict at all (not present, confirmed-absent, or unknown) — invisible to this classification
+and to the pruning it gates. See [`WINDOWS.md`](../../.planning/WINDOWS.md) entry #14.
 
 - **present** — the mapped ID appears in a read that succeeded.
 - **confirmed-absent** — a read that succeeded did not contain it.
@@ -352,6 +355,17 @@ Because `.planning/.github-sync.json` is committed, a wrong prune is recoverable
 history — the same argument that made `.planning/` tracked in the first place. An object the
 remote still reports present, but that disk no longer wants, is reported as an orphan exactly as
 before and is never pruned or touched.
+
+**Map pruning is not currently reachable in production.** The absence marker the two-confirmed-
+absences gate above requires is never persisted to disk for any orphaned phase, plan, or issue
+key: the only code path that persists an absence marker explicitly skips every issue-bearing key,
+and a legacy `plan:*` key receives no existence verdict at all (see above), so neither the
+persistence step nor the classification it depends on ever runs for it either. The result: an
+orphaned phase, plan, or issue-bearing completion's `prune` entry can never be produced from a
+cold start, no matter how many consecutive runs confirm the remote object gone. `status` and
+`sync` still report such an object as an orphan, but nothing removes it from the map today. See
+[`WINDOWS.md`](../../.planning/WINDOWS.md) entries #13 (persistence gap) and #14 (legacy
+`plan:*` classification gap).
 
 ## Phase Issues
 
