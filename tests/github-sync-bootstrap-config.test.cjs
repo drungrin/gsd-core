@@ -673,3 +673,90 @@ describe('resolveTarget', () => {
     } finally { cleanup(dir); }
   });
 });
+
+// ─── resolveTarget: plan 07-10 Task 3 (D-01 option-d) — sync-map project ────
+// recovery tier, gated on an explicit caller-reported verdict ───────────────
+
+describe('resolveTarget: option-d sync-map project-number recovery tier', () => {
+  test('configuredProjectNumberConfirmedAbsent true, and the map holds a DIFFERENT valid project completion number, overrides — the original configured number rides back on configuredProjectNumber', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, target: FULL_TARGET } });
+      const map = realMap.recordCompletion(null, {
+        logicalKey: 'project', nodeId: 'PVT_NEW', issueNumber: 42, completedAt: '2026-01-01T00:00:00.000Z',
+        owner: FULL_TARGET.owner, repo: FULL_TARGET.repo, repositoryNumber: FULL_TARGET.repository_number,
+      });
+      realMap.writeSyncMapAtomically(dir, map);
+      const result = resolveTarget(dir, { configuredProjectNumberConfirmedAbsent: true });
+      assert.equal(result.target.projectNumber, 42);
+      assert.equal(result.configuredProjectNumber, FULL_TARGET.project_number);
+      assert.equal(result.reason, RESOLVE_TARGET_REASON.CONFIGURED);
+      // Every other member of the target is untouched.
+      assert.equal(result.target.owner, FULL_TARGET.owner);
+      assert.equal(result.target.repo, FULL_TARGET.repo);
+      assert.equal(result.target.repositoryNumber, FULL_TARGET.repository_number);
+    } finally { cleanup(dir); }
+  });
+
+  test('configuredProjectNumberConfirmedAbsent true, but the map\'s project number EQUALS the configured one — no override, no configuredProjectNumber field', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, target: FULL_TARGET } });
+      const map = realMap.recordCompletion(null, {
+        logicalKey: 'project', nodeId: 'PVT_SAME', issueNumber: FULL_TARGET.project_number, completedAt: '2026-01-01T00:00:00.000Z',
+        owner: FULL_TARGET.owner, repo: FULL_TARGET.repo, repositoryNumber: FULL_TARGET.repository_number,
+      });
+      realMap.writeSyncMapAtomically(dir, map);
+      const result = resolveTarget(dir, { configuredProjectNumberConfirmedAbsent: true });
+      assert.equal(result.target.projectNumber, FULL_TARGET.project_number);
+      assert.equal(result.configuredProjectNumber, undefined);
+    } finally { cleanup(dir); }
+  });
+
+  test('configuredProjectNumberConfirmedAbsent absent (or false) — a configured project number wins even when the map carries a different one (D-01 config-first ordering unchanged for every other case)', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, target: FULL_TARGET } });
+      const map = realMap.recordCompletion(null, {
+        logicalKey: 'project', nodeId: 'PVT_UNRELATED', issueNumber: 999, completedAt: '2026-01-01T00:00:00.000Z',
+        owner: FULL_TARGET.owner, repo: FULL_TARGET.repo, repositoryNumber: FULL_TARGET.repository_number,
+      });
+      realMap.writeSyncMapAtomically(dir, map);
+
+      const withoutFlag = resolveTarget(dir, {});
+      assert.equal(withoutFlag.target.projectNumber, FULL_TARGET.project_number);
+      assert.equal(withoutFlag.configuredProjectNumber, undefined);
+
+      const withFalseFlag = resolveTarget(dir, { configuredProjectNumberConfirmedAbsent: false });
+      assert.equal(withFalseFlag.target.projectNumber, FULL_TARGET.project_number);
+      assert.equal(withFalseFlag.configuredProjectNumber, undefined);
+    } finally { cleanup(dir); }
+  });
+
+  test('configuredProjectNumberConfirmedAbsent true, but the map has no project completion at all — falls back to the configured number unchanged', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, target: FULL_TARGET } });
+      const result = resolveTarget(dir, { configuredProjectNumberConfirmedAbsent: true });
+      assert.equal(result.target.projectNumber, FULL_TARGET.project_number);
+      assert.equal(result.configuredProjectNumber, undefined);
+    } finally { cleanup(dir); }
+  });
+
+  test('resolveTarget performs no execGh call to decide the override — the verdict is entirely the caller-supplied boolean plus the already-local strict-map read', () => {
+    const dir = tempDir();
+    try {
+      writeConfig(dir, { github_sync: { enabled: true, target: FULL_TARGET } });
+      const map = realMap.recordCompletion(null, {
+        logicalKey: 'project', nodeId: 'PVT_NEW', issueNumber: 42, completedAt: '2026-01-01T00:00:00.000Z',
+        owner: FULL_TARGET.owner, repo: FULL_TARGET.repo, repositoryNumber: FULL_TARGET.repository_number,
+      });
+      realMap.writeSyncMapAtomically(dir, map);
+      let calls = 0;
+      const execGh = () => { calls += 1; return { exitCode: 1, stdout: '', stderr: '', reason: 'gh_exit_nonzero' }; };
+      const result = resolveTarget(dir, { execGh, configuredProjectNumberConfirmedAbsent: true });
+      assert.equal(calls, 0, 'the CONFIGURED path never needs gh repo view, override or not');
+      assert.equal(result.target.projectNumber, 42);
+    } finally { cleanup(dir); }
+  });
+});

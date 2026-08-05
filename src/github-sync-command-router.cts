@@ -167,10 +167,16 @@ interface BootstrapPlanModule {
 }
 
 interface ResolvedTargetLike { owner: string; repo: string; repositoryNumber: number; projectNumber: number | null; }
-interface ResolveTargetResultLike { target: ResolvedTargetLike | null; reason: string; strictMapRead: unknown; }
+interface ResolveTargetResultLike {
+  target: ResolvedTargetLike | null;
+  reason: string;
+  strictMapRead: unknown;
+  /** Plan 07-10 Task 3 (D-01 option-d): set only when `configuredProjectNumberConfirmedAbsent` overrode the configured project number with the sync map's own. */
+  configuredProjectNumber?: number;
+}
 interface ConfigWriteResultLike { ok: boolean; reason: string; }
 interface BootstrapConfigModule {
-  resolveTarget(cwd: string, options?: { execGh?: unknown }): ResolveTargetResultLike;
+  resolveTarget(cwd: string, options?: { execGh?: unknown; configuredProjectNumberConfirmedAbsent?: boolean }): ResolveTargetResultLike;
   readProjectTitle(cwd: string): string | null;
   /** Plan 06-04: the already-validated `github_sync.view.layout` GraphQL enum member — read once per `init` run, threaded to both `planBootstrap` passes. */
   readViewLayout(cwd: string): string;
@@ -192,6 +198,8 @@ interface ExistenceModule {
   rebuildTriggered(verdicts: ExistenceVerdictEntry[], completions: Record<string, unknown>, nowIso?: string): boolean;
   /** Plan 07-06 Task 2 (D-03): the same trigger predicate as `rebuildTriggered`, naming every key that satisfies it — `status`'s rebuild-scope preview names these as "what triggered this." */
   rebuildTriggerKeys(verdicts: ExistenceVerdictEntry[], completions: Record<string, unknown>, nowIso?: string): string[];
+  /** Plan 07-10 Task 3 (D-01 option-d): true only when a completion's PERSISTED absence marker (from a PRIOR run) already satisfies the same two-strikes-plus-grace-period gate `rebuildTriggered` uses — the durable "confirmed absent" verdict `resolveTarget`'s new sync-map recovery tier consumes, never a live remote read of its own. */
+  absenceGateSatisfied(completion: AbsenceMarkerLike | undefined, nowIso?: string): boolean;
   EXISTENCE_VERDICT: { PRESENT: string; CONFIRMED_ABSENT: string; UNKNOWN: string };
 }
 
@@ -540,6 +548,45 @@ function routeGithubSyncCommandRouter({
     };
   }
 
+  /**
+   * Plan 07-10 Task 3 (D-01/D-05 gap closure, option-d): closes the
+   * create-a-board-every-60-seconds loop a stale configured `project_number`
+   * would otherwise reopen on every run after a completed rebuild, with no
+   * write-back to `.planning/config.json`. Consulted by BOTH `sync` and
+   * `status`, right after each reads its own strict map and before either
+   * reads the remote — never afterward, since the override must apply to
+   * THIS run's own read, not just a later one.
+   *
+   * `existence.absenceGateSatisfied` here reads a PERSISTED marker — written
+   * by a PRIOR run's own classification, already on disk in `strictMap` — the
+   * same durable "confirmed absent" fact `rebuildTriggered` itself gates on
+   * (D-09). Finding it satisfied is what licenses passing
+   * `configuredProjectNumberConfirmedAbsent: true` into `resolveTarget`'s new
+   * tier; `resolveTarget` performs no remote read to decide this, matching
+   * its identity-resolution-seam contract.
+   */
+  function recoverProjectNumberFromSyncMap(params: {
+    cwd: string;
+    target: { owner: string; repo: string; repositoryNumber: number; projectNumber: number };
+    strictMap: { kind?: unknown; map?: { completions?: Record<string, AbsenceMarkerLike & { issueNumber?: number }> } };
+    nowIso: string;
+  }): { projectNumber: number; configuredProjectNumber?: number } {
+    const projectCompletion = (params.strictMap as { kind?: unknown } | undefined)?.kind === 'valid'
+      ? (params.strictMap as { map?: { completions?: Record<string, AbsenceMarkerLike & { issueNumber?: number }> } }).map?.completions?.project
+      : undefined;
+    if (!existence.absenceGateSatisfied(projectCompletion, params.nowIso)) {
+      return { projectNumber: params.target.projectNumber };
+    }
+    const recovered = bootstrapConfig.resolveTarget(params.cwd, { configuredProjectNumberConfirmedAbsent: true });
+    if (recovered.target && typeof recovered.configuredProjectNumber === 'number') {
+      return {
+        projectNumber: recovered.target.projectNumber ?? params.target.projectNumber,
+        configuredProjectNumber: recovered.configuredProjectNumber,
+      };
+    }
+    return { projectNumber: params.target.projectNumber };
+  }
+
   routeHubCommandFamily({
     family: 'github-sync',
     args,
@@ -584,6 +631,21 @@ function routeGithubSyncCommandRouter({
           const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber }) as {
             kind?: unknown; map?: { completions?: Record<string, unknown> };
           };
+          // Plan 07-10 Task 3 (D-01 option-d): before reading the remote,
+          // check whether the sync map already carries a DURABLY confirmed-
+          // absent marker (from a PRIOR run) on this configured project
+          // number, and a different, presumably-live number for it — same
+          // recovery `sync` applies, so `status` reports the SAME identity
+          // `sync` would actually use, and surfaces the divergence below.
+          const projectRecovery = recoverProjectNumberFromSyncMap({
+            cwd,
+            target: resolvedTarget.target,
+            strictMap: strictMap as { kind?: unknown; map?: { completions?: Record<string, AbsenceMarkerLike & { issueNumber?: number }> } },
+            nowIso: clock.nowIso(),
+          });
+          if (projectRecovery.configuredProjectNumber !== undefined) {
+            resolvedTarget.target = { ...resolvedTarget.target, projectNumber: projectRecovery.projectNumber };
+          }
           const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) }) as { available?: unknown };
 
           const nowIso = clock.nowIso();
@@ -706,7 +768,15 @@ function routeGithubSyncCommandRouter({
           }
 
           const plan = reconcile.planReconciliation(previewDesiredState, remoteSnapshot, previewStrictMap, existenceVerdicts, nowIso);
-          dto = status.buildStatusV1(remoteSnapshot, plan, { verdicts: existenceVerdicts, absences, rebuildScope });
+          // Plan 07-10 Task 3 (D-01 option-d): `projectNumber`/`configuredProjectNumber`
+          // ride alongside the remote snapshot's own fields — `buildStatusV1`
+          // adds a `projectTarget` group to its output ONLY when they diverge,
+          // so every pre-existing fixture that never diverges is unaffected.
+          dto = status.buildStatusV1(
+            { ...(remoteSnapshot as Record<string, unknown>), projectNumber: resolvedTarget.target.projectNumber, configuredProjectNumber: projectRecovery.configuredProjectNumber },
+            plan,
+            { verdicts: existenceVerdicts, absences, rebuildScope },
+          );
         } catch {
           dto = status.buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
         }
@@ -732,6 +802,21 @@ function routeGithubSyncCommandRouter({
               const strictMap = map.readSyncMapStrict(cwd, { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, number: resolvedTarget.target.repositoryNumber }) as {
                 kind?: unknown; map?: unknown;
               };
+              // Plan 07-10 Task 3 (D-01 option-d): before reading the remote,
+              // recover the sync map's OWN project number when the configured
+              // one has already been durably confirmed absent by a PRIOR run
+              // — closing the create-a-board-every-60-seconds loop with no
+              // write-back to `.planning/config.json` (see
+              // `recoverProjectNumberFromSyncMap`'s own doc comment).
+              const syncProjectRecovery = recoverProjectNumberFromSyncMap({
+                cwd,
+                target: resolvedTarget.target,
+                strictMap: strictMap as { kind?: unknown; map?: { completions?: Record<string, AbsenceMarkerLike & { issueNumber?: number }> } },
+                nowIso: clock.nowIso(),
+              });
+              if (syncProjectRecovery.configuredProjectNumber !== undefined) {
+                resolvedTarget.target = { ...resolvedTarget.target, projectNumber: syncProjectRecovery.projectNumber };
+              }
               const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) }) as { available?: unknown; reason?: unknown };
               // Plan 07-10 (D-01/D-05 gap closure): an unavailable snapshot
               // whose reason is PROJECT_ABSENT is not a transport failure —

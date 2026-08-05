@@ -31,7 +31,15 @@ const TARGET_UNAVAILABLE_MESSAGES: Readonly<Record<string, string>> = Object.fre
   project_number: 'github-sync status is unavailable because github_sync.target.project_number in .planning/config.json is invalid. Set it to a positive whole number, then re-run.',
 });
 
-interface StatusInput { available: boolean; reason: string; field?: string; }
+interface StatusInput {
+  available: boolean;
+  reason: string;
+  field?: string;
+  /** Plan 07-10 Task 3 (D-01 option-d): the project number this run actually resolved to and used. */
+  projectNumber?: number | null;
+  /** Plan 07-10 Task 3 (D-01 option-d): set ONLY when the sync map's own project number overrode a configured value this run found durably confirmed absent — the ORIGINAL configured value, so `projectTarget` can name the divergence. */
+  configuredProjectNumber?: number;
+}
 /** Plan 05-07 (D-14): one phase's parent-issue sub-issue count at or over the warn threshold — never a mutation authority, only a reported fact. */
 interface SubIssueCeilingWarning { phaseId: string; issueNumber: number; count: number; limit: number; }
 interface ReconciliationPlan {
@@ -104,6 +112,16 @@ interface StatusV1 {
   absences: Array<{ logicalKey: string; count: number; firstSeenAt: string }>;
   /** Plan 07-06 Task 2 (D-01/D-02/D-03): the rebuild this run's classification would trigger, and what both bootstrap passes would emit for it. */
   rebuildScope: { triggered: boolean; triggeredKeys: string[]; structureOperations: string[]; optionsOperations: string[] };
+  /**
+   * Plan 07-10 Task 3 (D-01 option-d): present ONLY when the resolved project
+   * number diverges from `.planning/config.json`'s configured one (the sync
+   * map's own recovery tier overrode a configured number this run found
+   * durably confirmed absent) — a developer reading config alone is not
+   * silently misled about which board is actually live. Absent for every
+   * pre-existing, non-diverging fixture, matching this DTO's established
+   * additive-and-optional evolution (`pendingIssueUpdates`, `adoptions`, …).
+   */
+  projectTarget?: { resolved: number | null; configured: number };
   limitations: string[];
 }
 
@@ -174,6 +192,13 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
     adoptions: (safePlan.adoptions ?? []).map(({ logicalKey, previousNodeId, resolvedNodeId }) => ({ logicalKey, previousNodeId, resolvedNodeId })),
     prune: (safePlan.prune ?? []).map(({ logicalKey }) => logicalKey),
     existence, absences, rebuildScope,
+    // Plan 07-10 Task 3 (D-01 option-d): omitted entirely (not even with
+    // `configured` undefined) unless the caller reports an actual divergence
+    // — every pre-existing fixture that never diverges keeps its exact
+    // pre-07-10 shape.
+    ...(remote.configuredProjectNumber !== undefined
+      ? { projectTarget: { resolved: remote.projectNumber ?? null, configured: remote.configuredProjectNumber } }
+      : {}),
     limitations: [],
   };
 }
@@ -248,6 +273,12 @@ function renderStatusV1(status: StatusV1, raw: boolean): string {
   for (const key of status.rebuildScope.triggeredKeys) lines.push(`  - trigger: ${key}`);
   for (const key of status.rebuildScope.structureOperations) lines.push(`  - structure: ${key}`);
   for (const key of status.rebuildScope.optionsOperations) lines.push(`  - options: ${key}`);
+  // Plan 07-10 Task 3 (D-01 option-d): only rendered when `projectTarget` is
+  // present at all (the divergence case) — a developer reading config alone
+  // is not silently misled about which board is actually live.
+  if (status.projectTarget) {
+    lines.push(`project-target: resolved=${status.projectTarget.resolved} configured=${status.projectTarget.configured} (diverged — .planning/config.json's project_number no longer matches the live board; the sync map's recovered number is being used instead)`);
+  }
   if (status.limitations.length > 0) {
     lines.push('limitations:');
     for (const limitation of status.limitations) lines.push(`  - ${limitation}`);

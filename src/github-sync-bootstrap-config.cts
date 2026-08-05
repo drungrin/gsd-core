@@ -99,6 +99,16 @@ interface ResolvedTargetResult {
   reason: ResolveTargetReason;
   /** The strict-map read this call performed, bound to the resolved identity — null when the identity could not be resolved. */
   strictMapRead: ReturnType<typeof mapMod.readSyncMapStrict> | null;
+  /**
+   * Plan 07-10 Task 3 (D-01 option-d): set ONLY when
+   * `configuredProjectNumberConfirmedAbsent` overrode the configured
+   * `project_number` with the sync map's own `project` completion number —
+   * the original configured value, so a caller (e.g. `status`) can report
+   * the divergence between what `.planning/config.json` says and what this
+   * call actually resolved to. Absent on every other path, including the
+   * ordinary CONFIGURED path where no override was requested or possible.
+   */
+  configuredProjectNumber?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -282,8 +292,23 @@ function decodeGhRepoView(result: GhResult): { owner: string; name: string; data
  * The strict-map read this call performs is returned alongside the target
  * so the caller (the `init` handler) consumes one map read bound to the
  * resolved identity, never a second one with the same identity.
+ *
+ * Plan 07-10 Task 3 (D-01 option-d): `options.configuredProjectNumberConfirmedAbsent`
+ * adds one more tier, consulted ONLY on the CONFIGURED path and ONLY when the
+ * caller passes it as `true`. `resolveTarget` never performs a remote read of
+ * its own to decide this — it is the identity-resolution seam, not a reader —
+ * so the caller must have already established (via `existence.absenceGateSatisfied`
+ * against a PRIOR run's persisted absence marker, or an equivalent durable
+ * confirmation) that the configured `project_number` is gone. When that is
+ * true AND the strict map already holds a `project` completion with a
+ * DIFFERENT, valid remote number, that number wins — `.planning/config.json`
+ * is never written, and the divergence rides back on `configuredProjectNumber`
+ * for the caller to surface. Every other case (flag absent/false, no
+ * qualifying map entry, or the map's number matching the configured one)
+ * returns the CONFIGURED target completely unchanged from before this option
+ * existed.
  */
-function resolveTarget(cwd: string, options: { execGh?: ExecGh } = {}): ResolvedTargetResult {
+function resolveTarget(cwd: string, options: { execGh?: ExecGh; configuredProjectNumberConfirmedAbsent?: boolean } = {}): ResolvedTargetResult {
   const full = targetMod.readSyncTarget(cwd);
   if (full.available && full.target) {
     const strictMapRead = mapMod.readSyncMapStrict(cwd, {
@@ -291,6 +316,18 @@ function resolveTarget(cwd: string, options: { execGh?: ExecGh } = {}): Resolved
       repo: full.target.repo,
       number: full.target.repositoryNumber,
     });
+    if (options.configuredProjectNumberConfirmedAbsent === true && strictMapRead.kind === 'valid') {
+      const projectCompletion = strictMapRead.map.completions.project;
+      const recoveredNumber = projectCompletion?.issueNumber;
+      if (isPositiveSafeInteger(recoveredNumber) && recoveredNumber !== full.target.projectNumber) {
+        return {
+          target: { ...full.target, projectNumber: recoveredNumber },
+          reason: RESOLVE_TARGET_REASON.CONFIGURED,
+          strictMapRead,
+          configuredProjectNumber: full.target.projectNumber,
+        };
+      }
+    }
     return { target: full.target, reason: RESOLVE_TARGET_REASON.CONFIGURED, strictMapRead };
   }
 

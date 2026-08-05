@@ -3047,6 +3047,7 @@ describe('github-sync router: plan 07-10 — a genuinely deleted Project through
   const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
   const realRemoteReader = require('../gsd-core/bin/lib/github-sync-remote.cjs');
   const realBootstrapRemoteReader = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
+  const realBootstrapConfig = require('../gsd-core/bin/lib/github-sync-bootstrap-config.cjs');
   const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
   const T0 = '2026-08-01T00:00:00.000Z';
   const T0_PLUS_60S = '2026-08-01T00:01:00.000Z';
@@ -3071,6 +3072,32 @@ describe('github-sync router: plan 07-10 — a genuinely deleted Project through
 
   function mapPathFor(tmpDir) {
     return path.join(tmpDir, '.planning', '.github-sync.json');
+  }
+
+  function configPathFor(tmpDir) {
+    return path.join(tmpDir, '.planning', 'config.json');
+  }
+
+  /**
+   * Writes a REAL `.planning/config.json` naming `TARGET`'s owner/repo/
+   * repository-number and the given (possibly stale/deleted) project number
+   * — required for option-d's tests, which exercise the REAL
+   * `bootstrapConfig.resolveTarget` (not the `_target` seam, which the
+   * router's own initial identity read still uses) and so need a genuine
+   * config file on disk for it to read.
+   */
+  function writeTargetConfig(tmpDir, projectNumber) {
+    fs.writeFileSync(configPathFor(tmpDir), JSON.stringify({
+      github_sync: {
+        enabled: true,
+        target: { owner: TARGET.owner, repo: TARGET.repo, repository_number: TARGET.repositoryNumber, project_number: projectNumber },
+      },
+    }, null, 2) + '\n');
+  }
+
+  /** `_bootstrapConfig` spread over the REAL module — every option-d test needs the real `resolveTarget`, not the plan 07-01 describe block's title/layout-only stub. */
+  function realBootstrapConfigSeam(overrides = {}) {
+    return { ...realBootstrapConfig, readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT', ...overrides };
   }
 
   /**
@@ -3363,4 +3390,133 @@ describe('github-sync router: plan 07-10 — a genuinely deleted Project through
   // normally, every pre-existing behaviour in the plan 07-01 and 07-08
   // describe blocks above still holds — run the whole file, not a new
   // assertion here.
+
+  // ─── Task 3 (D-01 option-d): sync-map project-number recovery, no ────────
+  // write-back to .planning/config.json — the checkpoint's own decision. ────
+
+  test("Task 3 Test 2/5 (option-d): a run whose config still names the deleted project number, and whose sync map already carries the NEW number on a project completion classified present (a PRIOR run's persisted, gate-satisfied state), resolves to the NEW number, reads it directly, dispatches zero create-project mutations, and leaves .planning/config.json byte-identical", () => {
+    const tmpDir = createTempProject();
+    const bootstrapPlanCalls = [];
+    const applyCalls = [];
+    // Only the 'project' document is ever routed here — a real deleted read
+    // is never issued this run, because the recovery tier switches identity
+    // BEFORE the first remote read.
+    const routing = makeRoutingExecGh({
+      project: () => resolvedProjectEnvelope('PVT_NEW'),
+      fieldsWithTypes: () => resolvedFieldsEnvelope('PVT_NEW'),
+    });
+    const cap = captureStdout();
+    let output;
+    let configBefore;
+    try {
+      writeTargetConfig(tmpDir, 7); // config still names the DELETED number
+      configBefore = fs.readFileSync(configPathFor(tmpDir), 'utf8');
+      // The persisted state a completed rebuild (plan 07-10 Task 1) leaves
+      // behind: the NEW node id/number, plus the stale (never-cleared)
+      // absence marker that satisfies the recreate gate.
+      realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, baseProjectCompletion({ nodeId: 'PVT_NEW', issueNumber: 42, absenceCount: 2, absenceFirstSeenAt: T0 })));
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => { bootstrapPlanCalls.push(options.pass); return { operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] }; },
+        },
+        _bootstrapConfig: realBootstrapConfigSeam(),
+        _reconcile: { planReconciliation: () => ({ operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: (plan) => { applyCalls.push({ tag: (plan.operations[0] || {}).logicalKey ?? null, kind: (plan.operations[0] || {}).kind ?? null }); return { kind: 'completed', outcomes: [] }; } },
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+    } finally { output = cap.chunks.join(''); cap.restore(); }
+
+    assert.equal(bootstrapPlanCalls.length, 0, 'the recreate gate never re-fires: the project resolves present against the recovered number, so rebuildTriggerKeys is empty');
+    assert.ok(!applyCalls.some((call) => call.tag === 'project' && call.kind === 'create'), 'zero create-project mutations were dispatched');
+
+    const projectCalls = routing.calls.filter((call) => call.document === 'project');
+    assert.equal(projectCalls.length, 1, 'exactly one project-document read this run — never against the deleted number');
+    assert.ok(
+      projectCalls[0].args.some((arg) => arg === 'projectNumber=42'),
+      'the single project read this run was issued against the RECOVERED number (42), never the configured deleted one (7)',
+    );
+
+    try {
+      const configAfter = fs.readFileSync(configPathFor(tmpDir), 'utf8');
+      assert.equal(configAfter, configBefore, '.planning/config.json is byte-identical — option-d never writes it');
+    } finally { cleanup(tmpDir); }
+
+    assert.equal(JSON.parse(output).kind, 'completed', 'the run completed normally against the recovered board — no blocked/uncertain collapse');
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Task 3 Test 3 (option-d): a configured project number that still resolves normally (no persisted, gate-satisfied absence marker) wins over any sync-map value — resolveTarget\'s config-first ordering is otherwise unchanged', () => {
+    const tmpDir = createTempProject();
+    const routing = makeRoutingExecGh({
+      project: () => resolvedProjectEnvelope('PVT_CONFIGURED'),
+      fieldsWithTypes: () => resolvedFieldsEnvelope('PVT_CONFIGURED'),
+    });
+    const cap = captureStdout();
+    try {
+      writeTargetConfig(tmpDir, 7);
+      // An unrelated sync-map project completion carrying a DIFFERENT number,
+      // but with NO absence marker at all (never confirmed absent) — the map
+      // tier must never fire here.
+      realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, baseProjectCompletion({ nodeId: 'PVT_CONFIGURED', issueNumber: 7 })));
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        _bootstrapPlan: { BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' }, planBootstrap: () => ({ operations: [], noops: [], blocked: [], uncertain: [], checkpoints: [] }) },
+        _bootstrapConfig: realBootstrapConfigSeam(),
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: () => ({ kind: 'completed', outcomes: [] }) },
+        _clock: { now: () => 0, nowIso: () => T0, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+
+    const projectCalls = routing.calls.filter((call) => call.document === 'project');
+    assert.equal(projectCalls.length, 1);
+    assert.ok(projectCalls[0].args.some((arg) => arg === 'projectNumber=7'), 'the configured number (7) was used — no override, since no absence marker was ever recorded');
+    cleanup(tmpDir);
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Task 3 Test 4 (option-d): status surfaces the divergence between the configured project number and the recovered one', () => {
+    const tmpDir = createTempProject();
+    const routing = makeRoutingExecGh({
+      project: () => resolvedProjectEnvelope('PVT_NEW'),
+      fieldsWithTypes: () => resolvedFieldsEnvelope('PVT_NEW'),
+    });
+    const cap = captureStdout();
+    let output;
+    try {
+      writeTargetConfig(tmpDir, 7);
+      realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, baseProjectCompletion({ nodeId: 'PVT_NEW', issueNumber: 42, absenceCount: 2, absenceFirstSeenAt: T0 })));
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        _bootstrapConfig: realBootstrapConfigSeam(),
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+    } finally { output = cap.chunks.join(''); cap.restore(); cleanup(tmpDir); }
+
+    const dto = JSON.parse(output);
+    assert.equal(dto.available, true);
+    assert.deepEqual(dto.projectTarget, { resolved: 42, configured: 7 }, 'status names both the resolved (live) and configured (stale) project numbers when they diverge');
+    assert.equal(process.exitCode, 0);
+  });
 });
