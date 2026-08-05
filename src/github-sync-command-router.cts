@@ -697,13 +697,21 @@ function routeGithubSyncCommandRouter({
                 if (triggerKeys.length > 0) {
                   const projectTitle = bootstrapConfig.readProjectTitle(cwd);
                   const viewLayout = bootstrapConfig.readViewLayout(cwd);
+                  // Live finding, plan 07-13 Task 1 (mirrors the identical fix
+                  // at `sync`'s own rebuild call site below): previewing
+                  // against the still-configured, confirmed-absent project
+                  // number makes `planProject` preview a `project_not_found`
+                  // block, not the create `sync` would actually dispatch — a
+                  // wrong rebuild-scope preview for REC-01's own case. `null`
+                  // only when `project` itself triggered.
+                  const previewProjectNumber = triggerKeys.includes('project') ? null : resolvedTarget.target.projectNumber;
                   const preview = runBootstrapTwoPass({
                     cwd,
                     desiredState,
                     remoteSnapshot: bootstrapRemoteState,
                     strictMap: strictMap as { kind: string; map?: unknown },
                     baseTarget: { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber },
-                    projectNumber: resolvedTarget.target.projectNumber,
+                    projectNumber: previewProjectNumber,
                     projectTitle,
                     viewLayout,
                     dryRun: true,
@@ -1022,16 +1030,49 @@ function routeGithubSyncCommandRouter({
                         map.writeSyncMapAtomically(cwd, nextSyncMap);
                         planningStrictMap = { kind: 'valid', map: nextSyncMap };
 
-                        if (existence.rebuildTriggered(verdicts, completions, nowIso)) {
+                        // Live finding, plan 07-13 Task 1: `rebuildTriggerKeys`
+                        // (not just the collapsed `rebuildTriggered` boolean) is
+                        // needed here to distinguish REC-01's own case (the
+                        // `project` key itself durably confirmed absent) from
+                        // REC-03's (a non-project bootstrap object absent while
+                        // the project still resolves). Passing the STILL-STALE,
+                        // confirmed-absent configured project number straight
+                        // into `runBootstrapTwoPass` makes `planProject` take
+                        // its `init`-designed "a specific number was configured
+                        // and it's gone -- refuse, never silently create a
+                        // replacement" branch (`PROJECT_NOT_FOUND`, blocked),
+                        // never the create branch -- confirmed live against a
+                        // genuinely deleted real Project (07-LIVE-REBUILD.md):
+                        // the gate fired, but the "rebuild" produced only a
+                        // `project_not_found`-blocked structure plan and the
+                        // post-rebuild re-read still reported the board absent,
+                        // so `sync` fell through to `remote_unavailable` forever
+                        // -- REC-01's own promised consequence (past the gate,
+                        // rebuild) was unreachable in practice. `planProject`
+                        // creates only when `target.projectNumber === null`
+                        // (BootstrapTwoPassOptions already types the field
+                        // `number | null` for exactly this reason -- `init`'s
+                        // own unconfigured-target call site already relies on
+                        // it). Passing `null` here ONLY when `project` itself is
+                        // one of this run's triggered keys authorizes exactly
+                        // the create REC-01's gate promises, while a
+                        // REC-03-shaped run (only a non-project key triggered,
+                        // `project` still resolving) is untouched -- it keeps
+                        // passing the resolved, still-valid project number, so
+                        // the existing field/label/milestone self-heal path
+                        // (plan 07-11's live-shaped proof) is unaffected.
+                        const triggerKeys = existence.rebuildTriggerKeys(verdicts, completions, nowIso);
+                        if (triggerKeys.length > 0) {
                           const projectTitle = bootstrapConfig.readProjectTitle(cwd);
                           const viewLayout = bootstrapConfig.readViewLayout(cwd);
+                          const rebuildProjectNumber = triggerKeys.includes('project') ? null : resolvedTarget.target.projectNumber;
                           const rebuildResult = runBootstrapTwoPass({
                             cwd,
                             desiredState,
                             remoteSnapshot: bootstrapRemoteState,
                             strictMap: planningStrictMap as { kind: string; map?: unknown },
                             baseTarget: { owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber },
-                            projectNumber: resolvedTarget.target.projectNumber,
+                            projectNumber: rebuildProjectNumber,
                             projectTitle,
                             viewLayout,
                           });

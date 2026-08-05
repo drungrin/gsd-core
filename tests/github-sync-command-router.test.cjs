@@ -3419,6 +3419,93 @@ describe('github-sync router: plan 07-10 — a genuinely deleted Project through
     assert.equal(process.exitCode, 0);
   });
 
+  test('Live finding (plan 07-13 Task 1, 07-LIVE-REBUILD.md): the REAL planBootstrap/planProject decision -- no _bootstrapPlan stub -- receives projectNumber:null once `project` itself is a triggered key, dispatching a real create-project operation instead of blocking project_not_found', () => {
+    // Every OTHER test in this describe block (including "Test 1 (the
+    // tracer)" directly above) stubs `_bootstrapPlan` with a hand-written
+    // fake that ignores `target.projectNumber` entirely and unconditionally
+    // returns a create operation for the structure pass. That is exactly
+    // why the live-discovered bug this test pins survived every offline
+    // test in this file: the router passed the STILL-CONFIGURED,
+    // confirmed-absent project number straight into `runBootstrapTwoPass`,
+    // so the REAL `planProject` (never exercised by the stub) took its
+    // `init`-designed "a specific number was configured and it's gone --
+    // refuse, never silently create a replacement" branch
+    // (PROJECT_NOT_FOUND, blocked) instead of the create branch --
+    // confirmed live against a genuinely deleted real Project
+    // (07-LIVE-REBUILD.md Task 1): the recreate gate fired, but the
+    // "rebuild" produced only a blocked structure plan, and `sync` fell
+    // through to remote_unavailable forever. This test omits `_bootstrapPlan`
+    // entirely (the CR-01 precedent, 06-07 gap closure) so the REAL module
+    // decides, proving the fix (`projectNumber: null` only when `project`
+    // itself is a triggered key) against the actual producer, not a fixture
+    // shaped to already agree with the router.
+    const tmpDir = createTempProject();
+    const structurePlansSeen = [];
+    const routing = makeRoutingExecGh({
+      project: (index) => (index === 0 ? DELETED_PROJECT_ENVELOPE : resolvedProjectEnvelope('PVT_NEW')),
+      fieldsWithTypes: (index) => (index === 0 ? DELETED_PROJECT_ENVELOPE : resolvedFieldsEnvelope('PVT_NEW')),
+    });
+    const cap = captureStdout();
+    try {
+      realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, baseProjectCompletion({ absenceCount: 1, absenceFirstSeenAt: T0 })));
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        // Deliberately no `_bootstrapPlan` override — see the header comment.
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [{ logicalKey: 'phase:01' }], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: {
+          // Records every structure-pass plan the real planBootstrap
+          // produced, and — mirroring the real applier's own
+          // responsibility — persists a project completion when it sees a
+          // real create-project operation, so the final on-disk assertion
+          // reflects what a real create dispatch would do.
+          applyMutationPlan: (plan) => {
+            structurePlansSeen.push(plan);
+            const operation = plan.operations[0];
+            if (operation && operation.logicalKey === 'project' && operation.kind === 'create-project') {
+              const currentMap = realMap.readSyncMapStrict(tmpDir, { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber }).map;
+              const nextMap = realMap.recordCompletion(currentMap, baseProjectCompletion({ nodeId: 'PVT_NEW', issueNumber: 42, absenceCount: 2, absenceFirstSeenAt: T0 }));
+              realMap.writeSyncMapAtomically(tmpDir, nextMap);
+              return {
+                kind: 'completed',
+                outcomes: [{ logicalKey: 'project', operationKey: 'project', action: 'create', result: 'confirmed' }],
+                map: nextMap,
+              };
+            }
+            return { kind: 'completed', outcomes: [] };
+          },
+        },
+        _clock: { now: () => 60000, nowIso: () => T0_PLUS_60S, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+
+    assert.ok(structurePlansSeen.length > 0, 'the structure pass reached the injected apply seam at least once');
+    const structurePlan = structurePlansSeen[0];
+    assert.deepEqual(
+      structurePlan.blocked ?? [],
+      [],
+      'the REAL planProject must not block with project_not_found once project itself is the triggered key — it must take the create branch',
+    );
+    assert.ok(
+      structurePlan.operations.some((op) => op.logicalKey === 'project' && op.kind === 'create-project'),
+      'the REAL planProject dispatched a create-project operation',
+    );
+
+    try {
+      const finalMap = JSON.parse(fs.readFileSync(mapPathFor(tmpDir), 'utf8'));
+      assert.equal(finalMap.completions.project.nodeId, 'PVT_NEW', 'the replacement project\'s real node id is recorded — the REAL bootstrapPlan/apply path, not a stub, drove the rebuild');
+    } finally { cleanup(tmpDir); }
+
+    assert.equal(process.exitCode, 0);
+  });
+
   test('Test 2: the same deleted-Project input with NO prior absence marker records absenceCount 1 + absenceFirstSeenAt on the project completion, dispatches zero mutations, and returns uncertain/remote_unavailable', () => {
     const tmpDir = createTempProject();
     const bootstrapPlanCalls = [];
