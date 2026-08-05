@@ -2060,12 +2060,30 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
     return { chunks, restore: () => mock.restoreAll() };
   }
 
-  test('a first confirmed absence records absenceCount 1 + absenceFirstSeenAt, dispatches ZERO bootstrap operations, and still reaches reconciliation', () => {
+  // Plan 07-11 Task 3 (fixture audit, producer-impossible correction): this
+  // fixture used to pair `_remote: { available: true }` with
+  // `_bootstrapRemote: { projectOutcome: 'absent' }` — a combination the
+  // real `readRemoteSnapshot` can never produce for a genuinely absent
+  // project, since its own `readProjectNodeId` step fails on the identical
+  // underlying state that makes `projectOutcome` absent (07-VERIFICATION.md
+  // Gap 1). Corrected to the real, internally-consistent shape
+  // (`available: false, reason: 'project_absent'`) — which, per plan
+  // 07-10's own documented intent ("the pre-reconciliation availability
+  // guard ... keeps this decoupling from ever reconciling against a dead
+  // board on a first, not-yet-gated absence"), means reconciliation is
+  // correctly WITHHELD here, not merely dispatched anyway. The absence
+  // marker is still advanced and persisted regardless (that write happens
+  // BEFORE the guard) — this test now asserts exactly that split, matching
+  // 07-10's own "Test 2" (tests/github-sync-command-router.test.cjs, plan
+  // 07-10 describe block) which proves the identical property through the
+  // real readers.
+  test('a first confirmed absence records absenceCount 1 + absenceFirstSeenAt, dispatches ZERO bootstrap operations, and correctly withholds reconciliation (the board is not yet confirmed to resolve)', () => {
     const mapSeam = makeMapSeam(realMap.recordCompletion(null, baseProjectCompletion()));
     const bootstrapPlanCalls = [];
     const applyCalls = [];
     const remoteCalls = [];
     const cap = captureStdout();
+    let output;
     try {
       routeGithubSyncCommandRouter({
         args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
@@ -2076,7 +2094,7 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
         _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
         _map: mapSeam.seam,
         _remote: {
-          readRemoteSnapshot: (options) => { remoteCalls.push(options); return { available: true }; },
+          readRemoteSnapshot: (options) => { remoteCalls.push(options); return { available: false, reason: 'project_absent' }; },
         },
         _bootstrapRemote: {
           readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }),
@@ -2091,13 +2109,14 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
         _apply: { applyMutationPlan: (plan) => { applyCalls.push((plan.operations[0] || {}).logicalKey ?? null); return { kind: 'completed', outcomes: [] }; } },
         _clock: { now: () => 0, nowIso: () => T0, sleep: () => {} },
       });
-    } finally { cap.restore(); }
+    } finally { output = cap.chunks.join(''); cap.restore(); }
 
     assert.deepEqual(bootstrapPlanCalls, [], 'first confirmed absence must dispatch zero bootstrap operations');
-    assert.deepEqual(applyCalls, ['phase:01'], 'only the reconciliation apply runs');
+    assert.deepEqual(applyCalls, [], 'reconciliation is correctly withheld -- the board has not been confirmed to resolve');
+    assert.deepEqual(JSON.parse(output), { kind: 'uncertain', reason: 'remote_unavailable' }, 'sync reports uncertain/remote_unavailable, matching the pre-reconciliation availability guard');
     assert.equal(remoteCalls.length, 1, 'no post-rebuild re-read on a non-triggering run');
 
-    assert.equal(mapSeam.writeCalls.length, 1);
+    assert.equal(mapSeam.writeCalls.length, 1, 'the absence marker is still advanced and persisted -- that write happens before the reconciliation guard');
     const written = mapSeam.writeCalls[0];
     assert.equal(written.completions.project.absenceCount, 1);
     assert.equal(written.completions.project.absenceFirstSeenAt, T0);
@@ -2107,6 +2126,18 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
     assert.equal(process.exitCode, 0);
   });
 
+  // Plan 07-11 Task 3 (fixture audit, producer-impossible correction): as
+  // above, `_remote: { available: true }` unconditionally paired with a
+  // confirmed-absent project is a combination the real reader can never
+  // produce. Corrected here to be call-index-aware: the FIRST call (the
+  // router's initial snapshot read) reports the real absent shape; the
+  // SECOND call (the post-rebuild re-read, once the gate has fired and the
+  // board has just been recreated) reports the board resolving again --
+  // exactly the sequence 07-10's own realReaderSeams-driven "Test 1 (the
+  // tracer)" proves against the real readers. The corrected fixture leaves
+  // every existing assertion below unchanged (the property they pin --
+  // structure-then-options-then-reconciliation, one invocation -- still
+  // holds under the realistic sequence).
   test('a second confirmed absence past the 60000ms gate runs BOTH planBootstrap passes and then planReconciliation, in that order, inside one invocation', () => {
     const mapSeam = makeMapSeam(realMap.recordCompletion(null, baseProjectCompletion({ absenceCount: 1, absenceFirstSeenAt: T0 })));
     const bootstrapPlanCalls = [];
@@ -2124,7 +2155,10 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
         _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
         _map: mapSeam.seam,
         _remote: {
-          readRemoteSnapshot: (options) => { remoteCalls.push(options); return { available: true }; },
+          readRemoteSnapshot: (options) => {
+            remoteCalls.push(options);
+            return remoteCalls.length === 1 ? { available: false, reason: 'project_absent' } : { available: true };
+          },
         },
         _bootstrapRemote: {
           readBootstrapRemoteState: (options) => { bootstrapRemoteCalls.push(options); return { available: true, projectOutcome: 'absent' }; },
@@ -2195,7 +2229,14 @@ describe('github-sync router: plan 07-01 — existence classification and rebuil
           _isCapabilityActive: () => true,
           _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
           _desired: { readDesiredState: () => ({ available: true }) },
-          _remote: { readRemoteSnapshot: () => ({ available: true }) },
+          // Plan 07-11 Task 3 (fixture audit): corrected from an
+          // unconditional `available: true` -- producer-impossible alongside
+          // a confirmed-absent project (07-VERIFICATION.md Gap 1) -- to the
+          // real, internally-consistent shape. `status` has no
+          // pre-reconciliation availability guard of its own (it never
+          // dispatches anything destructive), so this change is inert to
+          // every assertion below.
+          _remote: { readRemoteSnapshot: () => ({ available: false, reason: 'project_absent' }) },
           _map: {
             readSyncMapStrict: () => ({ kind: 'valid', map: initialMap }),
             writeSyncMapAtomically: () => { writeCalls += 1; },
@@ -2573,7 +2614,10 @@ describe('github-sync router: plan 07-06 — prune write and status rebuild-scop
         _isCapabilityActive: () => true,
         _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
         _desired: { readDesiredState: () => ({ available: true }) },
-        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        // Plan 07-11 Task 3 (fixture audit): corrected -- `status` has no
+        // pre-reconciliation guard of its own, so the real, internally-
+        // consistent absent shape is inert to this half of the test.
+        _remote: { readRemoteSnapshot: () => ({ available: false, reason: 'project_absent' }) },
         _map: { readSyncMapStrict: () => ({ kind: 'valid', map: seedMap }), writeSyncMapAtomically: () => { throw new Error('status must never persist a map'); } },
         _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
         _bootstrapPlan: bootstrapPlanStub(statusBootstrapPlanCalls),
@@ -2592,6 +2636,7 @@ describe('github-sync router: plan 07-06 — prune write and status rebuild-scop
       // `status`), and its dispatched operations are what status's preview
       // is compared against.
       let stored = seedMap;
+      let syncRemoteCalls = 0;
       routeGithubSyncCommandRouter({
         args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
         error: (message) => { throw new Error(message); },
@@ -2605,7 +2650,18 @@ describe('github-sync router: plan 07-06 — prune write and status rebuild-scop
           mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
           writeSyncMapAtomically: (cwd, map) => { stored = map; },
         },
-        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        // Plan 07-11 Task 3 (fixture audit): call-index-aware, mirroring
+        // 07-10's own realReaderSeams-driven "Test 1 (the tracer)" -- the
+        // FIRST call (initial snapshot) reports the real absent shape; the
+        // SECOND (the post-rebuild re-read, once the gate has fired) reports
+        // the board resolving again, matching what a real recreate would
+        // produce. Every assertion below is unchanged by this correction.
+        _remote: {
+          readRemoteSnapshot: () => {
+            syncRemoteCalls += 1;
+            return syncRemoteCalls === 1 ? { available: false, reason: 'project_absent' } : { available: true };
+          },
+        },
         _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
         _bootstrapPlan: bootstrapPlanStub(syncBootstrapPlanCalls),
         _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
@@ -2648,7 +2704,10 @@ describe('github-sync router: plan 07-06 — prune write and status rebuild-scop
         _isCapabilityActive: () => true,
         _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
         _desired: { readDesiredState: () => ({ available: true }) },
-        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        // Plan 07-11 Task 3 (fixture audit): corrected to the real,
+        // internally-consistent shape (status has no pre-reconciliation
+        // guard, so this is inert to the assertions below).
+        _remote: { readRemoteSnapshot: () => ({ available: false, reason: 'project_absent' }) },
         _map: { readSyncMapStrict: () => ({ kind: 'valid', map: seedMap }), writeSyncMapAtomically: () => { throw new Error('status must never persist a map'); } },
         _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
         _bootstrapPlan: bootstrapPlanStub(bootstrapPlanCalls),
@@ -2683,7 +2742,9 @@ describe('github-sync router: plan 07-06 — prune write and status rebuild-scop
           _isCapabilityActive: () => true,
           _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
           _desired: { readDesiredState: () => ({ available: true }) },
-          _remote: { readRemoteSnapshot: () => ({ available: true }) },
+          // Plan 07-11 Task 3 (fixture audit): corrected to the real,
+          // internally-consistent shape.
+          _remote: { readRemoteSnapshot: () => ({ available: false, reason: 'project_absent' }) },
           _map: { readSyncMapStrict: () => ({ kind: 'valid', map: seedMap }), writeSyncMapAtomically: () => { writeCalls += 1; } },
           _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
           _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [] }) },
@@ -3006,8 +3067,22 @@ describe('github-sync router: plan 07-08 — D-20 pre-pass and D-01 absence-mark
           writeSyncMapAtomically: (cwd, map) => { writeCalls.push(map); stored = map; },
           pruneCompletions: (map) => map,
         },
-        _remote: { readRemoteSnapshot: () => ({ available: true }) },
-        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'present' }) },
+        // Plan 07-11 Task 3 (fixture audit, producer-impossible correction):
+        // this fixture's `projectOutcome` used to carry the string "present"
+        // -- not a member of the frozen `PROJECT_OUTCOME` enum
+        // (`resolved`/`absent`/`unset`/`unavailable`) -- it happened to
+        // behave like `absent` only because
+        // `classifyByNamespace` compares against the `resolved` member
+        // specifically, collapsing any other string to confirmed-absent.
+        // This test's own title ("the project absence-marker advance")
+        // confirms the intended member was `absent` all along; corrected to
+        // the real enum member, paired with the internally-consistent
+        // `_remote` shape (a genuinely absent project cannot coexist with
+        // `available: true` -- 07-VERIFICATION.md Gap 1). No assertion below
+        // depends on reconciliation actually running, so this correction is
+        // inert to them.
+        _remote: { readRemoteSnapshot: () => ({ available: false, reason: 'project_absent' }) },
+        _bootstrapRemote: { readBootstrapRemoteState: () => ({ available: true, projectOutcome: 'absent' }) },
         _markerSearch: {
           readIssuesWithMarkers: () => ({ available: true, entries: [{ number: 100, nodeId: 'ISSUE_1', body }] }),
           unboundIssueTargets: markerSearchReal.unboundIssueTargets,
