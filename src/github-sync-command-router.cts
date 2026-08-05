@@ -195,6 +195,8 @@ interface AbsenceMarkerLike { absenceCount?: number; absenceFirstSeenAt?: string
 interface ExistenceModule {
   classifyExistence(input: { completions: Record<string, unknown>; remote: unknown; bootstrapRemote: unknown }): ExistenceVerdictEntry[];
   advanceAbsence(previous: AbsenceMarkerLike | undefined, verdict: string, nowIso?: string): AbsenceMarkerLike;
+  /** Plan 07-05 (D-11): true for a phase-issue key, a plan-issue key, or the legacy `phase:<id>` project-item key — the keys this module's own `advanceAbsence`/marker-persist step (plan 07-11 Task 2) must NEVER touch, since an issue-bearing key's recreate/prune lifecycle belongs to `planReconciliation`'s orphan pruning, not the D-01 bootstrap-rebuild block. */
+  isIssueBearingLogicalKey(logicalKey: string): boolean;
   rebuildTriggered(verdicts: ExistenceVerdictEntry[], completions: Record<string, unknown>, nowIso?: string): boolean;
   /** Plan 07-06 Task 2 (D-03): the same trigger predicate as `rebuildTriggered`, naming every key that satisfies it — `status`'s rebuild-scope preview names these as "what triggered this." */
   rebuildTriggerKeys(verdicts: ExistenceVerdictEntry[], completions: Record<string, unknown>, nowIso?: string): string[];
@@ -964,28 +966,59 @@ function routeGithubSyncCommandRouter({
                       existenceVerdicts = verdicts;
                       const projectVerdict = verdicts.find((entry) => entry.logicalKey === 'project');
                       if (projectVerdict) {
-                        const advancedMarker = existence.advanceAbsence(
-                          { absenceCount: projectCompletion.absenceCount, absenceFirstSeenAt: projectCompletion.absenceFirstSeenAt },
-                          projectVerdict.verdict,
-                          nowIso,
-                        );
-                        const clearKeys: string[] = [];
-                        if (advancedMarker.absenceCount === undefined) clearKeys.push('absenceCount');
-                        if (advancedMarker.absenceFirstSeenAt === undefined) clearKeys.push('absenceFirstSeenAt');
-                        const mergedCompletion = map.mergeCompletion(
-                          projectCompletion,
-                          {
-                            logicalKey: 'project',
-                            nodeId: projectCompletion.nodeId,
-                            completedAt: projectCompletion.completedAt,
-                            owner: projectCompletion.owner,
-                            repo: projectCompletion.repo,
-                            repositoryNumber: projectCompletion.repositoryNumber,
-                            ...advancedMarker,
-                          },
-                          { clear: clearKeys },
-                        );
-                        const nextSyncMap = map.recordCompletion(planningStrictMap.map, mergedCompletion);
+                        // Plan 07-11 Task 2 (D-08/D-09 gap closure): advance
+                        // and persist the absence marker for EVERY
+                        // participating bootstrap-namespace completion this
+                        // run classified — `project`, `field:*`, `option:*`,
+                        // `label:*`, `milestone:*` alike, not only `project`.
+                        // 07-04 widened `classifyExistence`/`rebuildTriggered`
+                        // to every namespace and explicitly named this exact
+                        // extension as deferred work
+                        // (07-04-SUMMARY.md "Next Phase Readiness"); until
+                        // this plan, the router only ever wrote `project`'s
+                        // own marker back to disk, so a non-project object's
+                        // `absenceCount` could never accumulate past 1 on
+                        // real, persisted state — `rebuildTriggered`'s
+                        // per-namespace gate was reachable only against a
+                        // hand-seeded fixture (see the pre-existing "D-02: a
+                        // single custom field..." test), never against a
+                        // real multi-run sequence. `verdicts` mixes
+                        // bootstrap-namespace entries with issue-bearing
+                        // ones (`classifyExistence` classifies both); every
+                        // issue-bearing key is excluded here by
+                        // `isIssueBearingLogicalKey` — an issue's own
+                        // recreate/prune lifecycle belongs to
+                        // `planReconciliation`'s orphan pruning, never this
+                        // block.
+                        let nextSyncMap: unknown = planningStrictMap.map;
+                        for (const verdict of verdicts) {
+                          if (existence.isIssueBearingLogicalKey(verdict.logicalKey)) continue;
+                          const completion = completions[verdict.logicalKey];
+                          if (!completion) continue;
+                          const advancedMarker = existence.advanceAbsence(
+                            { absenceCount: completion.absenceCount, absenceFirstSeenAt: completion.absenceFirstSeenAt },
+                            verdict.verdict,
+                            nowIso,
+                          );
+                          const clearKeys: string[] = [];
+                          if (advancedMarker.absenceCount === undefined) clearKeys.push('absenceCount');
+                          if (advancedMarker.absenceFirstSeenAt === undefined) clearKeys.push('absenceFirstSeenAt');
+                          const mergedCompletion = map.mergeCompletion(
+                            completion,
+                            {
+                              logicalKey: verdict.logicalKey,
+                              nodeId: completion.nodeId,
+                              ...(completion.issueNumber === undefined ? {} : { issueNumber: completion.issueNumber }),
+                              completedAt: completion.completedAt,
+                              owner: completion.owner,
+                              repo: completion.repo,
+                              repositoryNumber: completion.repositoryNumber,
+                              ...advancedMarker,
+                            },
+                            { clear: clearKeys },
+                          );
+                          nextSyncMap = map.recordCompletion(nextSyncMap, mergedCompletion);
+                        }
                         map.writeSyncMapAtomically(cwd, nextSyncMap);
                         planningStrictMap = { kind: 'valid', map: nextSyncMap };
 

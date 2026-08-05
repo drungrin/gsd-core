@@ -3773,3 +3773,329 @@ describe('github-sync router: plan 07-11 Task 1 — status predicts a deleted bo
     assert.equal(process.exitCode, 0);
   });
 });
+
+// ─── Plan 07-11 Task 2 (REC-03 gap closure): the two-consecutive-absence
+// recreate gate has an exhaustive OFFLINE boundary matrix
+// (tests/github-sync-existence.test.cjs) but nothing — offline or live — had
+// ever shown it actually PREVENTING A DUPLICATE for an object travelling the
+// real dispatch path. This describe block drives four (plus an interruption
+// control) real `sync` invocations through the SAME `realReaderSeams`
+// harness plan 07-10 introduced, over a bootstrap object OTHER than
+// `project` — a custom field — so the project itself keeps resolving
+// throughout: the narrow path REC-01's own finding left reachable (a field's
+// enumeration failing to include it never makes `remoteSnapshot.available`
+// false), proven here rather than the widened `PROJECT_ABSENT` path 07-10
+// built for the project-deletion case.
+//
+// Gap discovered while building this proof (Rule 2 — missing critical
+// functionality, documented in full in this plan's SUMMARY): the router's
+// D-01 absence-marker persistence step wrote ONLY `project`'s own marker
+// back to the sync map — every other participating bootstrap namespace
+// (`field:*`, `option:*`, `label:*`, `milestone:*`) had its verdict computed
+// by `classifyExistence` and consulted by `rebuildTriggered`'s SIMULATION,
+// but never durably advanced on disk. A field's `absenceCount` could
+// therefore never accumulate past 1 against real, persisted state, so
+// `rebuildTriggered`'s own widened per-namespace gate (07-04) was reachable
+// only against a hand-seeded fixture (see "D-02: a single custom field..."
+// above) — never against a real multi-run sequence, which is exactly what
+// REC-03 claims to guarantee. `src/github-sync-command-router.cts`'s marker
+// persistence step was widened to loop over every non-issue-bearing verdict
+// entry (project, field:*, option:*, label:*, milestone:* alike) as part of
+// this task; see the SUMMARY for the full account. ─────────────────────────
+
+describe('github-sync router: plan 07-11 Task 2 — REC-03: exactly one create across four runs', () => {
+  const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+  const realRemoteReader = require('../gsd-core/bin/lib/github-sync-remote.cjs');
+  const realBootstrapRemoteReader = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+
+  const T0 = '2026-08-01T00:00:00.000Z';
+  const T0_PLUS_59999 = '2026-08-01T00:00:59.999Z';
+  const T0_PLUS_60000 = '2026-08-01T00:01:00.000Z';
+  const T0_PLUS_120000 = '2026-08-01T00:02:00.000Z';
+
+  const FIELD_KEY = 'field:recreate-gate';
+  const FIELD_NODE_ID_OLD = 'PVTF_OLD';
+  const FIELD_NODE_ID_NEW = 'PVTF_NEW';
+
+  function mapPathFor(tmpDir) { return path.join(tmpDir, '.planning', '.github-sync.json'); }
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  /**
+   * `realReaderSeams`: delegates to the REAL compiled reader modules
+   * (`github-sync-remote.cjs`/`github-sync-bootstrap-remote.cjs`) — no
+   * member is a hand-written stub returning a snapshot shape, mirroring the
+   * plan 07-10/07-11 Task 1 harnesses exactly.
+   */
+  function realReaderSeams(execGh) {
+    return {
+      _remote: { readRemoteSnapshot: (options) => realRemoteReader.readRemoteSnapshot({ ...options, execGh }) },
+      _bootstrapRemote: { readBootstrapRemoteState: (options) => realBootstrapRemoteReader.readBootstrapRemoteState({ ...options, execGh }) },
+    };
+  }
+
+  const REMOTE_MARKER_NAMES = ['project', 'items', 'fields', 'subIssues', 'issueId'];
+
+  /**
+   * The project and its pre-existing `Status` field always resolve.
+   * `presentNodeId` is either `null` (the target field is genuinely absent
+   * from this run's enumeration) or the exact node id this run's remote
+   * enumeration should carry for it — `FIELD_NODE_ID_OLD` when the field
+   * simply becomes visible again with the SAME identity it always had (no
+   * recreation happened), or `FIELD_NODE_ID_NEW` when a create dispatched by
+   * a PRIOR run in this same sequence is what made it visible. Classifying
+   * "present" by nodeId membership (not merely by name) mirrors
+   * `classifyByNamespace`'s own real decision rule — the narrow,
+   * project-stays-up scenario this whole block proves.
+   */
+  function fieldsWithTypesResponse(presentNodeId) {
+    const nodes = [{ id: 'FIELD_STATUS', name: 'Status', dataType: 'SINGLE_SELECT', options: [] }];
+    if (presentNodeId) nodes.push({ id: presentNodeId, name: 'Recreate Gate', dataType: 'TEXT' });
+    return { data: { repositoryOwner: { projectV2: { id: 'PVT_LIVE', fields: { nodes, pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+  }
+
+  function defaultGraphqlResponse(document, presentNodeId) {
+    switch (document) {
+      case 'project':
+        return { data: { repositoryOwner: { projectV2: { id: 'PVT_LIVE' } } } };
+      case 'items':
+        return { data: { repositoryOwner: { projectV2: { items: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'fields':
+        return { data: { repositoryOwner: { projectV2: { fields: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'subIssues':
+        return { data: { repository: { issue: { subIssues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'repository':
+        return { data: { repository: { id: 'R_DEFAULT', owner: { id: 'O_DEFAULT', login: TARGET.owner }, projectsV2: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } };
+      case 'fieldsWithTypes':
+        return fieldsWithTypesResponse(presentNodeId);
+      case 'views':
+        return { data: { repositoryOwner: { projectV2: { views: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      default:
+        return { data: {} };
+    }
+  }
+
+  /** Routes every execGh call for one `sync` run, answering the `fieldsWithTypes` document (the field enumeration) according to `presentNodeId` for THIS run (`null` for absent) — everything else defaults, matching the 07-10/Task-1 harnesses. */
+  function makeRoutingExecGh(presentNodeId) {
+    const calls = [];
+    const execGh = (args) => {
+      let document = null;
+      if (args[0] === 'api' && args[1] !== 'graphql') {
+        if (typeof args[1] === 'string' && args[1].includes('/labels')) document = 'labels';
+        else if (typeof args[1] === 'string' && args[1].includes('/milestones')) document = 'milestones';
+      } else {
+        const queryArg = args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
+        const query = queryArg ? queryArg.slice('query='.length) : '';
+        document = REMOTE_MARKER_NAMES.find((name) => query.includes(`github-sync:${name}`)) ?? null;
+        if (!document) {
+          const bootstrapEntry = Object.entries(realBootstrapRemoteReader.BOOTSTRAP_DOCUMENTS).find(([, doc]) => doc === query);
+          document = bootstrapEntry ? bootstrapEntry[0] : null;
+        }
+      }
+      calls.push({ document, args });
+      if (document === 'labels' || document === 'milestones') return { exitCode: 0, reason: 'ok', stdout: '[]', stderr: '' };
+      return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(defaultGraphqlResponse(document, presentNodeId)), stderr: '' };
+    };
+    return { execGh, calls };
+  }
+
+  /**
+   * Runs one `sync` invocation against the persisted `tmpDir` sync map. The
+   * router reads and writes the REAL sync map itself (no `_map` seam is
+   * injected — `readSyncMapStrict`/`writeSyncMapAtomically` are the real
+   * `github-sync-map.cjs` functions), so the absence marker's survival
+   * across `recordCompletion`'s wholesale replace, and across the map's own
+   * persistence to disk between calls, is part of what the sequence proves
+   * (D-08's warning; the two convergence bugs plans 05-05/05-06 both found
+   * live). The injected `_apply` fake mirrors the REAL applier's own
+   * responsibility for a confirmed create (`github-sync-apply.cjs`): on a
+   * dispatched create it persists a fresh completion for the created key
+   * (no absence marker), exactly as the real applier would, so the run
+   * AFTER a dispatched create sees the field bound and present again — not
+   * merely "an operation happened, nothing was ever recorded." Every
+   * dispatched operation is appended to the caller-supplied `dispatched`
+   * array, keyed by logical key and kind — the aggregate this whole
+   * describe block asserts on, since a per-run assertion alone cannot
+   * distinguish "created once" from "created once per run."
+   */
+  function runSync({ tmpDir, nowIso, presentNodeId = null, dispatched }) {
+    const bootstrapPlanCalls = [];
+    const cap = captureStdout();
+    const routing = makeRoutingExecGh(presentNodeId);
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => {
+            bootstrapPlanCalls.push(options.pass);
+            if (options.pass === 'structure') {
+              return { operations: [{ logicalKey: FIELD_KEY, kind: 'create-field' }], noops: [], blocked: [], uncertain: [], checkpoints: [] };
+            }
+            return { operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] };
+          },
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: {
+          applyMutationPlan: (plan) => {
+            const operation = plan.operations[0] || {};
+            if (!operation.logicalKey) return { kind: 'completed', outcomes: [] };
+            dispatched.push({ logicalKey: operation.logicalKey, kind: operation.kind ?? null });
+            const currentMap = realMap.readSyncMapStrict(tmpDir, { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber }).map;
+            const nextMap = realMap.recordCompletion(currentMap, {
+              logicalKey: FIELD_KEY, nodeId: FIELD_NODE_ID_NEW, completedAt: nowIso,
+              owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber,
+            });
+            realMap.writeSyncMapAtomically(tmpDir, nextMap);
+            return { kind: 'completed', outcomes: [{ logicalKey: operation.logicalKey, operationKey: operation.logicalKey, action: 'create', result: 'confirmed' }], map: nextMap };
+          },
+        },
+        // D-09's own clock seam — `nowIso` is set explicitly per call by the
+        // caller; this function itself never reads the real wall clock.
+        _clock: { now: () => Date.parse(nowIso), nowIso: () => nowIso, sleep: () => {} },
+      });
+    } finally { cap.restore(); }
+    const finalMap = JSON.parse(fs.readFileSync(mapPathFor(tmpDir), 'utf8'));
+    return { bootstrapPlanCalls, finalMap };
+  }
+
+  function seedProjectAndField(tmpDir, fieldOverrides = {}) {
+    realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, {
+      logicalKey: 'project', nodeId: 'PVT_LIVE', completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber,
+    }));
+    const seededMap = realMap.readSyncMapStrict(tmpDir, { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber }).map;
+    realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(seededMap, {
+      logicalKey: FIELD_KEY, nodeId: FIELD_NODE_ID_OLD, completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber,
+      ...fieldOverrides,
+    }));
+  }
+
+  test('four consecutive sync runs over a missing custom field (project present throughout) dispatch exactly ONE create-field mutation, at the run that first satisfies the 60000ms gate', () => {
+    const tmpDir = createTempProject();
+    const dispatched = [];
+    try {
+      seedProjectAndField(tmpDir);
+
+      // Run 1 @ T0: first confirmed absence.
+      const run1 = runSync({ tmpDir, nowIso: T0, presentNodeId: null, dispatched });
+      assert.deepEqual(run1.bootstrapPlanCalls, [], 'run 1: the recreate gate is not yet satisfied on a first confirmed absence — zero bootstrap passes dispatched');
+      assert.equal(run1.finalMap.completions[FIELD_KEY].absenceCount, 1);
+      assert.equal(run1.finalMap.completions[FIELD_KEY].absenceFirstSeenAt, T0);
+      assert.equal(run1.finalMap.completions.project.absenceCount, undefined, 'the project itself resolves throughout — its own marker never advances');
+
+      // Run 2 @ T0+59999ms: second confirmed absence, still short of the gate.
+      const run2 = runSync({ tmpDir, nowIso: T0_PLUS_59999, presentNodeId: null, dispatched });
+      assert.deepEqual(run2.bootstrapPlanCalls, [], 'run 2: 59999ms elapsed is still short of the 60000ms gate — zero bootstrap passes dispatched');
+      assert.equal(run2.finalMap.completions[FIELD_KEY].absenceCount, 2);
+      assert.equal(run2.finalMap.completions[FIELD_KEY].absenceFirstSeenAt, T0, 'the first-seen stamp is never restamped by a later confirmation');
+
+      // Run 3 @ T0+60000ms: exactly the gate — dispatches the create.
+      const run3 = runSync({ tmpDir, nowIso: T0_PLUS_60000, presentNodeId: null, dispatched });
+      assert.deepEqual(run3.bootstrapPlanCalls, ['structure', 'options'], 'run 3: exactly 60000ms elapsed satisfies the gate — both bootstrap passes run');
+      assert.equal(dispatched.filter((entry) => entry.logicalKey === FIELD_KEY).length, 1, 'exactly one create-field mutation has reached the apply seam by run 3');
+
+      // Run 4 @ T0+120000ms: the field now resolves (the run-3 create's own
+      // effect, mirrored by the fake apply) — zero further bootstrap passes,
+      // and the completion carries no absence marker at all.
+      const run4 = runSync({ tmpDir, nowIso: T0_PLUS_120000, presentNodeId: FIELD_NODE_ID_NEW, dispatched });
+      assert.deepEqual(run4.bootstrapPlanCalls, [], 'run 4: the field now resolves present — nothing left to trigger');
+      assert.equal(run4.finalMap.completions[FIELD_KEY].absenceCount, undefined, 'a present verdict clears the marker entirely');
+      assert.equal(run4.finalMap.completions[FIELD_KEY].absenceFirstSeenAt, undefined);
+
+      assert.equal(dispatched.filter((entry) => entry.logicalKey === FIELD_KEY).length, 1, 'across the whole four-run sequence, exactly ONE create-field mutation ever reached the apply seam');
+    } finally { cleanup(tmpDir); }
+  });
+
+  test('interruption control: a present verdict between two absences resets the two-absence count to one with a fresh stamp, and the whole interrupted sequence dispatches zero create-field mutations', () => {
+    const tmpDir = createTempProject();
+    const dispatched = [];
+    try {
+      seedProjectAndField(tmpDir);
+
+      // Run 1 @ T0: first confirmed absence.
+      const run1 = runSync({ tmpDir, nowIso: T0, presentNodeId: null, dispatched });
+      assert.deepEqual(run1.bootstrapPlanCalls, []);
+      assert.equal(run1.finalMap.completions[FIELD_KEY].absenceCount, 1);
+
+      // Run 2 @ T0+59999ms: the field reappears — clears the marker entirely.
+      const run2 = runSync({ tmpDir, nowIso: T0_PLUS_59999, presentNodeId: FIELD_NODE_ID_OLD, dispatched });
+      assert.deepEqual(run2.bootstrapPlanCalls, [], 'a present verdict never triggers a rebuild');
+      assert.equal(run2.finalMap.completions[FIELD_KEY].absenceCount, undefined, 'a present verdict clears the marker entirely, not merely leaves it unincremented');
+      assert.equal(run2.finalMap.completions[FIELD_KEY].absenceFirstSeenAt, undefined);
+
+      // Run 3 @ T0+60000ms: absent again — the count restarts from one, a
+      // FRESH stamp, never the second half of the interrupted sequence.
+      const run3 = runSync({ tmpDir, nowIso: T0_PLUS_60000, presentNodeId: null, dispatched });
+      assert.deepEqual(run3.bootstrapPlanCalls, [], 'run 3 restarts the count at one — a single fresh absence never satisfies the gate');
+      assert.equal(run3.finalMap.completions[FIELD_KEY].absenceCount, 1, 'the interruption resets the count to one');
+      assert.equal(run3.finalMap.completions[FIELD_KEY].absenceFirstSeenAt, T0_PLUS_60000, 'a fresh stamp, not T0');
+
+      assert.deepEqual(dispatched, [], 'zero create-field mutations dispatched across the entire interrupted sequence');
+    } finally { cleanup(tmpDir); }
+  });
+
+  test('the field completion\'s absence marker is written through mergeCompletion (an unrelated pre-existing member survives) and survives the map\'s own persistence to disk, re-read through the real readSyncMapStrict', () => {
+    const tmpDir = createTempProject();
+    const dispatched = [];
+    try {
+      seedProjectAndField(tmpDir, { contentHash: 'unrelated-hash-must-survive' });
+
+      const run1 = runSync({ tmpDir, nowIso: T0, presentNodeId: null, dispatched });
+      assert.equal(run1.finalMap.completions[FIELD_KEY].absenceCount, 1);
+      assert.equal(run1.finalMap.completions[FIELD_KEY].contentHash, 'unrelated-hash-must-survive', 'the marker write went through mergeCompletion, never a bare recordCompletion built from a partial object — D-08\'s wholesale-replace warning');
+
+      // Re-read fresh from disk (never the in-memory object run1 returned) —
+      // the exact property the D-08 wholesale-replace trap threatens.
+      const rereadFromDisk = realMap.readSyncMapStrict(tmpDir, { owner: TARGET.owner, repo: TARGET.repo, number: TARGET.repositoryNumber });
+      assert.equal(rereadFromDisk.kind, 'valid');
+      assert.equal(rereadFromDisk.map.completions[FIELD_KEY].absenceCount, 1);
+      assert.equal(rereadFromDisk.map.completions[FIELD_KEY].contentHash, 'unrelated-hash-must-survive');
+    } finally { cleanup(tmpDir); }
+  });
+
+  test('every run obtains its remote/bootstrap-remote state through realReaderSeams — no hand-written seam literal supplies the field enumeration', () => {
+    const tmpDir = createTempProject();
+    try {
+      seedProjectAndField(tmpDir);
+      const routing = makeRoutingExecGh(null);
+      const seams = realReaderSeams(routing.execGh);
+      assert.equal(typeof seams._remote.readRemoteSnapshot, 'function');
+      assert.equal(typeof seams._bootstrapRemote.readBootstrapRemoteState, 'function');
+      const snapshot = seams._bootstrapRemote.readBootstrapRemoteState({ cwd: tmpDir, owner: TARGET.owner, repo: TARGET.repo, projectNumber: TARGET.projectNumber });
+      assert.equal(snapshot.available, true, 'the real bootstrap-remote reader, driven by the fake execGh, decodes a genuine available read');
+      assert.ok(Array.isArray(snapshot.fields), 'the field enumeration comes from the real reader\'s own decode of the injected execGh response, never an injected snapshot literal');
+      assert.equal(snapshot.fields.some((field) => field.id === FIELD_NODE_ID_NEW), false, 'the target field is genuinely absent from this decoded enumeration');
+    } finally { cleanup(tmpDir); }
+  });
+
+  test('this describe block contains no literal Date-dot-now call — every clock value is the explicit nowIso the test sets per run', () => {
+    const source = fs.readFileSync(__filename, 'utf8');
+    const blockStart = source.indexOf("describe('github-sync router: plan 07-11 Task 2");
+    assert.ok(blockStart >= 0, 'this describe block is present in the file');
+    // Stops BEFORE this very test's own definition — its title and assertion
+    // string necessarily contain the literal pattern being searched for,
+    // which would otherwise match itself. Every OTHER test/helper in the
+    // block (the only code that could actually call the forbidden function)
+    // is covered by this slice.
+    const selfStart = source.indexOf("test('this describe block contains no literal Date-dot-now call", blockStart);
+    assert.ok(selfStart > blockStart, 'this test\'s own definition is found after the block start');
+    const blockText = source.slice(blockStart, selfStart);
+    const forbidden = ['Date', '.', 'now', '(', ')'].join('');
+    assert.equal(blockText.includes(forbidden), false, 'no Date.now() call appears anywhere else in this describe block');
+  });
+});
