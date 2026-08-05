@@ -1,5 +1,5 @@
 {
-  "provenance": "Schema facts probed live against drungrin/gsd-core Project v2 #9 and #10 with `project` scope, 2026-08-01 (.planning/phases/02-sync-engine-core/02-UAT.md gap G-02-7 evidence). Re-verify against the live schema before editing this file rather than guessing. Updated 2026-08-01 (phase 03 plan 03, D-13): project/items/fields re-scoped from `viewer` to `repositoryOwner(login:) { ... on ProjectV2Owner { ... } }` so an organization-owned board is visible; each leaf selection's own node kind/fragment/selects are unchanged, recorded via the added `scopedVia` field.",
+  "provenance": "Schema facts probed live against drungrin/gsd-core Project v2 #9 and #10 with `project` scope, 2026-08-01 (.planning/phases/02-sync-engine-core/02-UAT.md gap G-02-7 evidence). Re-verify against the live schema before editing this file rather than guessing. Updated 2026-08-01 (phase 03 plan 03, D-13): project/items/fields re-scoped from `viewer` to `repositoryOwner(login:) { ... on ProjectV2Owner { ... } }` so an organization-owned board is visible; each leaf selection's own node kind/fragment/selects are unchanged, recorded via the added `scopedVia` field. Updated 2026-08-04 (phase 07 plan 12, WINDOWS #10 gap closure): items' Issue content fragment widened to also select the bound issue's `repository { owner { login } name }` (07-LIVE-RECOVERY.md's cross-repository-transfer finding) — recorded via the added `contentFragmentTargets`/`contentSelects`/`repositorySelects`/`repositoryOwnerSelects` fields, validated by the remote test file's Guard 6.",
   "documents": {
     "project": {
       "connection": null,
@@ -17,7 +17,11 @@
       "fragmentTargets": [],
       "selects": ["id", "content"],
       "paginated": true,
-      "scopedVia": "repositoryOwner(login:) { ... on ProjectV2Owner { projectV2(number:) { items } } }"
+      "scopedVia": "repositoryOwner(login:) { ... on ProjectV2Owner { projectV2(number:) { items } } }",
+      "contentFragmentTargets": ["Issue"],
+      "contentSelects": ["id", "number", "repository"],
+      "repositorySelects": ["owner", "name"],
+      "repositoryOwnerSelects": ["login"]
     },
     "fields": {
       "connection": ["repositoryOwner", "projectV2", "fields"],

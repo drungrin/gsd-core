@@ -426,6 +426,114 @@ describe('readRemoteSnapshot', () => {
     assert.strictEqual(stalled.reason, REMOTE_REASON.UNAVAILABLE);
   });
 
+  // ─── Plan 07-12 (WINDOWS #10 gap closure): items content repository
+  // identity — the widened `DOCUMENTS.items` selection this plan adds. ─────
+
+  /** A minimal, fully-decodable remote fixture whose ONLY interesting page is `items` — every other document returns an empty, well-formed page. */
+  function minimalRemoteExecGh({ itemsPage }) {
+    return (args) => {
+      const query = args.find((arg) => arg.startsWith('query='));
+      if (query.includes('github-sync:project')) {
+        return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('project', { id: 'PVT_proj_node_1' })), stderr: '' };
+      }
+      if (query.includes('github-sync:items')) {
+        return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('items', itemsPage)), stderr: '' };
+      }
+      if (query.includes('github-sync:fields')) {
+        return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('fields', { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } })), stderr: '' };
+      }
+      if (query.includes('github-sync:subIssues')) {
+        return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(envelope('subIssues', { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } })), stderr: '' };
+      }
+      throw new Error(`unexpected query: ${query}`);
+    };
+  }
+
+  test('Test 1 (07-12): a decoded item whose content carries a nested repository object exposes that owner login and repository name on the snapshot\'s item content, alongside the id and number', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh: minimalRemoteExecGh({
+        itemsPage: {
+          nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE_NODE_1', number: 101, repository: { owner: { login: 'octo' }, name: 'example' } } }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      }),
+    });
+    assert.equal(result.available, true);
+    assert.deepEqual(result.items, [
+      { id: 'ITEM-1', content: { id: 'ISSUE_NODE_1', number: 101, repository: { owner: { login: 'octo' }, name: 'example' } } },
+    ]);
+  });
+
+  test('Test 2 (07-12): a decoded item whose content is null (a draft item, or one bound to something that is not an issue) still decodes, exposing no repository identity, and does not fail the page', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh: minimalRemoteExecGh({
+        itemsPage: { nodes: [{ id: 'ITEM-DRAFT', content: null }], pageInfo: { hasNextPage: false, endCursor: null } },
+      }),
+    });
+    assert.equal(result.available, true);
+    assert.deepEqual(result.items, [{ id: 'ITEM-DRAFT', content: null }]);
+  });
+
+  test('Test 3 (07-12): an item whose content number is zero, negative, fractional, or beyond the safe integer range fails the read closed — collectIssueNumbers\' existing guarantee, restated against the widened shape so the widening cannot loosen it', () => {
+    for (const badNumber of [0, -5, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const result = readRemoteSnapshot({
+        cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+        execGh: minimalRemoteExecGh({
+          itemsPage: {
+            nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE_NODE_1', number: badNumber, repository: { owner: { login: 'octo' }, name: 'example' } } }],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        }),
+      });
+      assert.equal(result.available, false, `content.number ${badNumber} must fail the read closed even with a well-formed repository present`);
+      assert.equal(result.reason, REMOTE_REASON.UNAVAILABLE);
+    }
+  });
+
+  test('a present content.repository missing owner.login fails the page closed, not a partial identity', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh: minimalRemoteExecGh({
+        itemsPage: {
+          nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE_NODE_1', number: 101, repository: { owner: {}, name: 'example' } } }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      }),
+    });
+    assert.equal(result.available, false);
+    assert.equal(result.reason, REMOTE_REASON.UNAVAILABLE);
+  });
+
+  test('a present content.repository that is not an object at all fails the page closed', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh: minimalRemoteExecGh({
+        itemsPage: {
+          nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE_NODE_1', number: 101, repository: 'not-an-object' } }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      }),
+    });
+    assert.equal(result.available, false);
+    assert.equal(result.reason, REMOTE_REASON.UNAVAILABLE);
+  });
+
+  test('a present content.repository with an empty repository name fails the page closed', () => {
+    const result = readRemoteSnapshot({
+      cwd: '/tmp', owner: 'octo', repo: 'example', repositoryNumber: 1, projectNumber: 1,
+      execGh: minimalRemoteExecGh({
+        itemsPage: {
+          nodes: [{ id: 'ITEM-1', content: { id: 'ISSUE_NODE_1', number: 101, repository: { owner: { login: 'octo' }, name: '' } } }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      }),
+    });
+    assert.equal(result.available, false);
+    assert.equal(result.reason, REMOTE_REASON.UNAVAILABLE);
+  });
+
   // ─── D-13: owner-scoping — organization/user parity and decoder-drift gate ─
 
   test('a project read whose response resolves an organization-kind owner and one whose response resolves a user-kind owner yield the same project node id, with the same call count', () => {
@@ -742,6 +850,39 @@ describe('DOCUMENTS schema contract', () => {
         }
       }
     }
+  });
+
+  // Test 4 (plan 07-12, WINDOWS #10 gap closure): `items`' node body only
+  // ever selects the bare identifiers "id" and "content" at depth zero
+  // (Guard 3 above) — the widened repository identity lives INSIDE the
+  // `content { ... on Issue { ... } }` fragment, one level deeper than any
+  // existing guard inspects. This guard isolates that nested selection with
+  // the SAME brace-depth walker (`extractSelectionBody`/
+  // `collectDepthZeroIdentifiers`), applied to successively narrower text
+  // substrings so the naive lowercase substring "repository"/"owner" cannot
+  // false-match the query's own unrelated `repositoryOwner(login:)` root
+  // field. Fails if the fixture is reverted to the pre-widening selection —
+  // `extractSelectionBody(contentBody, 'repository')` returns null, and the
+  // `assert.ok` below fails, before any field-set comparison even runs.
+  test('items content selects the bound issue\'s repository identity (Guard 6: content nested selection, plan 07-12)', () => {
+    const documents = captureDispatchedDocuments();
+    const itemsEntry = contract.documents.items;
+    const query = documents.get('items');
+
+    const contentSelection = parseSelection(query, 'content');
+    assert.ok(contentSelection, 'items must select content');
+    assert.equal(contentSelection.fragmentTarget, itemsEntry.contentFragmentTargets[0], 'content must select through an inline fragment on Issue');
+    assert.deepStrictEqual([...contentSelection.fields].sort(), [...itemsEntry.contentSelects].sort(), 'content selection drifted from the recorded contract');
+    assert.strictEqual(contentSelection.bareOutsideFragment, false);
+
+    const contentBody = extractSelectionBody(query, 'content');
+    const repositoryBody = extractSelectionBody(contentBody, 'repository');
+    assert.ok(repositoryBody, 'the Issue fragment must select repository — reverting the widening makes this null');
+    assert.deepStrictEqual([...collectDepthZeroIdentifiers(repositoryBody.trim())].sort(), [...itemsEntry.repositorySelects].sort());
+
+    const ownerBody = extractSelectionBody(repositoryBody, 'owner');
+    assert.ok(ownerBody, 'repository must select owner');
+    assert.deepStrictEqual([...collectDepthZeroIdentifiers(ownerBody.trim())].sort(), [...itemsEntry.repositoryOwnerSelects].sort());
   });
 });
 

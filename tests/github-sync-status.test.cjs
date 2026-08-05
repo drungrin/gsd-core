@@ -38,8 +38,8 @@ test('buildStatusV1 groups a complete reconciliation plan into the documented co
     pendingIssueUpdates: ['phase:03'],
     pendingFieldChanges: ['plan:04-01'],
     subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
-    // Plan 07-05/07-06: always present, empty on a pre-07-05/07-06-shaped plan fixture.
-    adoptions: [], prune: [],
+    // Plan 07-05/07-06/07-12: always present, empty on a pre-07-05/07-06/07-12-shaped plan fixture.
+    adoptions: [], prune: [], contentDrift: [],
     existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
     absences: [],
     rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
@@ -80,7 +80,7 @@ test('buildStatusV1 produces an actionable fixed unavailable state without raw t
     message: 'github-sync status is unavailable because GitHub could not be read. Retry shortly.',
     creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
     orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
-    adoptions: [], prune: [],
+    adoptions: [], prune: [], contentDrift: [],
     existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
     absences: [],
     rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
@@ -121,6 +121,7 @@ test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), unce
     subIssueCeilingWarnings: [{ phaseId: '05', issueNumber: 900, count: 91, limit: 100 }],
     adoptions: [{ logicalKey: 'issue:phase:11', previousNodeId: 'ISSUE_OLD', resolvedNodeId: 'ISSUE_NEW' }],
     prune: ['plan:09-09'],
+    contentDrift: [{ logicalKey: 'issue:phase:12', previousOwner: 'octo', previousRepo: 'example', previousIssueNumber: 5, currentOwner: 'octo', currentRepo: 'moved-example', currentIssueNumber: 5 }],
     existence: { present: 3, confirmedAbsent: 1, unknown: 1, unknownKeys: ['field:gsd-id'] },
     absences: [{ logicalKey: 'plan:09-09', count: 2, firstSeenAt: '2026-08-01T00:00:00.000Z' }],
     rebuildScope: { triggered: true, triggeredKeys: ['project'], structureOperations: ['project'], optionsOperations: ['option:status:todo'] },
@@ -151,6 +152,8 @@ test('renderStatusV1 lists creates, updates, no-ops, blocked (with detail), unce
     '  - issue:phase:11: ISSUE_OLD -> ISSUE_NEW',
     'prune: 1',
     '  - plan:09-09',
+    'content-drift: 1',
+    '  - issue:phase:12: octo/example#5 -> octo/moved-example#5 (cross-repository, map unchanged)',
     'existence: present=3 confirmed-absent=1 unknown=1',
     '  - field:gsd-id',
     'absences: 1',
@@ -175,7 +178,7 @@ test('renderStatusV1 renders a blocked entry without a detail as the bare reason
     pendingIssueUpdates: [],
     pendingFieldChanges: [],
     subIssueCeilingWarnings: [],
-    adoptions: [], prune: [],
+    adoptions: [], prune: [], contentDrift: [],
     existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
     absences: [],
     rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
@@ -192,7 +195,7 @@ test('renderStatusV1 still shows all group lines at zero when every group is emp
     version: 1, available: true,
     creates: [], updates: [], noops: [], blocked: [], uncertain: [],
     orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
-    adoptions: [], prune: [],
+    adoptions: [], prune: [], contentDrift: [],
     existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
     absences: [],
     rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
@@ -212,6 +215,7 @@ test('renderStatusV1 still shows all group lines at zero when every group is emp
     'sub-issue-ceiling-warnings: 0',
     'adoptions: 0',
     'prune: 0',
+    'content-drift: 0',
     'existence: present=0 confirmed-absent=0 unknown=0',
     'absences: 0',
     'rebuild-scope: triggered=false',
@@ -338,7 +342,7 @@ test('buildStatusV1 keeps the target_unavailable and generic remote_unavailable 
     blocked: [{ reason: 'target_unavailable', detail: 'owner' }],
     uncertain: [],
     orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
-    adoptions: [], prune: [],
+    adoptions: [], prune: [], contentDrift: [],
     existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
     absences: [],
     rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
@@ -351,7 +355,7 @@ test('buildStatusV1 keeps the target_unavailable and generic remote_unavailable 
     message: 'github-sync status is unavailable because GitHub could not be read. Retry shortly.',
     creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
     orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
-    adoptions: [], prune: [],
+    adoptions: [], prune: [], contentDrift: [],
     existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
     absences: [],
     rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
@@ -599,4 +603,38 @@ test('buildStatusV1 carries plan.adoptions and plan.prune through verbatim, defa
   const withNeither = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] });
   assert.deepEqual(withNeither.adoptions, []);
   assert.deepEqual(withNeither.prune, []);
+});
+
+// ─── Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b): a bound item's
+// content drift — a cross-repository drift is named, never acted on. ───────
+
+test('buildStatusV1 carries plan.contentDrift through verbatim, defaulting to empty on a pre-07-12-shaped plan', () => {
+  const entry = {
+    logicalKey: 'issue:phase:12', previousOwner: 'octo', previousRepo: 'repo', previousIssueNumber: 501,
+    currentOwner: 'other-owner', currentRepo: 'other-repo', currentIssueNumber: 501,
+  };
+  const withDrift = buildStatusV1({ available: true, reason: 'ok' }, {
+    operations: [], noops: [], blocked: [], uncertain: [],
+    // `github-sync-reconcile.cts`'s real ContentDriftEntry also carries
+    // previousNodeId/currentNodeId/crossRepository — the DTO narrows to the
+    // seven fields a developer reading `status` needs, dropping node ids
+    // (already available via adoptions for the in-repository half).
+    contentDrift: [{ ...entry, previousNodeId: 'ISSUE_NODE_12', currentNodeId: 'ISSUE_NODE_12_MOVED', crossRepository: true }],
+  });
+  assert.deepEqual(withDrift.contentDrift, [entry]);
+
+  const withNeither = buildStatusV1({ available: true, reason: 'ok' }, { operations: [], noops: [], blocked: [], uncertain: [] });
+  assert.deepEqual(withNeither.contentDrift, []);
+});
+
+test('renderStatusV1 renders a content-drift entry as its logical key and both full identities, naming the map as unchanged', () => {
+  const dto = buildStatusV1({ available: true, reason: 'ok' }, {
+    operations: [], noops: [], blocked: [], uncertain: [],
+    contentDrift: [{
+      logicalKey: 'issue:phase:12', previousNodeId: 'N1', previousOwner: 'octo', previousRepo: 'repo', previousIssueNumber: 501,
+      currentNodeId: 'N2', currentOwner: 'other-owner', currentRepo: 'other-repo', currentIssueNumber: 501, crossRepository: true,
+    }],
+  });
+  const out = renderStatusV1(dto, false);
+  assert.match(out, /content-drift: 1\n {2}- issue:phase:12: octo\/repo#501 -> other-owner\/other-repo#501 \(cross-repository, map unchanged\)\n/);
 });

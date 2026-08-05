@@ -15,7 +15,7 @@ const {
   renderPhaseRegion, renderPlanRegion, renderNewPlanIssueBody, contentHash, renderFieldState, PLAN_FIELD_NAMES,
   DEPENDENCY_REF_SENTINEL,
 } = require('../gsd-core/bin/lib/github-sync-issue-body.cjs');
-const { resolveArgv } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
+const { resolveArgv, MUTATION_KIND_BUCKET } = require('../gsd-core/bin/lib/github-sync-operation.cjs');
 const { EXISTENCE_VERDICT } = require('../gsd-core/bin/lib/github-sync-existence.cjs');
 
 /** Recursively asserts no object among `inputs` carries a `body` key anywhere — proves SYNC-05/D-08's "no remote body read at all" structurally, not by convention. */
@@ -275,6 +275,8 @@ test('a desired state with zero phases produces zero operations, zero blocked en
     adoptions: [],
     // Plan 07-06 Task 1 (D-07): always present, empty when nothing applies.
     prune: [],
+    // Plan 07-12: always present, empty when nothing applies.
+    contentDrift: [],
   });
 });
 
@@ -643,6 +645,187 @@ test('adoption detection is scoped to issue:phase:*/issue:plan:* completions onl
   const remoteResolved = remoteWith({ items: [], issueNodeIds: { 77: 'ISSUE_NODE_77' } });
   const plan = planReconciliation(single, remoteResolved, map);
   assert.deepEqual(plan.adoptions, [], 'the legacy key form must never be compared against the by-number-resolved ISSUE node id');
+});
+
+// ─── Plan 07-12 (WINDOWS #10 gap closure): board-bound content-identity
+// drift — Task 1 option-b (adopt same-repository drift; report
+// cross-repository drift without acting) ───────────────────────────────────
+//
+// A project item's content silently follows its issue across a repository
+// transfer while the item's own id — and board membership — stays unchanged
+// (07-LIVE-RECOVERY.md). `bindingOnBoard`'s item-presence check alone cannot
+// tell a converged item from a drifted one; these tests drive
+// `planReconciliation`'s new drift comparison directly.
+
+const DRIFT_ID = '12';
+const DRIFT_LOGICAL_KEY = `phase:${DRIFT_ID}`;
+const DRIFT_ISSUE_KEY = issueKeyFor(DRIFT_ID);
+const DRIFT_MILESTONE_NUMBER = 9;
+
+function driftPhase(overrides = {}) {
+  return { id: DRIFT_ID, title: 'Phase Twelve', goal: 'g', requirements: [], status: '', ...overrides };
+}
+
+function driftDesired(phase) {
+  return {
+    available: true, reason: 'ok', currentPhase: DRIFT_ID,
+    phases: [phase], plans: [],
+    milestones: [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }],
+  };
+}
+
+/** The cached issue:phase:12 completion's own owner/repo/number, plus its phase:12 project-item binding — `owner`/`repo` are the fields this plan's StrictMapCompletion widening adds. */
+function driftMap({ itemNodeId = 'item-12', issueNodeId = 'ISSUE_NODE_12', owner = 'octo', repo = 'repo', issueNumber = 501, contentHashValue, fieldStateValue } = {}) {
+  return {
+    kind: 'valid',
+    map: {
+      completions: {
+        [MILESTONE_KEY]: { nodeId: 'MI_node_1', issueNumber: DRIFT_MILESTONE_NUMBER },
+        [DRIFT_LOGICAL_KEY]: { nodeId: itemNodeId, issueNumber, ...(fieldStateValue !== undefined ? { fieldState: fieldStateValue } : {}) },
+        [DRIFT_ISSUE_KEY]: { nodeId: issueNodeId, issueNumber, owner, repo, ...(contentHashValue !== undefined ? { contentHash: contentHashValue } : {}) },
+      },
+    },
+  };
+}
+
+/** The board item's CURRENT content — `item.id` always matches `driftMap`'s `itemNodeId` default ('item-12'), so `bindingOnBoard` matches by the item's own id regardless of what its content now names (the exact shape 07-LIVE-RECOVERY.md observed live). */
+function driftRemote({ itemNodeId = 'item-12', contentOwner = 'octo', contentRepo = 'repo', contentNumber = 501, contentNodeId = 'ISSUE_NODE_12' } = {}) {
+  return {
+    available: true, reason: 'ok',
+    target: { owner: 'octo', repo: 'repo', repositoryNumber: 42, projectNumber: 7, projectNodeId: 'PVT_proj_node_1' },
+    items: [{ id: itemNodeId, content: { id: contentNodeId, number: contentNumber, repository: { owner: { login: contentOwner }, name: contentRepo } } }],
+    fields: [], subIssues: [], issueNodeIds: {},
+  };
+}
+
+test('Test 5 (07-12): a bound item whose content names the same owner, repo, and number as the cached issue completion is unchanged from today — a plain no-op, zero operations, no drift entry', () => {
+  const phase = driftPhase();
+  const region = renderPhaseRegion(phase);
+  const hash = contentHash({ title: phase.title, region, milestoneNumber: DRIFT_MILESTONE_NUMBER });
+  const fieldState = renderFieldState({ gsdId: DRIFT_LOGICAL_KEY, phaseId: phase.id, requirements: [], status: '' });
+  const map = driftMap({ contentHashValue: hash, fieldStateValue: fieldState });
+  const remote = driftRemote();
+
+  const plan = planReconciliation(driftDesired(phase), remote, map);
+  assert.deepEqual(plan.contentDrift, []);
+  assert.deepEqual(plan.adoptions, []);
+  assert.deepEqual(plan.operations, []);
+  assert.deepEqual(plan.noops, [{ logicalKey: DRIFT_LOGICAL_KEY }]);
+});
+
+test('Test 6 (07-12): a bound item content naming a different repository name (owner and number identical) is detected as a cross-repository drift, reported without touching the map', () => {
+  const phase = driftPhase();
+  const map = driftMap();
+  const remote = driftRemote({ contentRepo: 'moved-repo', contentNodeId: 'ISSUE_NODE_MOVED' });
+
+  const plan = planReconciliation(driftDesired(phase), remote, map);
+  assert.deepEqual(plan.contentDrift, [{
+    logicalKey: DRIFT_ISSUE_KEY,
+    previousNodeId: 'ISSUE_NODE_12', previousOwner: 'octo', previousRepo: 'repo', previousIssueNumber: 501,
+    currentNodeId: 'ISSUE_NODE_MOVED', currentOwner: 'octo', currentRepo: 'moved-repo', currentIssueNumber: 501,
+    crossRepository: true,
+  }]);
+  assert.deepEqual(plan.adoptions, [], 'a cross-repository drift must never be routed through adoptions');
+  assert.deepEqual(plan.noops, []);
+  assert.deepEqual(plan.operations, []);
+});
+
+test('Test 7 (07-12): a bound item content naming a different owner login (repo and number identical) is detected as a cross-repository drift', () => {
+  const phase = driftPhase();
+  const map = driftMap();
+  const remote = driftRemote({ contentOwner: 'other-owner', contentNodeId: 'ISSUE_NODE_MOVED' });
+
+  const plan = planReconciliation(driftDesired(phase), remote, map);
+  assert.equal(plan.contentDrift.length, 1);
+  assert.equal(plan.contentDrift[0].crossRepository, true);
+  assert.equal(plan.contentDrift[0].currentOwner, 'other-owner');
+  assert.deepEqual(plan.adoptions, []);
+});
+
+test('Test 8 (07-12): a bound item content naming a different number within the same owner and repo is a same-repository drift, adopted through the existing adoptions path (no new write mechanism)', () => {
+  const phase = driftPhase();
+  const map = driftMap();
+  const remote = driftRemote({ contentNumber: 777, contentNodeId: 'ISSUE_NODE_777' });
+
+  const plan = planReconciliation(driftDesired(phase), remote, map);
+  assert.deepEqual(plan.contentDrift, [], 'a same-repository drift must never appear in the report-only array');
+  assert.deepEqual(plan.adoptions, [{
+    logicalKey: DRIFT_ISSUE_KEY, previousNodeId: 'ISSUE_NODE_12', resolvedNodeId: 'ISSUE_NODE_777', resolvedIssueNumber: 777,
+  }]);
+  assert.deepEqual(plan.noops, [], 'the phase is not a plain no-op the run it drifts — its whole disposition is the adoption entry');
+  assert.deepEqual(plan.operations, []);
+});
+
+test('Test 9 (07-12): an owner login differing only by letter case is detected as drift, never matched — exact string equality, never a case-insensitive comparison', () => {
+  const phase = driftPhase();
+  const map = driftMap({ owner: 'Octo' });
+  const remote = driftRemote({ contentOwner: 'octo', contentNodeId: 'ISSUE_NODE_MOVED' });
+
+  const plan = planReconciliation(driftDesired(phase), remote, map);
+  assert.equal(plan.contentDrift.length, 1, 'a case-variant owner login must be classified as drift, not silently matched');
+  assert.equal(plan.contentDrift[0].crossRepository, true);
+});
+
+test('Test 10 (07-12): the option-b disposition — an in-repository drift produces an adoption entry carrying the resolved identity, while a cross-repository drift (in the SAME run) produces a report-only entry, never a map write', () => {
+  const inRepoPhase = driftPhase({ id: '12', title: 'In-Repo Drift Phase' });
+  const crossRepoPhase = { id: '13', title: 'Cross-Repo Drift Phase', goal: 'g', requirements: [], status: '' };
+  const crossRepoIssueKey = issueKeyFor('13');
+  const desired = {
+    available: true, reason: 'ok', currentPhase: '12',
+    phases: [inRepoPhase, crossRepoPhase], plans: [],
+    milestones: [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }],
+  };
+  const map = driftMap();
+  map.map.completions['phase:13'] = { nodeId: 'item-13', issueNumber: 601 };
+  map.map.completions[crossRepoIssueKey] = { nodeId: 'ISSUE_NODE_13', issueNumber: 601, owner: 'octo', repo: 'repo' };
+  const remote = driftRemote({ contentNumber: 777, contentNodeId: 'ISSUE_NODE_777' });
+  remote.items.push({ id: 'item-13', content: { id: 'ISSUE_NODE_13_MOVED', number: 601, repository: { owner: { login: 'other-owner' }, name: 'other-repo' } } });
+
+  const plan = planReconciliation(desired, remote, map);
+  assert.deepEqual(plan.adoptions, [{
+    logicalKey: DRIFT_ISSUE_KEY, previousNodeId: 'ISSUE_NODE_12', resolvedNodeId: 'ISSUE_NODE_777', resolvedIssueNumber: 777,
+  }], 'the in-repository drift must be the only entry in adoptions');
+  assert.deepEqual(plan.contentDrift, [{
+    logicalKey: crossRepoIssueKey,
+    previousNodeId: 'ISSUE_NODE_13', previousOwner: 'octo', previousRepo: 'repo', previousIssueNumber: 601,
+    currentNodeId: 'ISSUE_NODE_13_MOVED', currentOwner: 'other-owner', currentRepo: 'other-repo', currentIssueNumber: 601,
+    crossRepository: true,
+  }], 'the cross-repository drift must be the only entry in contentDrift');
+});
+
+test('Test 11 (07-12): with the remote snapshot unavailable, no drift is detected for any completion — a failed read is never drift evidence', () => {
+  const phase = driftPhase();
+  const map = driftMap();
+  const unavailableRemote = { available: false, reason: 'remote_unavailable', items: [], fields: [], subIssues: [] };
+
+  const plan = planReconciliation(driftDesired(phase), unavailableRemote, map);
+  assert.deepEqual(plan.contentDrift, []);
+  assert.deepEqual(plan.adoptions, []);
+  assert.deepEqual(plan.uncertain, [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }]);
+});
+
+test('Test 12 (07-12): no operation emitted this run — across a same-repository and a cross-repository drift together — carries a kind absent from the frozen MUTATION_KIND_BUCKET catalog; drift disposition alone never removes, closes, or unlinks anything', () => {
+  const inRepoPhase = driftPhase({ id: '12', title: 'In-Repo Drift Phase' });
+  const crossRepoPhase = { id: '13', title: 'Cross-Repo Drift Phase', goal: 'g', requirements: [], status: '' };
+  const crossRepoIssueKey = issueKeyFor('13');
+  const desired = {
+    available: true, reason: 'ok', currentPhase: '12',
+    phases: [inRepoPhase, crossRepoPhase], plans: [],
+    milestones: [{ version: MILESTONE_VERSION, name: 'One', title: `${MILESTONE_VERSION} — One`, description: 'd', archived: false }],
+  };
+  const map = driftMap();
+  map.map.completions['phase:13'] = { nodeId: 'item-13', issueNumber: 601 };
+  map.map.completions[crossRepoIssueKey] = { nodeId: 'ISSUE_NODE_13', issueNumber: 601, owner: 'octo', repo: 'repo' };
+  const remote = driftRemote({ contentNumber: 777, contentNodeId: 'ISSUE_NODE_777' });
+  remote.items.push({ id: 'item-13', content: { id: 'ISSUE_NODE_13_MOVED', number: 601, repository: { owner: { login: 'other-owner' }, name: 'other-repo' } } });
+
+  const plan = planReconciliation(desired, remote, map);
+  for (const op of plan.operations) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(MUTATION_KIND_BUCKET, op.kind),
+      `operation kind "${op.kind}" is not a member of the frozen MUTATION_KIND_BUCKET catalog (create/update only — never a delete/close/unlink)`,
+    );
+  }
 });
 
 // ─── Plan 05-07: the sub-issue-per-parent ceiling warning ─────────────────

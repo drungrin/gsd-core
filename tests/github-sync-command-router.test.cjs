@@ -2401,6 +2401,55 @@ describe('github-sync router: plan 07-05 Task 2 — D-13 node-ID adoption persis
     assert.equal(process.exitCode, 0);
   });
 
+  // Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b, Rule 2 fix): a
+  // same-repository content-identity drift adoption also carries a
+  // corrected `resolvedIssueNumber` — the merge step must persist BOTH the
+  // resolved node id and the resolved issue number, never one without the
+  // other (a nodeId-only merge would leave the completion pointing at the
+  // OLD issue number while its node id names a different issue).
+  test('sync persists a resolvedIssueNumber alongside a resolvedNodeId when the adoption entry carries one, still through one mergeCompletion call', () => {
+    const initialMap = realMap.recordCompletion(null, issuePhaseCompletion());
+    let stored = initialMap;
+    const writeCalls = [];
+    const cap = captureStdout();
+    try {
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'sync'], cwd: '/fixture', raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _auth: { runPreflight: () => ({ ok: true, reason: 'ok', message: 'ok' }) },
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        _map: {
+          readSyncMapStrict: () => ({ kind: 'valid', map: stored }),
+          recordCompletion: (current, completion) => realMap.recordCompletion(current, completion),
+          mergeCompletion: (previous, next, options) => realMap.mergeCompletion(previous, next, options),
+          writeSyncMapAtomically: (cwd, map) => { writeCalls.push(map); stored = map; },
+        },
+        _remote: { readRemoteSnapshot: () => ({ available: true }) },
+        _reconcile: {
+          planReconciliation: () => ({
+            operations: [{ logicalKey: 'phase:05', args: ['contentId=ISSUE_NEW'] }],
+            noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [],
+            adoptions: [{ logicalKey: 'issue:phase:05', previousNodeId: 'ISSUE_OLD', resolvedNodeId: 'ISSUE_NEW', resolvedIssueNumber: 777 }],
+          }),
+        },
+        _issueUpdate: { prepareIssueUpdates: () => ({ operations: [], reports: [] }) },
+        _apply: { applyMutationPlan: () => ({ kind: 'completed', outcomes: [] }) },
+      });
+    } finally { cap.restore(); }
+
+    assert.equal(writeCalls.length, 1, 'the adoption write happens exactly once');
+    const written = writeCalls[0].completions['issue:phase:05'];
+    assert.equal(written.nodeId, 'ISSUE_NEW');
+    assert.equal(written.issueNumber, 777, 'the completion\'s own issueNumber must be corrected alongside its node id, never left stale');
+    // D-08's wholesale-replace trap: every other previously recorded member must survive.
+    assert.equal(written.contentHash, 'hash-abc');
+    assert.equal(written.fieldState, '{"status":"Todo"}');
+    assert.equal(written.owner, TARGET.owner);
+    assert.equal(process.exitCode, 0);
+  });
+
   test('sync writes nothing when plan.adoptions is empty', () => {
     const initialMap = realMap.recordCompletion(null, issuePhaseCompletion());
     let writeCalls = 0;
