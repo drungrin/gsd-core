@@ -71,7 +71,15 @@ interface Page {
 // decoders alike (cycle-2 HIGH-H).
 const DOCUMENTS = Object.freeze({
   project: 'query($login:String!,$projectNumber:Int!) { # github-sync:project\n repositoryOwner(login:$login) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { id } } } }',
-  items: 'query($login:String!,$projectNumber:Int!,$endCursor:String) { # github-sync:items\n repositoryOwner(login:$login) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { items(first:100,after:$endCursor) { nodes { id content { ... on Issue { id number } } } pageInfo { hasNextPage endCursor } } } } } }',
+  // Plan 07-12 (WINDOWS #10 gap closure): the Issue fragment also selects
+  // the bound issue's own repository identity (owner login + repository
+  // name) — a Project v2 item's `content` silently follows its issue across
+  // a repository transfer while the item's own id and board membership stay
+  // unchanged (07-LIVE-RECOVERY.md), so `bindingOnBoard`'s item-presence
+  // check alone can no longer tell a converged item from a drifted one.
+  // This identity is the input `github-sync-reconcile.cts`'s new drift
+  // comparison needs to detect that case.
+  items: 'query($login:String!,$projectNumber:Int!,$endCursor:String) { # github-sync:items\n repositoryOwner(login:$login) { ... on ProjectV2Owner { projectV2(number:$projectNumber) { items(first:100,after:$endCursor) { nodes { id content { ... on Issue { id number repository { owner { login } name } } } } pageInfo { hasNextPage endCursor } } } } } }',
   // ProjectV2.fields.nodes resolves to the ProjectV2FieldConfiguration union
   // (ProjectV2Field | ProjectV2IterationField | ProjectV2SingleSelectField).
   // Scalars can't be selected directly on a union (GitHub rejects it live with
@@ -109,6 +117,41 @@ function hasExplicitNotFoundError(errors: unknown): boolean {
   return Array.isArray(errors) && errors.length > 0 && errors.every((entry) => (
     entry !== null && typeof entry === 'object' && (entry as { type?: unknown }).type === 'NOT_FOUND'
   ));
+}
+
+/**
+ * Plan 07-12 (WINDOWS #10 gap closure): validates the widened `items`
+ * document's per-item content repository identity shape. Only a PRESENT
+ * `repository` sub-object is validated — its absence is tolerated (a node
+ * whose content is not an Issue at all, or any fixture/response predating
+ * this plan's widening, never carries the key), so this check is purely
+ * additive and never a new failure mode for a shape that never requested
+ * the field. A PRESENT but malformed `repository` (a non-object value, a
+ * missing/empty/non-string `name`, a non-object `owner`, or a missing/
+ * empty/non-string `owner.login`) fails the PAGE closed rather than
+ * decoding to a partial identity — the same fail-closed contract
+ * `collectIssueNumbers` below already holds for `content.number`, extended
+ * to the sibling field this plan adds beside it. Meaningful only for the
+ * `items` document: `fields`/`subIssues` nodes carry no `content` key at
+ * all, so this check is a no-op for them (`Object.hasOwn` skips every node).
+ */
+function hasValidContentRepositoryShape(nodes: RemoteNode[]): boolean {
+  for (const node of nodes) {
+    if (!Object.hasOwn(node, 'content')) continue;
+    const content = node.content;
+    if (content === null || typeof content !== 'object' || Array.isArray(content)) continue;
+    const contentObj = content as Record<string, unknown>;
+    if (!Object.hasOwn(contentObj, 'repository')) continue;
+    const repository = contentObj.repository;
+    if (repository === null || typeof repository !== 'object' || Array.isArray(repository)) return false;
+    const repoObj = repository as Record<string, unknown>;
+    if (typeof repoObj.name !== 'string' || repoObj.name.length === 0) return false;
+    const owner = repoObj.owner;
+    if (owner === null || typeof owner !== 'object' || Array.isArray(owner)) return false;
+    const login = (owner as Record<string, unknown>).login;
+    if (typeof login !== 'string' || login.length === 0) return false;
+  }
+  return true;
 }
 
 /**
@@ -151,6 +194,10 @@ function decodePage(result: GhResult, path: string[]): Page | null {
   const pageInfo = (connection as { pageInfo?: unknown }).pageInfo;
   if (!Array.isArray(nodes) || pageInfo === null || typeof pageInfo !== 'object') return null;
   if (!nodes.every((node) => node !== null && typeof node === 'object')) return null;
+  // Plan 07-12: a present-but-malformed content.repository fails the PAGE
+  // closed, before pageInfo is even inspected — see
+  // hasValidContentRepositoryShape's own doc comment.
+  if (!hasValidContentRepositoryShape(nodes as RemoteNode[])) return null;
   const hasNextPage = (pageInfo as { hasNextPage?: unknown }).hasNextPage;
   const endCursor = (pageInfo as { endCursor?: unknown }).endCursor;
   if (typeof hasNextPage !== 'boolean' || (endCursor !== null && typeof endCursor !== 'string')) return null;

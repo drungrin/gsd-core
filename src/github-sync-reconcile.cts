@@ -207,7 +207,14 @@ interface DesiredPlan {
   complete?: boolean;
 }
 interface DesiredState { available: boolean; reason: string; phases: DesiredPhase[]; plans?: DesiredPlan[]; milestones?: DesiredMilestone[]; }
-interface RemoteItem { id?: unknown; content?: { id?: unknown; number?: unknown } | null; }
+/**
+ * Plan 07-12 (WINDOWS #10 gap closure): `content.repository` widens the
+ * shape `github-sync-remote.cts`'s `DOCUMENTS.items` now selects — the
+ * bound issue's own repository identity, present only when `content`
+ * resolves (an Issue, not a draft/PR/null). Optional so every pre-07-12
+ * fixture (which never sets it) still type-checks.
+ */
+interface RemoteItem { id?: unknown; content?: { id?: unknown; number?: unknown; repository?: { owner?: { login?: unknown } | null; name?: unknown } | null } | null; }
 /**
  * Plan 05-07: only the two fields the per-parent sub-issue ceiling count
  * needs — `readRemoteSnapshot` (`github-sync-remote.cts`) tags every node
@@ -233,6 +240,18 @@ interface StrictMapCompletion {
   /** D-08/D-09, consulted by Task 1's prune gate (D-07): the same two-flat-scalar absence marker `github-sync-existence.cts` widens `SyncCompletion` with. */
   absenceCount?: number;
   absenceFirstSeenAt?: string;
+  /**
+   * Plan 07-12 (WINDOWS #10 gap closure): the real `SyncCompletion`
+   * (`github-sync-map.cts`) always carries these — every completion in a
+   * given map is validated to share the SAME owner/repo as the map's own
+   * single `repository` binding (`isSyncMap`'s own per-completion check),
+   * so this is the cached identity `detectContentDrift` compares a bound
+   * item's CURRENT content identity against. Optional here only so a
+   * pre-07-12 hand-built fixture (which never sets them) still type-checks
+   * — never optional on the real, on-disk completion.
+   */
+  owner?: string;
+  repo?: string;
 }
 interface StrictMap { kind: 'absent' | 'valid' | 'blocking'; reason?: string; map?: { completions?: Record<string, StrictMapCompletion> }; }
 
@@ -288,6 +307,42 @@ interface AdoptionEntry {
   logicalKey: string;
   previousNodeId: string;
   resolvedNodeId: string;
+  /**
+   * Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b): present ONLY for
+   * a same-repository content-identity drift adoption whose resolved issue
+   * number differs from the one cached — absent for D-13's own plain
+   * node-id re-resolution above, whose number never changes. The router's
+   * existing adoption-persistence step merges this in beside `resolvedNodeId`
+   * when present, still through `mergeCompletion` — no new write path.
+   */
+  resolvedIssueNumber?: number;
+}
+
+/**
+ * Plan 07-12 (WINDOWS #10 gap closure): an issue-identity completion
+ * (`issue:phase:<id>` / `issue:plan:<id>`) whose corresponding project-item
+ * completion IS bound on the board (`bindingOnBoard`'s own predicate — see
+ * `boundItemContentIdentity`) but whose bound item's CURRENT content
+ * identity (owner login, repository name, issue number) disagrees with the
+ * cached issue completion in at least one of the three. `crossRepository`
+ * is true when the owner or the repository name differs (never the number
+ * alone) — Task 1's option-b decision routes an in-repository drift through
+ * the existing `adoptions` array above and a cross-repository drift through
+ * this report-only array instead, never touching the map for the latter
+ * (the map's single `repository` binding — D-21/`readSyncMapStrict` — can
+ * never be repointed at a repository the developer did not configure).
+ */
+interface ContentDriftEntry {
+  logicalKey: string;
+  previousNodeId: string;
+  previousOwner: string;
+  previousRepo: string;
+  previousIssueNumber: number;
+  currentNodeId: string;
+  currentOwner: string;
+  currentRepo: string;
+  currentIssueNumber: number;
+  crossRepository: boolean;
 }
 
 /**
@@ -360,6 +415,15 @@ interface ReconciliationPlan {
    * `pruneCompletions`.
    */
   prune: Array<{ logicalKey: string }>;
+  /**
+   * Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b): always present,
+   * empty when nothing applies — matches every neighbouring array above.
+   * Carries ONLY the cross-repository drifts (a same-repository drift is
+   * routed through `adoptions` instead, per Task 1's decision); never gates,
+   * never removes or corrects anything on its own — the map is left exactly
+   * as it was for every entry named here.
+   */
+  contentDrift: ContentDriftEntry[];
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -1159,15 +1223,82 @@ function buildPlanIssueStateOperation(
   };
 }
 
-function bindingOnBoard(completion: { nodeId: string; issueNumber?: number } | undefined, remote: RemoteSnapshot): boolean {
-  if (!completion) return false;
+/**
+ * Plan 07-12 (WINDOWS #10 gap closure): the SAME item-matching predicate
+ * `bindingOnBoard` below already ran (id match first, then a content-number
+ * fallback) — extracted so `boundItemContentIdentity` can read the matched
+ * item's CURRENT content off the identical match, never a re-derived one
+ * (P2 D-12's shared-predicate rule: the two can never disagree about which
+ * item a completion is bound to). `bindingOnBoard` itself is unchanged
+ * behavior, byte-for-byte — a thin `!== null` wrapper around this.
+ */
+function matchedBoardItem(completion: { nodeId: string; issueNumber?: number } | undefined, remote: RemoteSnapshot): RemoteItem | null {
+  if (!completion) return null;
   for (const item of remote.items ?? []) {
-    if (isNonEmptyString(item.id) && item.id === completion.nodeId) return true;
+    if (isNonEmptyString(item.id) && item.id === completion.nodeId) return item;
     const content = item.content;
     if (content === null || typeof content !== 'object') continue;
-    if (completion.issueNumber !== undefined && content.number === completion.issueNumber && isNonEmptyString(content.id)) return true;
+    if (completion.issueNumber !== undefined && content.number === completion.issueNumber && isNonEmptyString(content.id)) return item;
   }
-  return false;
+  return null;
+}
+
+function bindingOnBoard(completion: { nodeId: string; issueNumber?: number } | undefined, remote: RemoteSnapshot): boolean {
+  return matchedBoardItem(completion, remote) !== null;
+}
+
+/**
+ * Plan 07-12 (WINDOWS #10 gap closure): the owner login + repository name a
+ * board item's content carries, when `content.repository` is present and
+ * well-formed — `null` for a draft/PR item (`content` null), an item whose
+ * content predates this plan's widened `items` document (no `repository`
+ * key at all), or a malformed `repository` sub-object (`decodePage` in
+ * `github-sync-remote.cts` already fails such a page closed before this
+ * function ever runs against it — this is a second, defensive check for any
+ * caller that builds a `RemoteItem` directly, e.g. a test fixture, rather
+ * than through the real reader).
+ */
+function contentRepositoryIdentityFor(item: RemoteItem): { owner: string; repo: string } | null {
+  const content = item.content;
+  if (content === null || content === undefined || typeof content !== 'object') return null;
+  const repository = content.repository;
+  if (repository === null || repository === undefined || typeof repository !== 'object') return null;
+  const name = repository.name;
+  if (typeof name !== 'string' || name.length === 0) return null;
+  const ownerObj = repository.owner;
+  if (ownerObj === null || ownerObj === undefined || typeof ownerObj !== 'object') return null;
+  const login = ownerObj.login;
+  if (typeof login !== 'string' || login.length === 0) return null;
+  return { owner: login, repo: name };
+}
+
+/**
+ * Plan 07-12 (WINDOWS #10 gap closure): the bound item's CURRENT content
+ * identity (node id, owner, repo, issue number) for a completion whose
+ * binding is on the board — built on `matchedBoardItem`, the SAME function
+ * `bindingOnBoard` itself now delegates to, so this can never disagree with
+ * `bindingOnBoard` about which item a completion is bound to. Returns
+ * `null` when the completion is not bound, the matched item's content is
+ * not an Issue (draft/PR/null), the matched item's number is not a valid
+ * positive safe integer (`collectIssueNumbers`' own guard,
+ * `github-sync-remote.cts`, restated here since this helper reads the same
+ * content shape from a different entry point), or the content's repository
+ * identity is absent/malformed.
+ */
+function boundItemContentIdentity(
+  completion: { nodeId: string; issueNumber?: number } | undefined,
+  remote: RemoteSnapshot,
+): { nodeId: string; owner: string; repo: string; number: number } | null {
+  const item = matchedBoardItem(completion, remote);
+  if (!item) return null;
+  const content = item.content;
+  if (content === null || content === undefined || typeof content !== 'object') return null;
+  if (!isNonEmptyString(content.id)) return null;
+  const number = content.number;
+  if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) return null;
+  const identity = contentRepositoryIdentityFor(item);
+  if (identity === null) return null;
+  return { nodeId: content.id, owner: identity.owner, repo: identity.repo, number };
 }
 
 function resolvedIssueNodeId(issueNodeIds: RemoteSnapshot['issueNodeIds'], issueNumber: number | undefined): string | null {
@@ -1210,6 +1341,69 @@ function detectAdoptions(
     }
   }
   return adoptions.sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, undefined, { numeric: true }));
+}
+
+/**
+ * Plan 07-12 (WINDOWS #10 gap closure): the `phase:<id>`/`plan:<id>`
+ * project-item key an `issue:phase:<id>`/`issue:plan:<id>` key names — the
+ * completion `bindingOnBoard`/`boundItemContentIdentity` actually match
+ * against, since board membership is tracked on the ITEM, not the issue.
+ * `null` for any other key (mirrors `orphanPhaseIdFromKey`/
+ * `orphanPlanIdFromKey`'s own closed dispatch).
+ */
+function projectItemKeyForIssueKey(issueKey: string): string | null {
+  if (issueKey.startsWith(ISSUE_PHASE_KEY_PREFIX)) return PHASE_KEY_PREFIX + issueKey.slice(ISSUE_PHASE_KEY_PREFIX.length);
+  if (issueKey.startsWith(ISSUE_PLAN_KEY_PREFIX)) return PLAN_KEY_PREFIX + issueKey.slice(ISSUE_PLAN_KEY_PREFIX.length);
+  return null;
+}
+
+/**
+ * Plan 07-12 (WINDOWS #10 gap closure): one drift entry per issue-identity
+ * completion (scoped to `ADOPTABLE_KEY_PREFIXES`, the exact reason
+ * `detectAdoptions` above scopes there — a legacy `phase:<id>`/`plan:<id>`
+ * completion carries the project ITEM's node id, not the issue's, so
+ * comparing it against a content identity would misfire on every run)
+ * whose project-item completion is bound on the board AND whose bound
+ * item's CURRENT content identity disagrees with the cached issue
+ * completion's own `(owner, repo, number)` in at least one of the three —
+ * an exact match on all three is never reported (Test 5's plain no-op).
+ * Computed once, over every completion in the map, mirroring
+ * `detectAdoptions`' own once-before-either-loop shape and sort. A
+ * completion whose `owner`/`repo` were never recorded (a pre-07-12 map
+ * entry — see `StrictMapCompletion`'s own doc comment) is skipped, not
+ * misread as drifted: there is nothing to compare against.
+ */
+function detectContentDrift(
+  completions: Record<string, StrictMapCompletion>,
+  remote: RemoteSnapshot,
+): ContentDriftEntry[] {
+  const drifts: ContentDriftEntry[] = [];
+  for (const [logicalKey, entry] of Object.entries(completions)) {
+    if (!entry || !isNonEmptyString(entry.nodeId)) continue;
+    if (!ADOPTABLE_KEY_PREFIXES.some((prefix) => logicalKey.startsWith(prefix))) continue;
+    if (entry.issueNumber === undefined || !isNonEmptyString(entry.owner) || !isNonEmptyString(entry.repo)) continue;
+    const itemKey = projectItemKeyForIssueKey(logicalKey);
+    if (!itemKey) continue;
+    const identity = boundItemContentIdentity(completions[itemKey], remote);
+    if (!identity) continue;
+    const sameOwner = identity.owner === entry.owner;
+    const sameRepo = identity.repo === entry.repo;
+    const sameNumber = identity.number === entry.issueNumber;
+    if (sameOwner && sameRepo && sameNumber) continue;
+    drifts.push({
+      logicalKey,
+      previousNodeId: entry.nodeId,
+      previousOwner: entry.owner,
+      previousRepo: entry.repo,
+      previousIssueNumber: entry.issueNumber,
+      currentNodeId: identity.nodeId,
+      currentOwner: identity.owner,
+      currentRepo: identity.repo,
+      currentIssueNumber: identity.number,
+      crossRepository: !sameOwner || !sameRepo,
+    });
+  }
+  return drifts.sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, undefined, { numeric: true }));
 }
 
 /**
@@ -1275,7 +1469,7 @@ function planReconciliation(
   /** Plan 07-06 Task 1 (D-09 discretion): the clock input the prune gate's elapsed-time rule needs — an injected instant, never read via `Date.now()` inside this pure stage. Omitted (or empty), the gate can never be satisfied, so a pre-existing call site that never threads a clock produces zero prunes, unchanged from before this task. */
   now?: string,
 ): ReconciliationPlan {
-  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [], adoptions: [], prune: [] };
+  const empty = { operations: [], noops: [], pendingIssueUpdates: [], orphans: [], pendingFieldChanges: [], subIssueCeilingWarnings: [], adoptions: [], prune: [], contentDrift: [] };
   if (!desired.available) return { ...empty, blocked: [{ reason: OPERATION_REASON.DESIRED_UNAVAILABLE, detail: desired.reason }], uncertain: [] };
   if (!remote.available) return { ...empty, blocked: [], uncertain: [{ reason: OPERATION_REASON.REMOTE_UNAVAILABLE }] };
   if (strictMap.kind === 'blocking') return { ...empty, blocked: [{ reason: OPERATION_REASON.MAP_BLOCKING, detail: strictMap.reason ?? 'invalid' }], uncertain: [] };
@@ -1302,6 +1496,27 @@ function planReconciliation(
   // two "issue exists but not yet bound" branches below consult instead of
   // the completion's own (possibly stale) `nodeId`.
   const adoptions = detectAdoptions(completions, remote.issueNodeIds);
+
+  // Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b): computed once,
+  // before either loop, mirroring `detectAdoptions` above. A
+  // same-repository drift is folded into `adoptions` (no new write path —
+  // the router's existing adoption-persistence step now also merges
+  // `resolvedIssueNumber` when present); a cross-repository drift is never
+  // added to `adoptions` — it is named in `contentDrift` only, and the map
+  // is never touched for it.
+  const contentDrift = detectContentDrift(completions, remote);
+  for (const drift of contentDrift) {
+    if (drift.crossRepository) continue;
+    adoptions.push({
+      logicalKey: drift.logicalKey,
+      previousNodeId: drift.previousNodeId,
+      resolvedNodeId: drift.currentNodeId,
+      resolvedIssueNumber: drift.currentIssueNumber,
+    });
+  }
+  adoptions.sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, undefined, { numeric: true }));
+  const crossRepositoryContentDrift = contentDrift.filter((drift) => drift.crossRepository);
+  const driftedIssueKeys = new Set(contentDrift.map((drift) => drift.logicalKey));
   const adoptedNodeIdFor = new Map(adoptions.map((entry) => [entry.logicalKey, entry.resolvedNodeId]));
 
   const operations: ReconciliationPlan['operations'] = [];
@@ -1325,6 +1540,18 @@ function planReconciliation(
         noops.push({ logicalKey });
         continue;
       }
+      // Plan 07-12 (WINDOWS #10 gap closure): the bound item's content has
+      // drifted from what `issueCompletion` still caches — the item is
+      // "already bound" by id, but the ISSUE it now points at is not the one
+      // `contentHash`/`milestoneNumber` below were computed against. Trust
+      // neither this run: the drift's own disposition (already computed
+      // above, before either loop — an `adoptions` entry for a
+      // same-repository drift, a `contentDrift` report entry for a
+      // cross-repository one) is this phase's whole handling for this run.
+      // The NEXT run, against either the corrected map (in-repository) or an
+      // unchanged one a developer can act on (cross-repository), evaluates
+      // convergence cleanly.
+      if (driftedIssueKeys.has(issueKey)) continue;
       if (!milestoneCompletion || milestoneCompletion.issueNumber === undefined) {
         // The issue exists, but its milestone can no longer be resolved to a
         // number (e.g. the milestone completion was lost) — the freshly
@@ -1449,6 +1676,11 @@ function planReconciliation(
         noops.push({ logicalKey: planLogicalKey });
         continue;
       }
+      // Plan 07-12 (WINDOWS #10 gap closure): mirrors the phase loop's
+      // identical guard above — the drift's own disposition (already
+      // computed before either loop) is this plan's whole handling for this
+      // run.
+      if (driftedIssueKeys.has(planIssueKey)) continue;
       if (!milestoneCompletionForPlans || milestoneCompletionForPlans.issueNumber === undefined) {
         blocked.push({ reason: OPERATION_REASON.MILESTONE_UNRESOLVED, detail: planLogicalKey });
         continue;
@@ -1748,7 +1980,7 @@ function planReconciliation(
     blocked.push({ reason: OPERATION_REASON.EXISTENCE_UNKNOWN, detail: verdict.logicalKey });
   }
 
-  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges, subIssueCeilingWarnings, adoptions, prune };
+  return { operations, noops, blocked, uncertain: [], pendingIssueUpdates, orphans, pendingFieldChanges, subIssueCeilingWarnings, adoptions, prune, contentDrift: crossRepositoryContentDrift };
 }
 
 export = {

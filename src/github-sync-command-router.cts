@@ -1075,7 +1075,7 @@ function routeGithubSyncCommandRouter({
                     // checkpointed, so a resumed run picks up where it left off.
                     const plan = reconcile.planReconciliation(planningDesiredState, planningRemoteSnapshot, planningStrictMap, existenceVerdicts, nowIso) as {
                       operations: unknown[]; pendingIssueUpdates?: unknown[]; subIssueCeilingWarnings?: unknown[];
-                      adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
+                      adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string; resolvedIssueNumber?: number }>;
                       prune?: Array<{ logicalKey: string }>;
                     };
 
@@ -1094,13 +1094,28 @@ function routeGithubSyncCommandRouter({
                     // absence-marker step above (T-07-04): `status` computes
                     // the identical `plan.adoptions` array for its own report
                     // but this branch never runs for it.
+                    //
+                    // Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b,
+                    // Rule 2 fix): a same-repository content-identity drift
+                    // adoption ALSO carries a corrected `resolvedIssueNumber`
+                    // — merging only `nodeId` for that case would leave the
+                    // completion's own `issueNumber` field stale and pointing
+                    // at a DIFFERENT issue than the newly-adopted node id
+                    // now names, a worse state than not adopting at all. Still
+                    // one `mergeCompletion` call, no new write path — the
+                    // field is simply omitted (not even `undefined`) for
+                    // D-13's own plain node-id re-resolution, whose number
+                    // never changes.
                     if (Array.isArray(plan.adoptions) && plan.adoptions.length > 0 && planningStrictMap?.kind === 'valid') {
                       const adoptionCompletions = ((planningStrictMap.map as { completions?: Record<string, unknown> } | undefined)?.completions ?? {}) as Record<string, { nodeId?: string } | undefined>;
                       let adoptedMap: unknown = planningStrictMap.map;
                       for (const adoption of plan.adoptions) {
                         const existingCompletion = adoptionCompletions[adoption.logicalKey];
                         if (!existingCompletion) continue;
-                        const mergedAdoption = map.mergeCompletion(existingCompletion, { nodeId: adoption.resolvedNodeId });
+                        const mergedAdoption = map.mergeCompletion(existingCompletion, {
+                          nodeId: adoption.resolvedNodeId,
+                          ...(adoption.resolvedIssueNumber !== undefined ? { issueNumber: adoption.resolvedIssueNumber } : {}),
+                        });
                         adoptedMap = map.recordCompletion(adoptedMap, mergedAdoption);
                       }
                       map.writeSyncMapAtomically(cwd, adoptedMap);

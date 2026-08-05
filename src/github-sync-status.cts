@@ -79,6 +79,17 @@ interface ReconciliationPlan {
   adoptions?: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
   /** Plan 07-06 Task 1 (D-07): optional so a pre-07-06-shaped plan fixture still type-checks and renders as empty. */
   prune?: Array<{ logicalKey: string }>;
+  /**
+   * Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b): optional so a
+   * pre-07-12-shaped plan fixture still type-checks and renders as empty.
+   * Carries ONLY a cross-repository content-identity drift a bound project
+   * item's content named — a same-repository drift is adopted instead and
+   * surfaces through `adoptions` above.
+   */
+  contentDrift?: Array<{
+    logicalKey: string; previousOwner: string; previousRepo: string; previousIssueNumber: number;
+    currentOwner: string; currentRepo: string; currentIssueNumber: number;
+  }>;
 }
 
 /** Plan 07-06 Task 2/3 (D-03): the existence classification and D-01's rebuild-scope preview — computed once by the router (the same `classifyExistence`/`runBootstrapTwoPass` calls `sync` makes, apply/map-write withheld) and handed here as already-typed data, never re-derived from a raw completions map. */
@@ -117,6 +128,16 @@ interface StatusV1 {
   adoptions: Array<{ logicalKey: string; previousNodeId: string; resolvedNodeId: string }>;
   /** Plan 07-06 Task 1 (D-07): always present, empty when nothing applies — matches every other group. Reports every prune this run would apply (or, from `sync`, has just applied); never gates. */
   prune: string[];
+  /**
+   * Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b): always present,
+   * empty when nothing applies — matches every other group. A
+   * cross-repository content-identity drift named by logical key and both
+   * identities; never gates, never corrects the map on its own.
+   */
+  contentDrift: Array<{
+    logicalKey: string; previousOwner: string; previousRepo: string; previousIssueNumber: number;
+    currentOwner: string; currentRepo: string; currentIssueNumber: number;
+  }>;
   /** Plan 07-06 Task 2 (D-06): counts by verdict, plus the logical keys of every object this run could not read — the same objects already named individually in `blocked` under `EXISTENCE_UNKNOWN`. */
   existence: { present: number; confirmedAbsent: number; unknown: number; unknownKeys: string[] };
   /** Plan 07-06 Task 2 (D-08/D-09): the per-object absence count and first-seen timestamp for every completion currently carrying one. */
@@ -171,7 +192,7 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
         blocked: [remote.field === undefined ? { reason: remote.reason } : { reason: remote.reason, detail: remote.field }],
         uncertain: [],
         orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
-        adoptions: [], prune: [], existence: EMPTY_EXISTENCE, absences: [], rebuildScope: EMPTY_REBUILD_SCOPE,
+        adoptions: [], prune: [], contentDrift: [], existence: EMPTY_EXISTENCE, absences: [], rebuildScope: EMPTY_REBUILD_SCOPE,
         limitations: ['The local github_sync.target configuration is invalid; no remote read was attempted.'],
       };
     }
@@ -191,7 +212,7 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
         blocked: [{ reason: remote.reason }],
         uncertain: [],
         orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
-        adoptions: [], prune: [], existence, absences, rebuildScope,
+        adoptions: [], prune: [], contentDrift: [], existence, absences, rebuildScope,
         limitations: [PROJECT_ABSENT_LIMITATION],
       };
     }
@@ -199,11 +220,11 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
       version: STATUS_SCHEMA_VERSION, available: false, message: UNAVAILABLE_MESSAGE,
       creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
       orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
-      adoptions: [], prune: [], existence: EMPTY_EXISTENCE, absences: [], rebuildScope: EMPTY_REBUILD_SCOPE,
+      adoptions: [], prune: [], contentDrift: [], existence: EMPTY_EXISTENCE, absences: [], rebuildScope: EMPTY_REBUILD_SCOPE,
       limitations: ['Remote data is currently unavailable; no changes were made.'],
     };
   }
-  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], pendingFieldChanges: [], orphans: [], subIssueCeilingWarnings: [], adoptions: [], prune: [] };
+  const safePlan = plan ?? { operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [], pendingFieldChanges: [], orphans: [], subIssueCeilingWarnings: [], adoptions: [], prune: [], contentDrift: [] };
   const { existence, absences, rebuildScope } = buildExistenceSummary(existenceSummary);
   return {
     version: STATUS_SCHEMA_VERSION, available: true,
@@ -222,6 +243,9 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
     subIssueCeilingWarnings: (safePlan.subIssueCeilingWarnings ?? []).map(({ phaseId, issueNumber, count, limit }) => ({ phaseId, issueNumber, count, limit })),
     adoptions: (safePlan.adoptions ?? []).map(({ logicalKey, previousNodeId, resolvedNodeId }) => ({ logicalKey, previousNodeId, resolvedNodeId })),
     prune: (safePlan.prune ?? []).map(({ logicalKey }) => logicalKey),
+    contentDrift: (safePlan.contentDrift ?? []).map(({ logicalKey, previousOwner, previousRepo, previousIssueNumber, currentOwner, currentRepo, currentIssueNumber }) => (
+      { logicalKey, previousOwner, previousRepo, previousIssueNumber, currentOwner, currentRepo, currentIssueNumber }
+    )),
     existence, absences, rebuildScope,
     // Plan 07-10 Task 3 (D-01 option-d): omitted entirely (not even with
     // `configured` undefined) unless the caller reports an actual divergence
@@ -335,6 +359,13 @@ function renderStatusV1(status: StatusV1, raw: boolean): string {
   // Plan 07-06 Task 1 (D-07): a prune renders as the removed key alone — the
   // single destructive act anywhere in this phase, named explicitly (T-07-20).
   appendGroup('prune', status.prune);
+  // Plan 07-12 (WINDOWS #10 gap closure, Task 1 option-b): a cross-repository
+  // content drift renders as its logical key and both full identities, so a
+  // developer sees exactly which repository/number the bound item now names
+  // and why the map was left untouched.
+  appendGroup('content-drift', status.contentDrift.map(({ logicalKey, previousOwner, previousRepo, previousIssueNumber, currentOwner, currentRepo, currentIssueNumber }) => (
+    `${logicalKey}: ${previousOwner}/${previousRepo}#${previousIssueNumber} -> ${currentOwner}/${currentRepo}#${currentIssueNumber} (cross-repository, map unchanged)`
+  )));
   appendExistenceAbsenceRebuildScopeLines(lines, status);
   // Plan 07-10 Task 3 (D-01 option-d): only rendered when `projectTarget` is
   // present at all (the divergence case) — a developer reading config alone
