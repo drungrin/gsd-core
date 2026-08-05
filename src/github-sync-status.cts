@@ -16,6 +16,17 @@ const { EXISTENCE_VERDICT } = existenceMod;
 const STATUS_SCHEMA_VERSION = 1;
 const UNAVAILABLE_MESSAGE = 'github-sync status is unavailable because GitHub could not be read. Retry shortly.';
 
+// Plan 07-11 Task 1 (D-03 gap closure, GAP 3 of 07-VERIFICATION.md): a
+// confirmed, explicit project absence (`REMOTE_REASON.PROJECT_ABSENT`,
+// github-sync-remote.cts) is not "the read failed" (T-07-39) — it is the
+// specific case D-01's rebuild machinery exists to predict. The board itself
+// is genuinely unreadable (`available: false` is honest), but the
+// existence/absences/rebuildScope this run's own classification already
+// computed are real facts worth reporting, unlike the generic catch-all's
+// empty summary.
+const PROJECT_ABSENT_MESSAGE = 'github-sync status is unavailable because the configured GitHub Project does not resolve; it may have been deleted.';
+const PROJECT_ABSENT_LIMITATION = 'The existence and rebuild-scope details below describe what a rebuild would create, not what is currently on the board.';
+
 // G-02-4: a local github_sync.target fault is a local configuration fault,
 // not a GitHub outage — "Retry shortly" is actively wrong advice for it, and
 // no field was ever named. Every entry below is a reviewed, whole fixed
@@ -164,6 +175,26 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
         limitations: ['The local github_sync.target configuration is invalid; no remote read was attempted.'],
       };
     }
+    // Plan 07-11 Task 1 (D-03 gap closure): distinct from the generic
+    // catch-all below — the router's widened preview gate (D-03) reaches
+    // existence classification and the rebuild-scope preview EVEN when the
+    // project itself is confirmed absent (the board is unreadable, but what
+    // a rebuild would create is knowable). Every OTHER unavailable reason
+    // (a failed read, a decode mismatch, the plain `remote_unavailable`
+    // default) still falls through to the catch-all's empty summary,
+    // unchanged (T-07-39's spoofing mitigation).
+    if (remote.reason === 'project_absent') {
+      const { existence, absences, rebuildScope } = buildExistenceSummary(existenceSummary);
+      return {
+        version: STATUS_SCHEMA_VERSION, available: false, message: PROJECT_ABSENT_MESSAGE,
+        creates: [], updates: [], noops: [],
+        blocked: [{ reason: remote.reason }],
+        uncertain: [],
+        orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
+        adoptions: [], prune: [], existence, absences, rebuildScope,
+        limitations: [PROJECT_ABSENT_LIMITATION],
+      };
+    }
     return {
       version: STATUS_SCHEMA_VERSION, available: false, message: UNAVAILABLE_MESSAGE,
       creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
@@ -204,6 +235,36 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
 }
 
 /**
+ * Plan 07-11 Task 1 (D-03 gap closure): the existence/absences/rebuild-scope
+ * group lines, extracted so both the available branch below AND the new
+ * `project_absent` unavailable branch (which carries a REAL preview, not the
+ * `EMPTY_*` constants) can render them identically — never two copies of the
+ * same three group lines drifting apart.
+ */
+function appendExistenceAbsenceRebuildScopeLines(lines: string[], status: Pick<StatusV1, 'existence' | 'absences' | 'rebuildScope'>): void {
+  const appendGroup = (label: string, members: string[]): void => {
+    lines.push(`${label}: ${members.length}`);
+    for (const member of members) lines.push(`  - ${member}`);
+  };
+  // Plan 07-06 Task 2/3 (D-06): counts by verdict on the header line, then
+  // the logical key of every object this run could not read — the human
+  // branch names the object, not only the reason (matching this task's own
+  // must-have).
+  lines.push(`existence: present=${status.existence.present} confirmed-absent=${status.existence.confirmedAbsent} unknown=${status.existence.unknown}`);
+  for (const key of status.existence.unknownKeys) lines.push(`  - ${key}`);
+  // Plan 07-06 Task 2/3 (D-08/D-09): one line per object currently carrying
+  // an absence marker, naming its count and its first-seen instant.
+  appendGroup('absences', status.absences.map(({ logicalKey, count, firstSeenAt }) => `${logicalKey} (count=${count}, since=${firstSeenAt})`));
+  // Plan 07-06 Task 2/3 (D-01/D-02/D-03): the rebuild-scope preview — the
+  // keys that triggered it, then every operation both bootstrap passes would
+  // emit for it, each labeled by which pass it belongs to.
+  lines.push(`rebuild-scope: triggered=${status.rebuildScope.triggered}`);
+  for (const key of status.rebuildScope.triggeredKeys) lines.push(`  - trigger: ${key}`);
+  for (const key of status.rebuildScope.structureOperations) lines.push(`  - structure: ${key}`);
+  for (const key of status.rebuildScope.optionsOperations) lines.push(`  - options: ${key}`);
+}
+
+/**
  * D-13/D-14: default (non-raw) human summary. Lists every planned create,
  * update, and no-op by its logical key, and every blocked/uncertain entry by
  * its typed reason (blocked entries append a safe `detail` in parentheses
@@ -219,6 +280,11 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
  * `wave:` — so it would otherwise never appear in any group). All nine
  * groups always render their count line, even at zero.
  *
+ * Plan 07-11 Task 1: the unavailable branch now ALSO renders the
+ * existence/absences/rebuild-scope group lines when `buildStatusV1`'s new
+ * `project_absent` case populated them with a real preview — every other
+ * unavailable reason keeps the pre-existing message-only rendering.
+ *
  * Kept pure and total: reads only `status` fields, never the filesystem,
  * config, or a caught error (SAFE-04) — the raw branch stays the first
  * statement so the machine surface (D-15) cannot be affected by the human
@@ -226,7 +292,19 @@ function buildStatusV1(remote: StatusInput, plan: ReconciliationPlan | null, exi
  */
 function renderStatusV1(status: StatusV1, raw: boolean): string {
   if (raw) return JSON.stringify(status);
-  if (!status.available) return `${status.message}\n`;
+  if (!status.available) {
+    const lines: string[] = [status.message ?? ''];
+    // Plan 07-11 Task 1: the `project_absent` branch of `buildStatusV1` is
+    // the only unavailable case whose existence/absences/rebuildScope are
+    // ever non-empty (every OTHER unavailable reason keeps the frozen
+    // `EMPTY_EXISTENCE`/`EMPTY_REBUILD_SCOPE` constants) — so this condition
+    // is a no-op for every pre-existing fixture, and the pinned "message
+    // followed by a newline" test stays byte-identical for them.
+    if (status.existence.present > 0 || status.existence.confirmedAbsent > 0 || status.existence.unknown > 0 || status.absences.length > 0 || status.rebuildScope.triggered) {
+      appendExistenceAbsenceRebuildScopeLines(lines, status);
+    }
+    return lines.join('\n') + '\n';
+  }
   const lines: string[] = ['github-sync status'];
   const appendGroup = (label: string, members: string[]): void => {
     lines.push(`${label}: ${members.length}`);
@@ -257,22 +335,7 @@ function renderStatusV1(status: StatusV1, raw: boolean): string {
   // Plan 07-06 Task 1 (D-07): a prune renders as the removed key alone — the
   // single destructive act anywhere in this phase, named explicitly (T-07-20).
   appendGroup('prune', status.prune);
-  // Plan 07-06 Task 2/3 (D-06): counts by verdict on the header line, then
-  // the logical key of every object this run could not read — the human
-  // branch names the object, not only the reason (matching this task's own
-  // must-have).
-  lines.push(`existence: present=${status.existence.present} confirmed-absent=${status.existence.confirmedAbsent} unknown=${status.existence.unknown}`);
-  for (const key of status.existence.unknownKeys) lines.push(`  - ${key}`);
-  // Plan 07-06 Task 2/3 (D-08/D-09): one line per object currently carrying
-  // an absence marker, naming its count and its first-seen instant.
-  appendGroup('absences', status.absences.map(({ logicalKey, count, firstSeenAt }) => `${logicalKey} (count=${count}, since=${firstSeenAt})`));
-  // Plan 07-06 Task 2/3 (D-01/D-02/D-03): the rebuild-scope preview — the
-  // keys that triggered it, then every operation both bootstrap passes would
-  // emit for it, each labeled by which pass it belongs to.
-  lines.push(`rebuild-scope: triggered=${status.rebuildScope.triggered}`);
-  for (const key of status.rebuildScope.triggeredKeys) lines.push(`  - trigger: ${key}`);
-  for (const key of status.rebuildScope.structureOperations) lines.push(`  - structure: ${key}`);
-  for (const key of status.rebuildScope.optionsOperations) lines.push(`  - options: ${key}`);
+  appendExistenceAbsenceRebuildScopeLines(lines, status);
   // Plan 07-10 Task 3 (D-01 option-d): only rendered when `projectTarget` is
   // present at all (the divergence case) — a developer reading config alone
   // is not silently misled about which board is actually live.

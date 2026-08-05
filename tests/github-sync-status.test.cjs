@@ -297,6 +297,101 @@ test('a target_unavailable blocked entry renders through the human path with its
   assert.equal(renderStatusV1(dto, false), `${dto.message}\n`);
 });
 
+// ─── Plan 07-11 Task 1 (D-03 gap closure, GAP 3 of 07-VERIFICATION.md):
+// `buildStatusV1`'s `project_absent` branch — the board is unreadable, but
+// the existence/absences/rebuild-scope preview the router's widened D-03
+// gate already computed is real and must not be discarded. ─────────────────
+
+test('buildStatusV1 on a project_absent reason returns available:false with the real existence/absences/rebuildScope preview, never the EMPTY_* constants', () => {
+  const result = buildStatusV1({ available: false, reason: 'project_absent' }, null, {
+    verdicts: [{ logicalKey: 'project', verdict: 'confirmed-absent' }],
+    absences: [{ logicalKey: 'project', count: 2, firstSeenAt: '2026-08-01T00:00:00.000Z' }],
+    rebuildScope: { triggered: true, triggeredKeys: ['project'], structureOperations: ['project'], optionsOperations: [] },
+  });
+  assert.equal(result.available, false);
+  assert.equal(result.message, 'github-sync status is unavailable because the configured GitHub Project does not resolve; it may have been deleted.');
+  assert.deepEqual(result.creates, []);
+  assert.deepEqual(result.updates, []);
+  assert.deepEqual(result.blocked, [{ reason: 'project_absent' }]);
+  assert.deepEqual(result.uncertain, []);
+  assert.deepEqual(result.existence, { present: 0, confirmedAbsent: 1, unknown: 0, unknownKeys: [] });
+  assert.deepEqual(result.absences, [{ logicalKey: 'project', count: 2, firstSeenAt: '2026-08-01T00:00:00.000Z' }]);
+  assert.deepEqual(result.rebuildScope, { triggered: true, triggeredKeys: ['project'], structureOperations: ['project'], optionsOperations: [] });
+  assert.deepEqual(result.limitations, ['The existence and rebuild-scope details below describe what a rebuild would create, not what is currently on the board.']);
+});
+
+test('buildStatusV1 on a project_absent reason with no existence summary at all still defaults to the EMPTY_* constants, never throwing', () => {
+  const result = buildStatusV1({ available: false, reason: 'project_absent' }, null);
+  assert.equal(result.available, false);
+  assert.deepEqual(result.existence, { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] });
+  assert.deepEqual(result.absences, []);
+  assert.deepEqual(result.rebuildScope, { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] });
+});
+
+test('buildStatusV1 keeps the target_unavailable and generic remote_unavailable branches byte-identical alongside the new project_absent branch', () => {
+  const targetFault = buildStatusV1({ available: false, reason: 'target_unavailable', field: 'owner' }, null);
+  assert.deepEqual(targetFault, {
+    version: 1,
+    available: false,
+    message: 'github-sync status is unavailable because github_sync.target.owner in .planning/config.json is invalid. Set it to a non-empty string (the GitHub owner login), then re-run.',
+    creates: [], updates: [], noops: [],
+    blocked: [{ reason: 'target_unavailable', detail: 'owner' }],
+    uncertain: [],
+    orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
+    adoptions: [], prune: [],
+    existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
+    absences: [],
+    rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
+    limitations: ['The local github_sync.target configuration is invalid; no remote read was attempted.'],
+  });
+  const remoteOutage = buildStatusV1({ available: false, reason: 'remote_unavailable' }, null);
+  assert.deepEqual(remoteOutage, {
+    version: 1,
+    available: false,
+    message: 'github-sync status is unavailable because GitHub could not be read. Retry shortly.',
+    creates: [], updates: [], noops: [], blocked: [], uncertain: [{ reason: 'remote_unavailable' }],
+    orphans: [], pendingIssueUpdates: [], pendingFieldChanges: [], subIssueCeilingWarnings: [],
+    adoptions: [], prune: [],
+    existence: { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] },
+    absences: [],
+    rebuildScope: { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] },
+    limitations: ['Remote data is currently unavailable; no changes were made.'],
+  });
+});
+
+test('renderStatusV1 for a project_absent DTO renders the message followed by the existence/absences/rebuild-scope group lines (a developer sees the same facts the JSON carries), and never a limitations line', () => {
+  const dto = buildStatusV1({ available: false, reason: 'project_absent' }, null, {
+    verdicts: [{ logicalKey: 'project', verdict: 'confirmed-absent' }],
+    absences: [{ logicalKey: 'project', count: 2, firstSeenAt: '2026-08-01T00:00:00.000Z' }],
+    rebuildScope: { triggered: true, triggeredKeys: ['project'], structureOperations: ['project'], optionsOperations: [] },
+  });
+  const out = renderStatusV1(dto, false);
+  assert.equal(out, [
+    dto.message,
+    'existence: present=0 confirmed-absent=1 unknown=0',
+    'absences: 1',
+    '  - project (count=2, since=2026-08-01T00:00:00.000Z)',
+    'rebuild-scope: triggered=true',
+    '  - trigger: project',
+    '  - structure: project',
+    '',
+  ].join('\n'));
+  assert.doesNotMatch(out, /limitations:/);
+});
+
+test('renderStatusV1 for a project_absent DTO with an empty preview (existence summary omitted) stays exactly the message line, matching every other unavailable branch', () => {
+  const dto = buildStatusV1({ available: false, reason: 'project_absent' }, null);
+  assert.equal(renderStatusV1(dto, false), `${dto.message}\n`);
+});
+
+test('renderStatusV1(dto, true) for a project_absent DTO stays exactly JSON.stringify(dto), regardless of the new human-branch group lines (D-15)', () => {
+  const dto = buildStatusV1({ available: false, reason: 'project_absent' }, null, {
+    verdicts: [{ logicalKey: 'project', verdict: 'confirmed-absent' }],
+    rebuildScope: { triggered: true, triggeredKeys: ['project'], structureOperations: ['project'], optionsOperations: [] },
+  });
+  assert.equal(renderStatusV1(dto, true), JSON.stringify(dto));
+});
+
 // ─── WINDOWS #8 (plan 07-03): the shared, exhaustively-tested mutation-kind catalog ─
 
 const MILESTONE_VERSION = 'v1.0';

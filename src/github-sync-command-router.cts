@@ -646,7 +646,7 @@ function routeGithubSyncCommandRouter({
           if (projectRecovery.configuredProjectNumber !== undefined) {
             resolvedTarget.target = { ...resolvedTarget.target, projectNumber: projectRecovery.projectNumber };
           }
-          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) }) as { available?: unknown };
+          const remoteSnapshot = remote.readRemoteSnapshot({ cwd, owner: resolvedTarget.target.owner, repo: resolvedTarget.target.repo, repositoryNumber: resolvedTarget.target.repositoryNumber, projectNumber: resolvedTarget.target.projectNumber, issueNodeIdHints: collectIssueNodeIdHints(strictMap) }) as { available?: unknown; reason?: unknown };
 
           const nowIso = clock.nowIso();
           let existenceVerdicts: ExistenceVerdictEntry[] = [];
@@ -667,12 +667,19 @@ function routeGithubSyncCommandRouter({
           // pre-07-06 status fixture that omits a `project` completion
           // takes this same "nothing new happens" path unchanged.
           //
+          // Plan 07-11 Task 1 (D-03 gap closure, GAP 3): widened to admit the
+          // SAME case `sync`'s own gate (line ~831) admits — a snapshot whose
+          // reason is `REMOTE_REASON.PROJECT_ABSENT` is not a transport
+          // failure, it is precisely the confirmed-absent finding this block
+          // exists to classify and preview. Every OTHER unavailable reason
+          // still skips this block exactly as before.
+          //
           // The whole block is defensively contained (D-11: never gates) —
           // a fault anywhere in the preview degrades to the empty preview
           // already assigned above, never to an unavailable status; the
           // reconciliation-level report below still runs either way.
           try {
-            if (remoteSnapshot?.available === true && strictMap?.kind === 'valid') {
+            if ((remoteSnapshot?.available === true || remoteSnapshot?.reason === REMOTE_REASON.PROJECT_ABSENT) && strictMap?.kind === 'valid') {
               const completions = (strictMap.map?.completions ?? {}) as Record<string, { nodeId?: string; issueNumber?: number; absenceCount?: number; absenceFirstSeenAt?: string } | undefined>;
               if (completions.project) {
                 const bootstrapRemoteState = bootstrapRemote.readBootstrapRemoteState({

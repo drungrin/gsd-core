@@ -25,6 +25,7 @@ const { describe, test, beforeEach, afterEach, mock } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const childProcess = require('node:child_process');
 const { spawnSync, spawn } = require('node:child_process');
 
@@ -3517,6 +3518,258 @@ describe('github-sync router: plan 07-10 — a genuinely deleted Project through
     const dto = JSON.parse(output);
     assert.equal(dto.available, true);
     assert.deepEqual(dto.projectTarget, { resolved: 42, configured: 7 }, 'status names both the resolved (live) and configured (stale) project numbers when they diverge');
+    assert.equal(process.exitCode, 0);
+  });
+});
+
+// ─── Plan 07-11 Task 1 (D-03 gap closure, GAP 3 of 07-VERIFICATION.md):
+// `status` must predict a deleted board's rebuild scope — the SAME real-
+// reader `realReaderSeams` harness plan 07-10 introduced, now driving
+// `status` instead of `sync`, since `status`'s own D-03 preview gate carried
+// the identical `!remote.available` collapse `sync`'s gate did before plan
+// 07-10 widened it. ──────────────────────────────────────────────────────
+
+describe('github-sync router: plan 07-11 Task 1 — status predicts a deleted board through the real readers', () => {
+  const realMap = require('../gsd-core/bin/lib/github-sync-map.cjs');
+  const realRemoteReader = require('../gsd-core/bin/lib/github-sync-remote.cjs');
+  const realBootstrapRemoteReader = require('../gsd-core/bin/lib/github-sync-bootstrap-remote.cjs');
+  const TARGET = { owner: 'octo', repo: 'repo', repositoryNumber: 1, projectNumber: 7 };
+  const T0 = '2026-08-01T00:00:00.000Z';
+  const T0_PLUS_65S = '2026-08-01T00:01:05.000Z';
+
+  function baseProjectCompletion(overrides = {}) {
+    return {
+      logicalKey: 'project', nodeId: 'PVT_OLD', completedAt: '2026-07-01T00:00:00.000Z',
+      owner: TARGET.owner, repo: TARGET.repo, repositoryNumber: TARGET.repositoryNumber,
+      ...overrides,
+    };
+  }
+
+  function captureStdout() {
+    const chunks = [];
+    mock.method(fs, 'writeSync', (_fd, chunk) => { chunks.push(String(chunk)); return Buffer.byteLength(String(chunk)); });
+    return { chunks, restore: () => mock.restoreAll() };
+  }
+
+  function mapPathFor(tmpDir) { return path.join(tmpDir, '.planning', '.github-sync.json'); }
+  function configPathFor(tmpDir) { return path.join(tmpDir, '.planning', 'config.json'); }
+  function sha256Of(filePath) { return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex'); }
+
+  /** A real, on-disk `.planning/config.json` — required for Test 4's hash comparison to mean anything (a file that never existed hashes "equal" vacuously). `_target` bypasses reading it, so its content is inert to routing. */
+  function writeTargetConfig(tmpDir, projectNumber) {
+    fs.writeFileSync(configPathFor(tmpDir), JSON.stringify({
+      github_sync: {
+        enabled: true,
+        target: { owner: TARGET.owner, repo: TARGET.repo, repository_number: TARGET.repositoryNumber, project_number: projectNumber },
+      },
+    }, null, 2) + '\n');
+  }
+
+  function realReaderSeams(execGh) {
+    return {
+      _remote: { readRemoteSnapshot: (options) => realRemoteReader.readRemoteSnapshot({ ...options, execGh }) },
+      _bootstrapRemote: { readBootstrapRemoteState: (options) => realBootstrapRemoteReader.readBootstrapRemoteState({ ...options, execGh }) },
+    };
+  }
+
+  const REMOTE_MARKER_NAMES = ['project', 'items', 'fields', 'subIssues', 'issueId'];
+
+  function defaultGraphqlResponse(document) {
+    switch (document) {
+      case 'project':
+        return { data: { repositoryOwner: { projectV2: { id: 'PVT_DEFAULT' } } } };
+      case 'items':
+        return { data: { repositoryOwner: { projectV2: { items: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'fields':
+        return { data: { repositoryOwner: { projectV2: { fields: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'subIssues':
+        return { data: { repository: { issue: { subIssues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'repository':
+        return { data: { repository: { id: 'R_DEFAULT', owner: { id: 'O_DEFAULT', login: TARGET.owner }, projectsV2: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } };
+      case 'fieldsWithTypes':
+        return { data: { repositoryOwner: { projectV2: { id: 'PVT_DEFAULT', fields: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      case 'views':
+        return { data: { repositoryOwner: { projectV2: { views: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+      default:
+        return { data: {} };
+    }
+  }
+
+  function makeRoutingExecGh(routes = {}) {
+    const calls = [];
+    const callCounts = {};
+    const execGh = (args) => {
+      let document = null;
+      if (args[0] === 'api' && args[1] !== 'graphql') {
+        if (typeof args[1] === 'string' && args[1].includes('/labels')) document = 'labels';
+        else if (typeof args[1] === 'string' && args[1].includes('/milestones')) document = 'milestones';
+      } else {
+        const queryArg = args.find((arg) => typeof arg === 'string' && arg.startsWith('query='));
+        const query = queryArg ? queryArg.slice('query='.length) : '';
+        document = REMOTE_MARKER_NAMES.find((name) => query.includes(`github-sync:${name}`)) ?? null;
+        if (!document) {
+          const bootstrapEntry = Object.entries(realBootstrapRemoteReader.BOOTSTRAP_DOCUMENTS).find(([, doc]) => doc === query);
+          document = bootstrapEntry ? bootstrapEntry[0] : null;
+        }
+      }
+      calls.push({ document, args });
+      const index = callCounts[document] ?? 0;
+      callCounts[document] = index + 1;
+      const handler = routes[document];
+      if (typeof handler === 'function') return handler(index);
+      if (handler !== undefined) return handler;
+      if (document === 'labels' || document === 'milestones') return { exitCode: 0, reason: 'ok', stdout: '[]', stderr: '' };
+      return { exitCode: 0, reason: 'ok', stdout: JSON.stringify(defaultGraphqlResponse(document)), stderr: '' };
+    };
+    return { execGh, calls };
+  }
+
+  /** GitHub's real deleted-Project envelope: `data.repositoryOwner.projectV2` set to null, a single NOT_FOUND-typed `errors` entry, exit code 1. */
+  const DELETED_PROJECT_ENVELOPE = {
+    exitCode: 1,
+    reason: 'gh_exit_nonzero',
+    stderr: 'gh: Could not resolve to a ProjectV2 node with the number 7.',
+    stdout: JSON.stringify({
+      data: { repositoryOwner: { projectV2: null } },
+      errors: [{ type: 'NOT_FOUND', path: ['repositoryOwner', 'projectV2'], message: 'Could not resolve to a ProjectV2 node with the number 7.' }],
+    }),
+  };
+
+  /** A read that FAILED — exit code 1, a FORBIDDEN (non-NOT_FOUND) errors entry — never absence evidence (T-07-31). */
+  const FORBIDDEN_PROJECT_ENVELOPE = {
+    exitCode: 1,
+    reason: 'gh_exit_nonzero',
+    stderr: 'gh: Resource not accessible by integration.',
+    stdout: JSON.stringify({
+      data: { repositoryOwner: { projectV2: null } },
+      errors: [{ type: 'FORBIDDEN', path: ['repositoryOwner', 'projectV2'], message: 'Resource not accessible by integration.' }],
+    }),
+  };
+
+  /**
+   * Runs `github-sync status --raw` against a (by default) deleted-Project
+   * fixture, driven through the REAL readers. Returns the parsed DTO, the
+   * raw output string, every `_bootstrapPlan` pass invoked, every call the
+   * injected `_apply` seam received (status must never dispatch, so this
+   * should always be empty), and SHA-256 hashes of both on-disk files taken
+   * immediately before and after the run.
+   */
+  function runStatus({ projectCompletionOverrides = {}, nowIso = T0, bootstrapPlanOperations = null, execGhOverride = null } = {}) {
+    const tmpDir = createTempProject();
+    const applyCalls = [];
+    const bootstrapPlanCalls = [];
+    const routing = execGhOverride ?? makeRoutingExecGh({
+      project: () => DELETED_PROJECT_ENVELOPE,
+      fieldsWithTypes: () => DELETED_PROJECT_ENVELOPE,
+    });
+    const cap = captureStdout();
+    let output;
+    let hashesBefore;
+    try {
+      writeTargetConfig(tmpDir, TARGET.projectNumber);
+      realMap.writeSyncMapAtomically(tmpDir, realMap.recordCompletion(null, baseProjectCompletion(projectCompletionOverrides)));
+      hashesBefore = { map: sha256Of(mapPathFor(tmpDir)), config: sha256Of(configPathFor(tmpDir)) };
+      routeGithubSyncCommandRouter({
+        args: ['github-sync', 'status'], cwd: tmpDir, raw: true,
+        error: (message) => { throw new Error(message); },
+        _isCapabilityActive: () => true,
+        _desired: { readDesiredState: () => ({ available: true }) },
+        _target: { readSyncTarget: () => ({ available: true, target: TARGET }) },
+        ...realReaderSeams(routing.execGh),
+        _bootstrapPlan: {
+          BOOTSTRAP_PASS: { STRUCTURE: 'structure', OPTIONS: 'options' },
+          planBootstrap: (input, options) => {
+            bootstrapPlanCalls.push(options.pass);
+            if (bootstrapPlanOperations && options.pass === 'structure') {
+              return { operations: bootstrapPlanOperations, noops: [], blocked: [], uncertain: [], checkpoints: [] };
+            }
+            return { operations: [], noops: [{ reason: 'nothing-to-do' }], blocked: [], uncertain: [], checkpoints: [] };
+          },
+        },
+        _bootstrapConfig: { readProjectTitle: () => null, readViewLayout: () => 'BOARD_LAYOUT' },
+        _reconcile: { planReconciliation: () => ({ operations: [], noops: [], blocked: [], uncertain: [], pendingIssueUpdates: [] }) },
+        _apply: {
+          applyMutationPlan: (plan) => {
+            applyCalls.push({ tag: (plan.operations[0] || {}).logicalKey ?? null, kind: (plan.operations[0] || {}).kind ?? null });
+            return { kind: 'completed', outcomes: [] };
+          },
+        },
+        _clock: { now: () => 0, nowIso: () => nowIso, sleep: () => {} },
+      });
+    } finally { output = cap.chunks.join(''); cap.restore(); }
+    const hashesAfter = { map: sha256Of(mapPathFor(tmpDir)), config: sha256Of(configPathFor(tmpDir)) };
+    return { tmpDir, output, dto: JSON.parse(output), applyCalls, bootstrapPlanCalls, routing, hashesBefore, hashesAfter };
+  }
+
+  test('Test 1: a status run whose project document answers with the deleted-project envelope names the project logical key with the confirmed-absent verdict', () => {
+    const { dto, tmpDir } = runStatus({ nowIso: T0 });
+    try {
+      assert.equal(dto.available, false);
+      // `project` is the sync map's only completion — a single confirmed-
+      // absent verdict can only be for it.
+      assert.deepEqual(dto.existence, { present: 0, confirmedAbsent: 1, unknown: 0, unknownKeys: [] });
+      assert.deepEqual(dto.blocked, [{ reason: 'project_absent' }]);
+    } finally { cleanup(tmpDir); }
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Test 2: the same run with a project completion already carrying one confirmed absence stamped more than 60000ms earlier reports rebuild-scope triggered, naming project among the triggered keys with at least one structure operation', () => {
+    const { dto, tmpDir, bootstrapPlanCalls } = runStatus({
+      projectCompletionOverrides: { absenceCount: 1, absenceFirstSeenAt: T0 },
+      nowIso: T0_PLUS_65S,
+      bootstrapPlanOperations: [{ logicalKey: 'project', kind: 'create' }],
+    });
+    try {
+      assert.equal(dto.available, false);
+      assert.equal(dto.rebuildScope.triggered, true);
+      assert.ok(dto.rebuildScope.triggeredKeys.includes('project'));
+      assert.ok(dto.rebuildScope.structureOperations.includes('project'), 'at least one structure operation is named');
+      assert.deepEqual(bootstrapPlanCalls, ['structure', 'options'], 'status runs BOTH dry-run bootstrap passes, mirroring sync exactly (dryRun withholds apply, not planning)');
+    } finally { cleanup(tmpDir); }
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Test 3: --raw output parses as JSON with available:false while its existence and rebuild-scope members are populated — an honest "the board is gone, here is what a rebuild would do", not a claim the board is readable', () => {
+    const { output, dto, tmpDir } = runStatus({
+      projectCompletionOverrides: { absenceCount: 1, absenceFirstSeenAt: T0 },
+      nowIso: T0_PLUS_65S,
+      bootstrapPlanOperations: [{ logicalKey: 'project', kind: 'create' }],
+    });
+    try {
+      assert.doesNotThrow(() => JSON.parse(output));
+      assert.equal(dto.available, false);
+      assert.ok(dto.existence.confirmedAbsent >= 1);
+      assert.equal(dto.rebuildScope.triggered, true);
+      assert.ok(dto.rebuildScope.structureOperations.length > 0);
+    } finally { cleanup(tmpDir); }
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Test 4: status against a deleted, rebuild-triggering Project leaves .planning/.github-sync.json and .planning/config.json byte-identical (SHA-256 equal before/after), and the injected apply seam receives zero calls', () => {
+    const { hashesBefore, hashesAfter, applyCalls, tmpDir } = runStatus({
+      projectCompletionOverrides: { absenceCount: 1, absenceFirstSeenAt: T0 },
+      nowIso: T0_PLUS_65S,
+      bootstrapPlanOperations: [{ logicalKey: 'project', kind: 'create' }],
+    });
+    try {
+      assert.equal(hashesAfter.map, hashesBefore.map, 'the sync map file is byte-identical before and after — status never writes it, even when it previews a triggered rebuild');
+      assert.equal(hashesAfter.config, hashesBefore.config, 'config.json is untouched by status');
+      assert.deepEqual(applyCalls, [], 'the injected apply seam received zero calls');
+    } finally { cleanup(tmpDir); }
+    assert.equal(process.exitCode, 0);
+  });
+
+  test('Test 5: a status run whose project document answers FORBIDDEN (not NOT_FOUND) returns the pre-existing bare remote-unavailable DTO with an empty existence summary — a failed read predicts nothing', () => {
+    const { dto, tmpDir } = runStatus({
+      execGhOverride: makeRoutingExecGh({ project: () => FORBIDDEN_PROJECT_ENVELOPE, fieldsWithTypes: () => FORBIDDEN_PROJECT_ENVELOPE }),
+    });
+    try {
+      assert.equal(dto.available, false);
+      assert.deepEqual(dto.uncertain, [{ reason: 'remote_unavailable' }]);
+      assert.deepEqual(dto.blocked, []);
+      assert.deepEqual(dto.existence, { present: 0, confirmedAbsent: 0, unknown: 0, unknownKeys: [] });
+      assert.deepEqual(dto.rebuildScope, { triggered: false, triggeredKeys: [], structureOperations: [], optionsOperations: [] });
+    } finally { cleanup(tmpDir); }
     assert.equal(process.exitCode, 0);
   });
 });
