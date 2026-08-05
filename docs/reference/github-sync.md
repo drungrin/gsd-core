@@ -230,6 +230,24 @@ by number. If the number lookup succeeds with a **different** node ID than the o
 signature of a repository transfer — the new ID is adopted and recorded, reported by name in the
 run's output, and converges to zero on the next run.
 
+**This re-resolution path only fires when the mapped project item is not currently bound to the
+board** — for example, the item was removed, or the board is being rebuilt from scratch. **The
+more realistic transfer scenario — an issue whose project item is still bound to the board, live-
+confirmed** — never reaches this path: GitHub silently re-points the bound item's `content` at the
+transferred issue's new location rather than removing the item, so the item-presence check that
+runs first finds "still bound, nothing to do" before the number lookup above is ever consulted.
+For that case, `sync` instead runs a content-drift comparison every run: it reads the bound item's
+current `(owner, repo, number)` and compares it against the completion's own cached identity. **A
+drift that stays within the configured repository** (only the number moved) is auto-corrected the
+same way the paragraph above describes — the map is updated and the correction is named in the
+run's own adoption report. **A drift into a different repository — the outcome of a real `gh
+issue transfer`, live-confirmed** — is detected and named (in `sync`'s own report and in
+`status`'s `content-drift` group) but the sync map is **deliberately left uncorrected**: the map
+binds every completion to one configured repository, and no `sync` behavior ever repoints that
+binding at a repository the developer did not configure. A developer who sees a cross-repository
+drift reported must update the configured target — or otherwise resolve the transfer — by hand;
+the mirror keeps reporting the drift, and never silently guesses, until they do.
+
 **Recreating a confirmed-absent object requires two confirmed absences separated by a minimum
 elapsed wall-clock gap of 60 seconds.** A single absence is recorded and never acted on; only a
 **second** confirmed absence, at least 60 seconds after the first, triggers recreation. A verdict
@@ -256,10 +274,42 @@ would still be a guess dressed as a fix.
 When a bootstrap-namespace object reaches its second confirmed absence past the 60-second gate,
 `sync` delegates to the same `planBootstrap` two-pass sequence `init` runs — recreating every
 bootstrap object `.planning/` still wants, not only the one that triggered the rebuild — and then
-continues into phase/plan reconciliation in the **same run**. This is a literal reading of "the
-next `sync` rebuilds the mirror from `.planning/`": deleting the Project on GitHub, or hand-
-deleting a single custom field, both self-heal on the next `sync` once the gate is satisfied,
-with zero duplicated bootstrap logic (`sync` calls the identical function `init` does).
+continues into phase/plan reconciliation in the **same run**, with zero duplicated bootstrap logic
+(`sync` calls the identical function `init` does). What that rebuild actually delivers differs by
+what was deleted:
+
+**Deleting the Project itself** rebuilds live, proven end to end against a real, disposable
+GitHub Project: delete the board, wait for the gate, and the next `sync` creates a real
+replacement, restores its full bootstrap surface (the five custom fields, the project-repository
+link, the six standard views, the Status/Autonomous options), and continues reconciliation in the
+same run — proven live: the existing phase issue was rebuilt on the new board with its own create
+outcome reported in that same `sync` invocation. `github_sync.target.project_number` in
+`.planning/config.json` — already configured, pointing at the now-deleted board — is **never
+rewritten** by this rebuild; that value stays byte-identical, confirmed live. The recreated
+board's real number lives only in the sync map (`.planning/.github-sync.json`'s own `project`
+completion), and every later run resolves through that map rather than the stale configured
+number. A developer who checks only `config.json` after a rebuild will see a number that no
+longer matches the live board — this divergence is intended, not drift; the sync map (or
+`status`) carries the number actually in use.
+
+**That rebuild is not guaranteed to happen only once per deletion.** A realistic, non-contrived,
+continuous-session sequence reproduced a SECOND, independent rebuild from the SAME original
+deletion: once a successful recovery causes a later run's own classification to find the new
+board present, that object's absence marker clears; the next run that still resolves through the
+stale configured number restarts a fresh two-confirmed-absences cycle from zero, and a single
+subsequent `sync` more than 60 seconds later can independently satisfy that fresh cycle's own gate
+— creating a third board, without ever checking whether the prior recovery is still healthy. One
+deletion of a real board produced two separate, simultaneously-live replacement boards in one
+continuous session. This is a known, currently open limitation, not a hypothetical: a developer
+who deletes the Project should not assume exactly one replacement board will exist afterward.
+
+**Hand-deleting a single bootstrap object that is not the Project itself** — a custom field, a
+label, a single-select option, a milestone — self-heals cleanly: live-proven, exactly one
+recreation across the full two-absence sequence, with the following run converging to zero
+further changes. Unlike the Project case, a non-project object's identity is re-discovered fresh
+from the resolving project's own live state on every run — there is no stale, separately-persisted
+reference for it to flap against — so this narrower case does not share the Project case's
+duplicate-rebuild limitation above.
 
 **This run can be long, and it is always safe to interrupt.** A full rebuild dispatches every
 bootstrap-structure mutation the board needs (fields, options, labels, milestones, views) plus
