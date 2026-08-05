@@ -30,10 +30,7 @@ animation/
 # Internal planning documents
 reports/
 RAILROAD_ARCHITECTURE.md
-# .planning/ is tracked so executor worktrees can read their own PLAN.md and so
-# tracking files (REQUIREMENTS.md, STATE.md) have recoverable history. Transient
-# phase artifacts are filtered out of PR branches by /gsd-pr-branch — this branch
-# is never pushed directly.
+.planning/
 analysis/
 docs/GSD-MASTER-ARCHITECTURE.md
 docs/GSD-RUST-IMPLEMENTATION-GUIDE.md
