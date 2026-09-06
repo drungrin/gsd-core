@@ -82,15 +82,20 @@ function buildIsolatedPath({ extraBefore = [], nodeShim = 'own', nodeShimDir = n
 
   const join = (dirs) => [...extraBefore, ...dirs].join(path.delimiter);
 
+  // Validated before the platform branches below: a missing nodeShimDir is a
+  // programming error in the CALL, not a property of the host, so it must fail
+  // the same way on every lane rather than passing silently on Windows (where
+  // the symlink step is skipped) and throwing only on POSIX.
+  if (nodeShim === 'caller' && (typeof nodeShimDir !== 'string' || !nodeShimDir)) {
+    throw new TypeError("buildIsolatedPath: nodeShim 'caller' requires nodeShimDir");
+  }
+
   // Windows: no symlink (see JSDoc above); callers must handle nodeBinDir === null.
   if (nodeShim === 'none' || process.platform === 'win32') {
     return { isolatedPath: join(systemPaths), nodeBinDir: null };
   }
 
   if (nodeShim === 'caller') {
-    if (typeof nodeShimDir !== 'string' || !nodeShimDir) {
-      throw new TypeError("buildIsolatedPath: nodeShim 'caller' requires nodeShimDir");
-    }
     // Only shim when the filter actually removed node along with gsd-tools —
     // the co-location case. Otherwise the filtered PATH already resolves it.
     const nodeAlreadyResolvable = systemPaths.some((p) => {
