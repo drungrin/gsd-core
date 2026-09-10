@@ -5363,6 +5363,11 @@ describe('#4377 project-relative prefix properties', () => {
   });
 });
 
+test('#4377: a project-root local target falls back to absolute includes', () => {
+  assert.equal(conversion._localIncludeDirName('cline'), undefined);
+  assert.equal(conversion._localIncludeDirName('claude'), '.claude');
+});
+
 describe('#4377 relative rewrites preserve every runtime launcher shell default', () => {
   test('the shared mask preserves a complete nested shell default as one unit', () => {
     const nested = '${OUTER:-${INNER:-$HOME/.claude}/gsd-core}';

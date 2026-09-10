@@ -3039,6 +3039,14 @@ function computePathPrefix({
 }
 
 /**
+ * A runtime installed directly at the project root cannot use its descriptor
+ * directory in a project-relative include: that directory was never created.
+ */
+function localIncludeDirName(runtime: string): string | undefined {
+  return _hostBehaviors(runtime).localTargetIsProjectRoot === true ? undefined : getDirName(runtime);
+}
+
+/**
  * #4377: the project-relative prefix for a local install, or `''` when the
  * runtime cannot express one and the caller must fall back to absolute.
  *
@@ -3711,7 +3719,7 @@ function rewriteStagedSkillBodies(stagedDir, opts) {
   const isWindowsHost = platform === 'win32';
   // #4377: localDirName lets a local install emit a project-relative prefix
   // when opted in; ignored for a global install and when the opt-in is off.
-  const pathPrefix = computePathPrefix({ isGlobal, isOpencode, isWindowsHost, resolvedTarget, homeDir, localDirName: getDirName(runtime) });
+  const pathPrefix = computePathPrefix({ isGlobal, isOpencode, isWindowsHost, resolvedTarget, homeDir, localDirName: localIncludeDirName(runtime) });
   const attribution = resolveAttribution ? resolveAttribution(runtime) : undefined;
 
   applyRuntimeContentRewritesInPlace(stagedDir, runtime, pathPrefix, isGlobal, attribution);
@@ -3765,7 +3773,7 @@ function rewriteStagedCommandBodies(stagedDir, opts) {
   const isWindowsHost = platform === 'win32';
   // #4377: localDirName lets a local install emit a project-relative prefix
   // when opted in; ignored for a global install and when the opt-in is off.
-  const pathPrefix = computePathPrefix({ isGlobal, isOpencode, isWindowsHost, resolvedTarget, homeDir, localDirName: getDirName(runtime) });
+  const pathPrefix = computePathPrefix({ isGlobal, isOpencode, isWindowsHost, resolvedTarget, homeDir, localDirName: localIncludeDirName(runtime) });
   const attribution = resolveAttribution ? resolveAttribution(runtime) : undefined;
 
   return applyRuntimeContentRewritesForCommandsInPlace(stagedDir, runtime, pathPrefix, isGlobal, attribution);
@@ -4152,6 +4160,7 @@ export = {
   _isRelativePathPrefix: isRelativePathPrefix,
   _relativeIncludesEnabled: relativeIncludesEnabled,
   _projectRelativePrefix: projectRelativePrefix,
+  _localIncludeDirName: localIncludeDirName,
   _restoreClaudeGlobalAtRefTilde: restoreClaudeGlobalAtRefTilde,
   _applyRuntimeRewrites,
   _stampNonClaudeRuntimeDefaults,
