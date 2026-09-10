@@ -10815,7 +10815,7 @@ function install(isGlobal, runtime = DEFAULT_RUNTIME, options = {}) {
     // copyWithPathReplacement, i.e. the one actually written into every
     // emitted command/skill/workflow body — the rewrite-engine seams below
     // handle re-applied surfaces, not the first install.
-    localDirName: getDirName(runtime),
+    localDirName: _hostBehaviors(runtime).localTargetIsProjectRoot === true ? undefined : getDirName(runtime),
   });
 
   // runtimeLabel is now the single-source getRuntimeLabel lookup (ADR-1239
