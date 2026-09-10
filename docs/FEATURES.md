@@ -42,6 +42,7 @@
   - [Session Reporting](#24-session-reporting)
   - [Multi-Agent Orchestration](#25-multi-agent-orchestration)
   - [Model Profiles](#26-model-profiles)
+  - [Compact Content Mode](#4139-compact-content-mode)
 - [Brownfield Features](#brownfield-features)
   - [Codebase Mapping](#27-codebase-mapping)
   - [Existing Codebase Onboarding](#27b-existing-codebase-onboarding)
@@ -809,8 +810,8 @@ phase of the same epic.
 
 **Requirements:**
 - REQ-CTX-01: Statusline MUST display context usage percentage to user
-- REQ-CTX-02: Context monitor MUST inject agent-facing warnings at ≤35% remaining (WARNING)
-- REQ-CTX-03: Context monitor MUST inject agent-facing warnings at ≤25% remaining (CRITICAL)
+- REQ-CTX-02: Context monitor MUST inject agent-facing warnings at the WARNING fire-point — ≤35% remaining by default, overridable per project via `hooks.context_warning_threshold`
+- REQ-CTX-03: Context monitor MUST inject agent-facing warnings at the CRITICAL fire-point — ≤25% remaining by default, overridable per project via `hooks.context_critical_threshold`
 - REQ-CTX-04: Warnings MUST debounce (5 tool uses between repeated warnings)
 - REQ-CTX-05: Severity escalation (WARNING→CRITICAL) MUST bypass debounce
 - REQ-CTX-06: Context monitor MUST differentiate GSD-active vs non-GSD-active projects
@@ -910,6 +911,46 @@ phase of the same epic.
 | gsd-plan-checker | Sonnet | Sonnet | Haiku | Inherit |
 | gsd-integration-checker | Sonnet | Sonnet | Haiku | Inherit |
 | gsd-nyquist-auditor | Sonnet | Sonnet | Haiku | Inherit |
+
+---
+
+### 4139. Compact Content Mode
+
+**Config:** `workflow.compact_content: false`
+
+**Purpose:** Per-project opt-in to token-minimized variants of GSD's own shipped prompt
+content — workflow instructions, planning-artifact templates, and non-Claude agent-persona
+payloads — so the always-loaded instruction window leaves more of the model's attention on
+the developer's own code (ADR-4139 Decision 2: finite attention, not per-invocation price,
+since prompt caching already discounts the latter).
+
+Nothing is compressed at runtime. Compact variants are hand-authored, reviewed files sitting
+beside their canonical siblings; the config key only chooses which one gets read. With the
+key off (the default), every covered workflow, template, and agent persona behaves exactly as
+it did before this feature existed.
+
+**Requirements:**
+- REQ-COMPACT-01: System MUST default `workflow.compact_content` to `false` — off costs
+  nothing and changes no existing behavior
+- REQ-COMPACT-02: Eagerly `@`-included workflow files MUST keep their host-guaranteed load;
+  compactness on this stream comes from a spine + deferred `detail/*.md` elaboration, never
+  from converting the `@`-include itself
+- REQ-COMPACT-03: A missed runtime `Read` of a deferred elaboration or compact variant MUST
+  degrade to a complete, correct, terser state — never to a state with no instructions
+- REQ-COMPACT-04: No compact variant MAY weaken or remove protected content (guardrails,
+  output-format contracts, few-shot examples, security language, structural headings)
+- REQ-COMPACT-05: An agent with no compact persona variant registered MUST fall back to its
+  canonical persona and disclose the fallback inside the served payload, never fail or serve
+  nothing
+- REQ-COMPACT-06: `/gsd-new-project` MUST ask the question and persist the answer;
+  `/gsd-settings` and `/gsd-config` MUST toggle it on an already-initialized project
+
+**Config:**
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `workflow.compact_content` | boolean | `false` | When `true`, loads token-minimized instruction/template/agent-persona variants wherever one is registered; falls back to canonical content everywhere else |
+
+**See also:** [ADR-4139](../adr/4139-compact-content-seam.md), [CONFIGURATION.md](../CONFIGURATION.md#workflow-toggles), [USER-GUIDE.md](../USER-GUIDE.md)
 
 
 ---
@@ -3553,6 +3594,8 @@ The load-bearing wire is the `plan-phase` lift into `must_haves.prohibitions`, s
 **Config:** `workflow.windows_enforce` (gate active, default `false` — opt-in enforcement). Enable with `gsd config-set workflow.windows_enforce true`. Tracking (the ledger itself, populated by the executor) is always on; only the ship gate is opt-in.
 
 **Backward compatibility:** A project with no `.planning/WINDOWS.md` reports `open_count: 0` and ships cleanly; the gate only activates once windows are recorded.
+
+**Milestone attribution (#4487):** each entry carries a `milestone` field, stamped at record time from the workstream's resolved milestone version (STATE.md `milestone:` frontmatter, or the ROADMAP.md in-progress marker as a fallback). Phase numbers are unique only within one active `phases/` directory — `milestone complete` frees them for reuse — so this is what lets an entry be attributed to the milestone it was actually recorded under, even after that milestone is archived and its phase numbers reused. `null` when no milestone could be resolved, including every entry recorded before this field existed.
 
 **Configuration:** `graphify.graph_path`
 

@@ -110,6 +110,84 @@ const INSTALL_TIMEOUT_MS = 120000;
  */
 const SEAM_DEFAULT_TIMEOUT_MS = 60000;
 
+/**
+ * A cheap, lightweight subprocess/hook invocation whose own work is
+ * trivial -- a synchronous in-process guard hook, a fully-mocked shell
+ * harness (git/gh functions stubbed out), a small `node -e` snippet, or a
+ * lint script scanning a tiny temp fixture -- with no real git/network/
+ * fan-out work inside. 10000ms leaves generous headroom over each call
+ * site's sub-second observed worst case (#4514, batch 3 of the ad hoc
+ * timeout literal migration, epic #4445 -- consolidates 5 call sites
+ * across 4 files that had all independently arrived at this exact value).
+ *
+ * Deliberately NOT the same as `PROBE_TIMEOUT_MS` (15000ms): consolidating
+ * onto that would RAISE these sites' bound with no bench citation, which
+ * this migration's scope (naming, not tuning) does not permit. This norm
+ * is for the even-lighter end of the spectrum PROBE_TIMEOUT_MS occupies.
+ */
+const QUICK_SPAWN_TIMEOUT_MS = 10000;
+
+/**
+ * NOT a subprocess spawn timeout. This is fixture DATA -- the numeric value
+ * placed inside a fixture JSON object that mimics a Claude Code
+ * `settings.json` hook-entry's own `timeout` field, whose schema expresses
+ * that field in SECONDS. Do not pass this into a `spawnSync`/`execFileSync`
+ * options object -- every other constant in this file is milliseconds, this
+ * one is not.
+ *
+ * Shared across >=2 files in batch #4515 of the ad hoc timeout literal
+ * migration, epic #4445 -- that is why it lives here rather than as a
+ * file-local constant.
+ */
+const FIXTURE_HOOK_TIMEOUT_SECONDS = 5;
+
+/**
+ * Spawning ONE already-staged or already-bundled hook script directly --
+ * never the full installer, never a fan-out across several hooks -- where
+ * the script does a modest amount of real work: a git-root check, a
+ * version-cache read/write, or an ESM-vs-CommonJS module load probe under a
+ * hostile config root. This is a distinct, heavier class than
+ * `QUICK_SPAWN_TIMEOUT_MS` (10000ms, trivial invocations with no real
+ * git/network work), since every site using this constant measurably does
+ * more than that. It is also distinct from `HOOK_FANOUT_TIMEOUT_MS`, which
+ * bounds a different class -- nested shell fan-out across MULTIPLE hooks,
+ * not a single script.
+ *
+ * Shared across 3 files in batch #4516 of the ad hoc timeout literal
+ * migration, epic #4445 -- that is why it lives here rather than as a
+ * file-local constant.
+ */
+const STAGED_HOOK_SCRIPT_TIMEOUT_MS = 20000;
+
+/**
+ * A single `gsd-tools.cjs` CLI subcommand invocation, spawned directly (never
+ * via an intermediate shell script), used by a loop/hook-point e2e test. The
+ * command does real in-process work -- capability/config resolution, project
+ * scaffolding, or (for the `check` verbs that inspect git-tracked state) real
+ * git plumbing calls -- but as ONE process with no confirmed nested-subprocess
+ * fan-out, verified per-site by reading each file's own runner function, not
+ * assumed from "hook" in the filename. Representative verbs seen at this
+ * norm's 7 sites: `loop render-hooks <point>`, `check <check-id>`,
+ * `execute <hook-point>`, and `init new-project` (tests/loop-walk.qa.test.cjs's
+ * concurrency test) -- the norm describes the CALL SHAPE (single direct
+ * gsd-tools.cjs spawn, no fan-out), not one specific verb family, so this list
+ * is illustrative, not exhaustive.
+ *
+ * Distinct from `HOOK_FANOUT_TIMEOUT_MS` (a bash-hosted script that itself
+ * shells out to further subprocesses) despite the coincidentally-matching
+ * value: this norm's sites spawn `gsd-tools.cjs` and nothing beneath it.
+ * Distinct from `PROBE_TIMEOUT_MS`: the same underlying `loop render-hooks`
+ * command is ALSO called at `PROBE_TIMEOUT_MS` (15000ms) elsewhere in the
+ * suite against lighter temp-project fixtures -- the two bounds are kept
+ * separate rather than equalized, since this migration never raises or
+ * lowers a value without a fresh bench citation.
+ *
+ * Shared across 7 files in batch #4518 of the ad hoc timeout literal
+ * migration, epic #4445 -- every site independently arrived at this exact
+ * value -- that is why it lives here rather than as a file-local constant.
+ */
+const LOOP_HOOK_POINT_CLI_TIMEOUT_MS = 60000;
+
 module.exports = {
   PROBE_TIMEOUT_MS,
   HOOK_FANOUT_TIMEOUT_MS,
@@ -118,4 +196,8 @@ module.exports = {
   BUILD_TIMEOUT_MS,
   INSTALL_TIMEOUT_MS,
   SEAM_DEFAULT_TIMEOUT_MS,
+  QUICK_SPAWN_TIMEOUT_MS,
+  FIXTURE_HOOK_TIMEOUT_SECONDS,
+  STAGED_HOOK_SCRIPT_TIMEOUT_MS,
+  LOOP_HOOK_POINT_CLI_TIMEOUT_MS,
 };
