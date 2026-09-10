@@ -4923,12 +4923,47 @@ describe('updatePerformanceMetricsSection', () => {
 describe('state planned-phase command', () => {
   let tmpDir;
 
+  function seedState() {
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'STATE.md'),
+      '# Project State\n\n**Status:** Planning\n**Total Plans in Phase:** 0\n**Last Activity:** 2024-01-01\n**Current Phase:** 1\n',
+    );
+  }
+
   beforeEach(() => {
     tmpDir = createFixture();
   });
 
   afterEach(() => {
     cleanup(tmpDir);
+  });
+
+  for (const { label, args } of [
+    { label: 'missing', args: ['state', 'planned-phase'] },
+    { label: 'flag-shaped', args: ['state', 'planned-phase', '--phase', '--name', 'API'] },
+    { label: 'empty', args: ['state', 'planned-phase', '--phase', ''] },
+    { label: 'whitespace-only', args: ['state', 'planned-phase', '--phase', '   '] },
+  ]) {
+    test(`#4383: ${label} --phase fails before writing STATE.md`, () => {
+      seedState();
+      const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+      const before = fs.readFileSync(statePath, 'utf8');
+
+      const result = runGsdTools(args, tmpDir);
+
+      assert.strictEqual(result.success, false, `${label} --phase must fail the command`);
+      assert.notStrictEqual(result.exitCode, 0, 'usage error must exit non-zero');
+      assert.match(result.error, /--phase/, `usage message must name --phase; got: ${result.error}`);
+      assert.strictEqual(fs.readFileSync(statePath, 'utf8'), before, 'STATE.md must stay byte-identical');
+    });
+  }
+
+  test('#4383: phase zero remains a valid present value', () => {
+    seedState();
+    const result = runGsdTools(['state', 'planned-phase', '--phase', '0', '--plans', '1'], tmpDir);
+
+    assert.ok(result.success, `phase zero must not be treated as missing: ${result.error}`);
+    assert.strictEqual(JSON.parse(result.output).phase, '0');
   });
 
   test('after call: Status is "Ready to execute"', () => {
@@ -13759,6 +13794,155 @@ describe('#905: syncStateFrontmatter preserves scalars when body annotations are
     } finally {
       cleanup(dir);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bug #4488: state update reports a same-value write as "field not found"
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('bug #4488: state update reports updated:true, not a false "not found", when the new value equals the current value', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTempProject();
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  test('same-value update on a template-shaped STATE.md reports updated:true, not "not found"', () => {
+    // Exact shape from the issue: frontmatter last_activity AND body
+    // "Last activity:" line already hold the value being "written". The
+    // transform's own stateReplaceField match succeeds and produces
+    // byte-identical output, which trips readModifyWriteStateMd's #948
+    // no-op guard before reconcileReportedFields' preWriteState snapshot is
+    // ever populated -- reconciliation then (correctly, for the general
+    // case) reports "[]", and cmdStateUpdate must not read that as "the
+    // field could not be found".
+    const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+    fs.writeFileSync(statePath, [
+      '---',
+      'gsd_state_version: "1.0"',
+      'current_phase: 1',
+      'current_phase_name: Test Phase',
+      'status: planning',
+      'last_activity: 2026-09-07',
+      '---',
+      '',
+      '# Project State',
+      '',
+      '## Current Position',
+      '',
+      'Phase: 1 of 1 (Test Phase)',
+      'Status: In progress',
+      'Last activity: 2026-09-07',
+      '',
+    ].join('\n'), 'utf-8');
+
+    const result = runGsdTools('state update "Last Activity" "2026-09-07"', tmpDir);
+    assert.ok(result.success, `state update failed: ${result.error}`);
+
+    const json = JSON.parse(result.output);
+    assert.strictEqual(
+      json.updated,
+      true,
+      `same-value update must report updated:true, not a false negative (got: ${JSON.stringify(json)})`,
+    );
+    assert.ok(
+      !('reason' in json),
+      `same-value update must not carry a "field not found" reason (got: ${JSON.stringify(json)})`,
+    );
+
+    // The file itself is untouched byte-for-byte (there was nothing to change).
+    const after = fs.readFileSync(statePath, 'utf-8');
+    assert.match(after, /^last_activity: 2026-09-07$/m);
+    assert.match(after, /^Last activity: 2026-09-07$/m);
+  });
+
+  test('changed-value update (control) still reports updated:true and actually rewrites the line', () => {
+    // Same fixture, different target date -- the pre-existing, always-worked
+    // path. Pins that the #4488 fix does not turn INTO a false positive for
+    // a real change.
+    const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+    fs.writeFileSync(statePath, [
+      '---',
+      'gsd_state_version: "1.0"',
+      'last_activity: 2026-09-07',
+      '---',
+      '',
+      '## Current Position',
+      '',
+      'Last activity: 2026-09-07',
+      '',
+    ].join('\n'), 'utf-8');
+
+    const result = runGsdTools('state update "Last Activity" "2026-09-08"', tmpDir);
+    assert.ok(result.success, `state update failed: ${result.error}`);
+    const json = JSON.parse(result.output);
+    assert.strictEqual(json.updated, true);
+
+    const after = fs.readFileSync(statePath, 'utf-8');
+    assert.match(after, /^Last activity: 2026-09-08$/m);
+  });
+
+  test('a genuinely absent field still reports updated:false with the case-D diagnostic', () => {
+    // Control for the other direction: this must NOT become a blanket
+    // "always true" -- a field with no body source line and no frontmatter
+    // key at all is still a real failure.
+    const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+    fs.writeFileSync(statePath, [
+      '---',
+      'gsd_state_version: "1.0"',
+      '---',
+      '',
+      '## Current Position',
+      '',
+      'Status: In progress',
+      '',
+    ].join('\n'), 'utf-8');
+
+    const result = runGsdTools('state update "Last Activity" "2026-09-08"', tmpDir);
+    assert.ok(result.success, `state update failed: ${result.error}`);
+    const json = JSON.parse(result.output);
+    assert.strictEqual(json.updated, false);
+    assert.match(json.reason, /not found in STATE\.md/);
+  });
+
+  test('#3699 case-D repair with a same-value frontmatter target still reports updated:true', () => {
+    // Case D fires when the CALLER addresses the FRONTMATTER key directly
+    // (e.g. "last_activity", per explainUpdateFailure's own "update
+    // \"last_activity\" directly to repair" instruction) on a document whose
+    // body has no source line at all. That repair write can ALSO be
+    // byte-identical to the original (the frontmatter already holds the
+    // target value) and trip the same #948 no-op guard as the body-label
+    // path above -- a second origin for the #4488 collapse, covered here so
+    // it doesn't regress silently.
+    const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+    fs.writeFileSync(statePath, [
+      '---',
+      'gsd_state_version: "1.0"',
+      'current_phase: 1',
+      'current_phase_name: Test Phase',
+      'status: planning',
+      'last_activity: 2026-09-07',
+      '---',
+      '',
+      '## Current Position',
+      '',
+      'Status: In progress',
+      '',
+    ].join('\n'), 'utf-8');
+
+    const result = runGsdTools('state update last_activity 2026-09-07', tmpDir);
+    assert.ok(result.success, `state update failed: ${result.error}`);
+    const json = JSON.parse(result.output);
+    assert.strictEqual(
+      json.updated,
+      true,
+      `same-value case-D repair must report updated:true (got: ${JSON.stringify(json)})`,
+    );
   });
 });
 
