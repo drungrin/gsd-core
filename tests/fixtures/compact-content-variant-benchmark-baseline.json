@@ -23,9 +23,9 @@
       "reductionPct": 20.79
     },
     "agents/gsd-code-fixer.md": {
-      "offTokens": 10734,
+      "offTokens": 10709,
       "onTokens": 6682,
-      "reductionPct": 37.75
+      "reductionPct": 37.6
     },
     "agents/gsd-code-reviewer.md": {
       "offTokens": 4408,
@@ -38,9 +38,9 @@
       "reductionPct": 9.76
     },
     "agents/gsd-debug-session-manager.md": {
-      "offTokens": 4766,
+      "offTokens": 4741,
       "onTokens": 4477,
-      "reductionPct": 6.06
+      "reductionPct": 5.57
     },
     "agents/gsd-doc-classifier.md": {
       "offTokens": 2901,
@@ -73,9 +73,9 @@
       "reductionPct": 17.83
     },
     "agents/gsd-eval-auditor.md": {
-      "offTokens": 2941,
+      "offTokens": 2916,
       "onTokens": 2808,
-      "reductionPct": 4.52
+      "reductionPct": 3.7
     },
     "agents/gsd-eval-planner.md": {
       "offTokens": 1674,
@@ -93,9 +93,9 @@
       "reductionPct": 42.1
     },
     "agents/gsd-intel-updater.md": {
-      "offTokens": 4353,
+      "offTokens": 4328,
       "onTokens": 4115,
-      "reductionPct": 5.47
+      "reductionPct": 4.92
     },
     "agents/gsd-mempalace-curator.md": {
       "offTokens": 1160,
@@ -113,14 +113,14 @@
       "reductionPct": 15.37
     },
     "agents/gsd-project-researcher.md": {
-      "offTokens": 5464,
+      "offTokens": 5439,
       "onTokens": 5135,
-      "reductionPct": 6.02
+      "reductionPct": 5.59
     },
     "agents/gsd-research-synthesizer.md": {
-      "offTokens": 3122,
+      "offTokens": 3097,
       "onTokens": 2917,
-      "reductionPct": 6.57
+      "reductionPct": 5.81
     },
     "agents/gsd-roadmapper.md": {
       "offTokens": 6008,
@@ -143,9 +143,9 @@
       "reductionPct": 32.25
     },
     "agents/gsd-ui-researcher.md": {
-      "offTokens": 5432,
+      "offTokens": 5407,
       "onTokens": 4815,
-      "reductionPct": 11.36
+      "reductionPct": 10.95
     },
     "agents/gsd-user-profiler.md": {
       "offTokens": 1859,
@@ -169,8 +169,8 @@
     }
   },
   "aggregate": {
-    "offTokens": 118691,
+    "offTokens": 118516,
     "onTokens": 94333,
-    "reductionPct": 20.52
+    "reductionPct": 20.4
   }
 }
