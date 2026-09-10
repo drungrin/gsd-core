@@ -72,7 +72,7 @@ if [ -f .planning/config.json ]; then
   # Parse the captured payload without a short-reading pipeline. Under
   # `pipefail`, `printf | head -1` can surface SIGPIPE (141) when the optional
   # commit-type list is larger than the pipe buffer (#4429).
-  ENABLED=${CONFIG_OUT%%$'\n'*}
+  ENABLED="${CONFIG_OUT%%$'\n'*}"
   if [ "$ENABLED" != "1" ]; then exit 0; fi
   # Remaining lines (if any) are the sanitized, deduped configured commit
   # types beyond the 10 built-ins (#3811). Read into a bash-3.2-safe array —
