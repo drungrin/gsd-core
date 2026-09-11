@@ -867,8 +867,33 @@ function loadConfigResolved(cwd: string, options: Record<string, unknown> = {}):
 
     _warnUnknownProfileOverrides(parsed, '.planning/config.json');
 
-    const get = (key: string, nested?: { section: string; field: string }): unknown =>
-      _getConfigValue(parsed, key, nested);
+    // #4071: project presence must not discard unrelated ~/.gsd/defaults.json
+    // keys. Resolve each value from the project first, then the global layer,
+    // so a nested project workflow key also beats a legacy flat global spelling.
+    let globalDefaults: Record<string, unknown> = {};
+    try {
+      const globalPath = path.join(process.env['GSD_HOME'] || os.homedir(), '.gsd', 'defaults.json');
+      const globalRead = _readConfigFile(globalPath);
+      if (globalRead.kind === 'ok') globalDefaults = globalRead.data;
+      else if (globalRead.kind === 'fault') {
+        configFault ??= globalRead.fault;
+        _warnUnusableConfig(globalRead.fault);
+      }
+    } catch { /* intentionally empty */ }
+
+    const get = (key: string, nested?: { section: string; field: string }): unknown => {
+      const projectValue = _getConfigValue(parsed, key, nested);
+      return projectValue !== undefined ? projectValue : _getConfigValue(globalDefaults, key, nested);
+    };
+
+    const mergeObject = (key: string): Record<string, unknown> | null => {
+      const globalValue = globalDefaults[key];
+      const projectValue = parsed[key];
+      const globalObject = globalValue && typeof globalValue === 'object' && !Array.isArray(globalValue) ? globalValue as Record<string, unknown> : null;
+      const projectObject = projectValue && typeof projectValue === 'object' && !Array.isArray(projectValue) ? projectValue as Record<string, unknown> : null;
+      if (!globalObject && !projectObject) return null;
+      return { ...(globalObject || {}), ...(projectObject || {}) };
+    };
 
     /**
      * Nested-ONLY read — no top-level fallback (#3648).
@@ -929,19 +954,19 @@ function loadConfigResolved(cwd: string, options: Record<string, unknown> = {}):
       phase_naming: get('phase_naming') ?? defaults.phase_naming,
       project_code: get('project_code') ?? defaults.project_code,
       subagent_timeout: get('subagent_timeout', { section: 'workflow', field: 'subagent_timeout' }) ?? defaults.subagent_timeout,
-      model_overrides: (parsed['model_overrides']) || null,
+      model_overrides: mergeObject('model_overrides'),
       agent_tools: (parsed['agent_tools']) || null,
       models: (parsed['models']) || null,
-      granularity: parsed['granularity'] !== undefined ? parsed['granularity'] : null,
-      granularities: (parsed['granularities']) || null,
-      planning: (parsed['planning']) || null,
-      dynamic_routing: (parsed['dynamic_routing']) || null,
-      runtime: (parsed['runtime']) || null,
-      model_profile_overrides: (parsed['model_profile_overrides']) || null,
-      model_policy: (parsed['model_policy']) || null,
-      effort: (parsed['effort']) || null,
-      fast_mode: (parsed['fast_mode']) || null,
-      agent_skills: (parsed['agent_skills']) || {},
+      granularity: get('granularity') ?? null,
+      granularities: get('granularities') ?? null,
+      planning: mergeObject('planning'),
+      dynamic_routing: get('dynamic_routing') ?? null,
+      runtime: get('runtime') ?? null,
+      model_profile_overrides: mergeObject('model_profile_overrides'),
+      model_policy: get('model_policy') ?? null,
+      effort: mergeObject('effort'),
+      fast_mode: mergeObject('fast_mode'),
+      agent_skills: mergeObject('agent_skills') || {},
       agent_skills_security: (parsed['agent_skills_security']) || null,
       // #3587: phase_commit_docs.<phase-id> — a dynamic-key family shaped like
       // agent_skills above (`{ "<phase-id>": boolean }`). Must be threaded here
@@ -984,22 +1009,6 @@ function loadConfigResolved(cwd: string, options: Record<string, unknown> = {}):
     // A1 vs A2: disambiguate by whether a real workstream was requested.
     // Fix 4: empty-string ws ('') resolves the root path → source:'root'.
     const source: ConfigSource = wsRequested ? 'workstream' : 'root';
-
-    // #3532 (10b): a parsed project config means Branch D never runs, so every
-    // key ~/.gsd/defaults.json sets that Branch D would honor is silently inert
-    // here. Observation only — one deduped stderr warning; precedence is
-    // untouched. Faults in the global file stay silent in this branch (the
-    // project config governs; the nearer file is the actionable one).
-    try {
-      const shadowHome = process.env['GSD_HOME'] || os.homedir();
-      const shadowPath = path.join(shadowHome, '.gsd', 'defaults.json');
-      const shadowRead = _readConfigFile(shadowPath);
-      if (shadowRead.kind === 'ok') {
-        _warnShadowedGlobalDefaults(shadowRead.data, shadowPath);
-      }
-    } catch {
-      // Observation only — never let the diagnostic perturb resolution.
-    }
 
     // This config parsed — but a DIFFERENT file on the resolution path may not
     // have. A workstream config that loads cleanly while the root config it

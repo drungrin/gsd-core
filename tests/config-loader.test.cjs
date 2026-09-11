@@ -1317,7 +1317,7 @@ const GLOBAL_KEYS_SHADOWED_UNDER_PROJECT = [
   'model_profile_overrides', 'model_policy',
 ];
 
-describe('#3532 shadowed global-defaults warning', () => {
+describe.skip('#3532 shadowed global-defaults warning (superseded by #4071 merge)', () => {
   let tmpDir;
   let gsdHome;
   let stderrLines;
@@ -1464,6 +1464,43 @@ describe('#3532 shadowed global-defaults warning', () => {
     );
     _resetRuntimeWarningCacheForTests();
     assert.equal(configLoader._warnedShadowedGlobalKeys.size, 0);
+  });
+});
+
+describe('#4071 project config inherits global defaults per key', () => {
+  let tmpDir;
+  let gsdHome;
+  let originalGsdHome;
+
+  beforeEach(() => {
+    tmpDir = makeTempProject('gsd-4071-project-');
+    gsdHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-4071-home-'));
+    originalGsdHome = process.env.GSD_HOME;
+    process.env.GSD_HOME = gsdHome;
+  });
+  afterEach(() => {
+    if (originalGsdHome === undefined) delete process.env.GSD_HOME;
+    else process.env.GSD_HOME = originalGsdHome;
+    cleanup(tmpDir); cleanup(gsdHome);
+  });
+  function writeGlobal(obj) {
+    fs.mkdirSync(path.join(gsdHome, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(gsdHome, '.gsd', 'defaults.json'), JSON.stringify(obj));
+  }
+  test('honors global model_profile absent from project config', () => {
+    writeConfig(tmpDir, { granularity: 'standard' });
+    writeGlobal({ model_profile: 'budget' });
+    assert.equal(loadConfigResolved(tmpDir).config.model_profile, 'budget');
+  });
+  test('project model_profile still wins on collision', () => {
+    writeConfig(tmpDir, { model_profile: 'quality' });
+    writeGlobal({ model_profile: 'budget' });
+    assert.equal(loadConfigResolved(tmpDir).config.model_profile, 'quality');
+  });
+  test('merges model overrides by agent key', () => {
+    writeConfig(tmpDir, { model_overrides: { 'gsd-executor': 'project' } });
+    writeGlobal({ model_overrides: { 'gsd-planner': 'global', 'gsd-executor': 'global' } });
+    assert.deepEqual(loadConfigResolved(tmpDir).config.model_overrides, { 'gsd-planner': 'global', 'gsd-executor': 'project' });
   });
 });
 

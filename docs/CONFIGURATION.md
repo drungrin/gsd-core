@@ -2294,16 +2294,13 @@ When `/gsd-new-project` creates a new `config.json`, it reads global defaults an
 
 ### What a global file can and cannot set at runtime
 
-Two different rules apply, and the difference is deliberate ([#3532](https://github.com/open-gsd/gsd-core/issues/3532)):
+Two different rules apply:
 
 - **In a directory with no `.planning/` at all**, `~/.gsd/defaults.json` is the active
   configuration — model resolution reads it directly.
-- **In a real project (`.planning/config.json` present, even if empty)**, the global file is
-  **not read for model resolution** — every model-side key it sets (`model_profile`,
-  `model_overrides`, `models`, `dynamic_routing`, `runtime`, and the rest of the resolution
-  set) is inert there. GSD prints a one-time stderr warning naming the shadowed keys when it
-  detects this, instead of failing silently. To apply a global model setting to a project,
-  put it in that project's `.planning/config.json`.
+- **In a real project (`.planning/config.json` present)**, global resolution keys are merged
+  per key: an explicit project value wins only for that key, while an absent project key
+  inherits the global value ([#4071](https://github.com/open-gsd/gsd-core/issues/4071)).
 - **`effort` is the exception**: the install-time effort channel always merges
   `~/.gsd/defaults.json` with the project config (that is how `effort sync` works), so a
   global `effort` block keeps working in projects and does not trigger the warning.
