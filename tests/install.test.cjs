@@ -8284,8 +8284,7 @@ describe('#4377: --relative-includes emits project-relative @ includes for a loc
   // affected files across commands, workflows and references on a real repo —
   // a commands-only assertion would have called this fixed while 124 workflow
   // and reference files still carried the baked path.
-  const allBodies = (root) => {
-    const base = path.join(root, '.claude');
+  const allBodies = (root, base = path.join(root, '.claude')) => {
     const out = [];
     const walk = (dir) => {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -8319,6 +8318,24 @@ describe('#4377: --relative-includes emits project-relative @ includes for a loc
     // pass the arm above while shipping includes that point nowhere.
     const withRelative = allBodies(relDir).filter((f) => f.content.includes('@.claude/gsd-core/'));
     assert.ok(withRelative.length > 0, 'expected @.claude/gsd-core/ includes in the relative install');
+  });
+
+  test('a project-root runtime falls back to absolute includes instead of inventing its descriptor directory', (t) => {
+    // Cline declares localTargetIsProjectRoot: local agents live in `agents/`,
+    // not `.cline/agents/`.  A relative `.cline/` prefix would therefore point
+    // at a directory the install never creates.  This crosses the real install
+    // plan and agent-rewrite seam; testing _localIncludeDirName alone would not
+    // prove every production consumer uses the guard.
+    const clineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-4377-cline-'));
+    t.after(() => cleanup(clineDir));
+    install(clineDir, ['--cline', '--local', '--no-sdk', '--relative-includes']);
+
+    const agents = allBodies(clineDir, path.join(clineDir, 'agents'));
+    assert.ok(agents.length > 0, 'the local Cline install must emit agents at the project root');
+    const descriptorRelative = agents.filter((f) => f.content.includes('@.cline/gsd-core/')).map((f) => f.rel);
+    assert.deepEqual(descriptorRelative, [], 'Cline has no .cline/ local target, so its includes must not use one');
+    const absoluteFallback = agents.filter((f) => f.content.includes(`@${toPosix(clineDir)}/gsd-core/`));
+    assert.ok(absoluteFallback.length > 0, 'an unrepresentable project-relative target must retain the safe absolute prefix');
   });
 
   test('the launcher shim keeps ABSOLUTE shell defaults even with the flag', () => {
