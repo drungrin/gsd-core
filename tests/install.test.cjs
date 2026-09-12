@@ -8334,7 +8334,8 @@ describe('#4377: --relative-includes emits project-relative @ includes for a loc
     assert.ok(agents.length > 0, 'the local Cline install must emit agents at the project root');
     const descriptorRelative = agents.filter((f) => f.content.includes('@.cline/gsd-core/')).map((f) => f.rel);
     assert.deepEqual(descriptorRelative, [], 'Cline has no .cline/ local target, so its includes must not use one');
-    const absoluteFallback = agents.filter((f) => f.content.includes(`@${toPosix(clineDir)}/gsd-core/`));
+    const absoluteFallback = agents.filter((f) => rootSpellings(clineDir)
+      .some((root) => f.content.includes(`@${root}/gsd-core/`)));
     assert.ok(absoluteFallback.length > 0, 'an unrepresentable project-relative target must retain the safe absolute prefix');
   });
 
