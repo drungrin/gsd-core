@@ -18,8 +18,6 @@ const path = _require('node:path') as typeof import('node:path');
 // (see the module-level doc comment on `isGlobalScope` for why the
 // projection is centralized rather than eliminated).
 import { isGlobalScope, type InstallScope } from './install-scope.cjs';
-// #4377: the runtime's own localConfigDir, for the project-relative include style.
-import { getDirName } from './runtime-name-policy.cjs';
 
 type ArtifactKindName = 'commands' | 'agents' | 'skills' | 'kimi-agents';
 
@@ -94,6 +92,7 @@ interface RuntimeArtifactConversionExports {
   rewriteStagedSkillBodies: (stagedDir: string, opts: RewriteOpts) => string | void;
   rewriteStagedCommandBodies: (stagedDir: string, opts: RewriteOpts) => string | void;
   _computePathPrefix: (opts: ComputePathPrefixOpts) => string;
+  _localIncludeDirName: (runtime: string) => string | undefined;
 }
 
 interface PlanItem {
@@ -214,7 +213,7 @@ function createRuntimeArtifactInstallPlan(args: CreateRuntimeArtifactInstallPlan
   const isWindowsHost = (platform ?? process.platform) === 'win32';
   // #4377: descriptor-derived local dir name, so an opted-in local install
   // emits a project-relative prefix instead of this checkout's absolute path.
-  const pathPrefix = conversionExports._computePathPrefix({ isGlobal, isOpencode, isWindowsHost, resolvedTarget, homeDir, localDirName: getDirName(layout.runtime) });
+  const pathPrefix = conversionExports._computePathPrefix({ isGlobal, isOpencode, isWindowsHost, resolvedTarget, homeDir, localDirName: conversionExports._localIncludeDirName(layout.runtime) });
   const attribution = resolveAttribution ? resolveAttribution(layout.runtime) : undefined;
   // #2875 Part 2 (row I1): layout.configDir IS the install root the inline
   // agent loop called `targetDir` — same value, same resolution.
