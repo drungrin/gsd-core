@@ -29,7 +29,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const { cleanup, createTempDir, installSpawnEnv, writeAmbientCapabilityGate } = require('./helpers.cjs');
+const { cleanup, createTempDir, installSpawnEnv, withAmbientCapabilityHome } = require('./helpers.cjs');
 
 const GSD_TOOLS = path.join(__dirname, '..', 'gsd-core', 'bin', 'gsd-tools.cjs');
 
@@ -75,8 +75,8 @@ function runTools(args, cwd, envOverrides = {}) {
     {
       cwd: cwd || process.cwd(),
       encoding: 'utf8',
-    timeout: PLAN_PRE_HOOK_CLI_TIMEOUT_MS,
-    env: installSpawnEnv({ ...CLEAN_ENV, ...envOverrides }),
+      timeout: PLAN_PRE_HOOK_CLI_TIMEOUT_MS,
+      env: installSpawnEnv({ ...CLEAN_ENV, ...envOverrides }),
     },
   );
 }
@@ -278,31 +278,19 @@ describe('plan:pre all-off — empty resolution', () => {
     assert.strictEqual(result.status, 0, `exit non-zero. stderr=${result.stderr?.slice(0, 300)}`);
     const envelope = parseEnvelope(result, 'all-off');
 
-    assert.deepEqual(envelope.activeHooks, [],
+    assert.deepStrictEqual(envelope.activeHooks, [],
       `activeHooks must be empty when all flags false. Got: ${JSON.stringify(envelope.activeHooks.map(h=>h.capId))}`);
     assert.strictEqual(envelope.rendered, '_No active hooks at plan:pre._',
       'rendered must be placeholder when no active hooks');
   });
 
   test('#4485: an ambient plan:pre capability cannot perturb the empty resolution', (t) => {
-    const ambientHome = createTempDir('gsd-ambient-plan-pre-');
-    writeAmbientCapabilityGate(ambientHome, 'ambient-plan-pre', 'plan:pre');
-    const previous = { home: process.env.HOME, userprofile: process.env.USERPROFILE, gsdHome: process.env.GSD_HOME };
-    process.env.HOME = ambientHome;
-    process.env.USERPROFILE = ambientHome;
-    process.env.GSD_HOME = ambientHome;
-    t.after(() => {
-      for (const [key, value] of [['HOME', previous.home], ['USERPROFILE', previous.userprofile], ['GSD_HOME', previous.gsdHome]]) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
-      cleanup(ambientHome);
-    });
+    withAmbientCapabilityHome(t, 'gsd-ambient-plan-pre-', 'ambient-plan-pre', 'plan:pre');
 
     const result = runTools(['loop', 'render-hooks', 'plan:pre', '--cwd', tmpDir, '--raw'], tmpDir);
     assert.strictEqual(result.status, 0, `exit non-zero. stderr=${result.stderr?.slice(0, 300)}`);
     const envelope = parseEnvelope(result, 'all-off-ambient');
-    assert.deepEqual(envelope.activeHooks, []);
+    assert.deepStrictEqual(envelope.activeHooks, []);
   });
 });
 

@@ -23,7 +23,7 @@ const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
 
-const { runGsdTools, createTempProject, createTempDir, cleanup, installSpawnEnv, writeAmbientCapabilityGate } = require('./helpers.cjs');
+const { runGsdTools, createTempProject, createTempDir, cleanup, installSpawnEnv, withAmbientCapabilityHome } = require('./helpers.cjs');
 const { LOOP_HOOK_POINT_CLI_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
 const GSD_TOOLS = path.join(__dirname, '..', 'gsd-core', 'bin', 'gsd-tools.cjs');
@@ -138,24 +138,12 @@ describe('render-hooks plan:post — gate discovery', () => {
   });
 
   test('#4485: render-hooks ignores capabilities installed in ambient user locations', (t) => {
-    const ambientHome = createTempDir('gsd-ambient-plan-post-');
-    writeAmbientCapabilityGate(ambientHome, 'ambient-plan-post', 'plan:post');
-    const previous = { home: process.env.HOME, userprofile: process.env.USERPROFILE, gsdHome: process.env.GSD_HOME };
-    process.env.HOME = ambientHome;
-    process.env.USERPROFILE = ambientHome;
-    process.env.GSD_HOME = ambientHome;
-    t.after(() => {
-      for (const [key, value] of [['HOME', previous.home], ['USERPROFILE', previous.userprofile], ['GSD_HOME', previous.gsdHome]]) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
-      cleanup(ambientHome);
-    });
+    withAmbientCapabilityHome(t, 'gsd-ambient-plan-post-', 'ambient-plan-post', 'plan:post');
 
     const result = spawnRenderHooks('plan:post', tmpDir);
     assert.strictEqual(result.status, 0, `exit non-zero: ${result.stderr}`);
-    const activeIds = JSON.parse(result.stdout).activeHooks.map((hook) => hook.capId);
-    assert.deepStrictEqual(activeIds, ['gap-analysis']);
+    const activeHooks = JSON.parse(result.stdout).activeHooks;
+    assert.deepStrictEqual(activeHooks.map((hook) => [hook.capId, hook.check?.query]), [['gap-analysis', 'gap-analysis.plan-post']]);
   });
 
   test('[negative] render-hooks plan:post returns empty activeHooks when workflow.post_planning_gaps=false (gate deactivated)', () => {

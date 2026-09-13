@@ -1274,7 +1274,27 @@ function writeAmbientCapabilityGate(home, id, point) {
   }), 'utf8');
 }
 
-module.exports = { runGsdTools, createTempDir, createTempProject, createTempGitProject, cleanup, tmpRootCandidates, readFileNormalized, readWorkflowCombined, parseFrontmatter, isUsageOutput, captureConsole, toPosixPath, absPlanningPath, runNpm, isolatedNpmEnv, withIsolatedProcessState, delay, waitFor, resetRuntimeWarningCaches, SESSION_ENV_KEYS, saveSessionEnv, restoreSessionEnv, clearSessionEnv, isolateWorkstreamEnv, restoreWorkstreamEnv, TOOLS_PATH, SESSION_IDENTITY_ENV_KEYS, scrubConfigLocationEnv, installSpawnEnv, installSpawnHome, sandboxHome, writePackageSourceMarkerFixture, writeAmbientCapabilityGate, TEST_HOME_SANDBOX_MARKER, mockPartialWriteThenThrow, captureFdSync, suppressFdAsync };
+/**
+ * Put a capability in the parent process's ambient home for one serial test.
+ * The child must still receive installSpawnEnv()'s different sandbox home.
+ */
+function withAmbientCapabilityHome(t, prefix, id, point) {
+  const home = createTempDir(prefix);
+  writeAmbientCapabilityGate(home, id, point);
+  const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  t.after(() => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    cleanup(home);
+  });
+  return home;
+}
+
+module.exports = { runGsdTools, createTempDir, createTempProject, createTempGitProject, cleanup, tmpRootCandidates, readFileNormalized, readWorkflowCombined, parseFrontmatter, isUsageOutput, captureConsole, toPosixPath, absPlanningPath, runNpm, isolatedNpmEnv, withIsolatedProcessState, delay, waitFor, resetRuntimeWarningCaches, SESSION_ENV_KEYS, saveSessionEnv, restoreSessionEnv, clearSessionEnv, isolateWorkstreamEnv, restoreWorkstreamEnv, TOOLS_PATH, SESSION_IDENTITY_ENV_KEYS, scrubConfigLocationEnv, installSpawnEnv, installSpawnHome, sandboxHome, writePackageSourceMarkerFixture, writeAmbientCapabilityGate, withAmbientCapabilityHome, TEST_HOME_SANDBOX_MARKER, mockPartialWriteThenThrow, captureFdSync, suppressFdAsync };
 
 // Lazy, for the reason builtLib() is lazy: reading either of these is what
 // forces the built-lib require, so a test file that needs neither can still
