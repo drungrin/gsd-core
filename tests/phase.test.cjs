@@ -6225,6 +6225,22 @@ describe('#2028 — phase complete milestone-end + workstream guard', () => {
     assert.match(result.error || '', /workstream|--ws/i, 'error should name the workstream requirement');
   });
 
+  test('refuses to write root when GSD_WORKSTREAM is whitespace only', (t) => {
+    fs.mkdirSync(path.join(tmpDir, '.planning', 'workstreams', 'alpha'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), '# State\n');
+    fs.writeFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), '# Roadmap\n\n### Phase 1: A\n**Goal:** x\n');
+    const previous = process.env.GSD_WORKSTREAM;
+    t.after(() => {
+      if (previous === undefined) delete process.env.GSD_WORKSTREAM;
+      else process.env.GSD_WORKSTREAM = previous;
+    });
+    process.env.GSD_WORKSTREAM = ' \t ';
+
+    const result = runGsdTools('phase complete 1', tmpDir);
+    assert.equal(result.success, false, 'a whitespace workstream must not write the shared root');
+    assert.match(result.error || '', /workstream|--ws/i);
+  });
+
   // An explicit --ws satisfies the guard (it sets GSD_WORKSTREAM upstream) AND
   // targets that workstream — the write must land in the workstream's own
   // STATE.md/ROADMAP.md, leaving root untouched.
