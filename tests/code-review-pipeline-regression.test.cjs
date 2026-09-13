@@ -158,17 +158,23 @@ describe('Bug 1 — compute_file_scope SUMMARY parser', () => {
     assert.equal(result.exitCode, 0, `bash rejected the shipped fence:\n${result.stderr}`);
   });
 
-  test('#4461: the shipped heredoc treats adversarial SUMMARY text and paths as inert data', () => {
+  test('#4461: the shipped extractor helper treats adversarial SUMMARY text and argv as inert data', () => {
     const src = readFileNormalized(WORKFLOW_PATH);
     const helperStart = src.indexOf('  extract_summary_files() {');
-    const helperEnd = src.indexOf('\n  \n  if [ -n "$SUMMARIES" ]; then', helperStart);
+    // Anchor on the real loop gate, not the whitespace-only separator above it:
+    // editors are entitled to trim trailing spaces without changing behavior.
+    const helperEnd = src.indexOf('\n  if [ -n "$SUMMARIES" ]; then', helperStart);
     assert.ok(helperStart !== -1 && helperEnd !== -1, 'extract_summary_files helper must be extractable');
     const helper = src.slice(helperStart, helperEnd);
 
     const dir = createTempDir('gsd-4461-adversarial-');
     try {
       const sentinel = path.join(dir, 'MUST-NOT-EXIST');
-      // Double quotes are not legal in Windows filenames. Keep the path
+      // This directly executes the shipped helper's argv boundary. It does
+      // not claim the workflow's outer SUMMARY-list iteration preserves
+      // whitespace; that pre-existing shell-word-splitting behavior remains
+      // tracked separately by #4109.
+      // Double quotes are not legal in Windows filenames. Keep the argv
       // adversarial with shell syntax, whitespace, and a quote that is valid
       // on every supported filesystem; the SUMMARY payload below exercises
       // a literal double quote independently.
