@@ -3019,6 +3019,8 @@ function computePathPrefix({
   homeDir,
   projectRelative = relativeIncludesEnabled(),
   localDirName,
+  projectRoot = process.cwd(),
+  projectRelativePath,
 }) {
   // #1615: normalize Windows backslashes to forward slashes. This prefix is
   // substituted into markdown @-references (e.g. Windsurf workflow files),
@@ -3032,10 +3034,23 @@ function computePathPrefix({
     return '$HOME' + posixTarget.slice(posixHome.length) + '/';
   }
   if (!isGlobal && projectRelative) {
-    const relative = projectRelativePrefix(localDirName);
+    // An explicit local config dir need not be the descriptor's conventional
+    // `.claude`-style directory. Derive from the resolved target first; only
+    // use the descriptor as the legacy fallback when no project root exists.
+    const relative = projectRelativePrefix(projectRelativePath)
+      || projectRelativePrefixFromProjectRoot(projectRoot, resolvedTarget)
+      || projectRelativePrefix(localDirName);
     if (relative) return relative;
   }
   return `${posixTarget}/`;
+}
+
+/** Return a safe project-relative prefix for a resolved install target. */
+function projectRelativePrefixFromProjectRoot(projectRoot: unknown, resolvedTarget: unknown): string {
+  if (typeof projectRoot !== 'string' || typeof resolvedTarget !== 'string') return '';
+  const relative = posixNormalize(path.relative(projectRoot, resolvedTarget));
+  if (!relative || relative === '.' || relative === '..' || relative.startsWith('../') || path.isAbsolute(relative)) return '';
+  return projectRelativePrefix(relative);
 }
 
 /**
@@ -4160,6 +4175,7 @@ export = {
   _isRelativePathPrefix: isRelativePathPrefix,
   _relativeIncludesEnabled: relativeIncludesEnabled,
   _projectRelativePrefix: projectRelativePrefix,
+  _projectRelativePrefixFromProjectRoot: projectRelativePrefixFromProjectRoot,
   _localIncludeDirName: localIncludeDirName,
   _restoreClaudeGlobalAtRefTilde: restoreClaudeGlobalAtRefTilde,
   _applyRuntimeRewrites,

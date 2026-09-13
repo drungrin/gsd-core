@@ -9928,6 +9928,11 @@ function writeManifest(configDir, runtime = DEFAULT_RUNTIME, options = {}) {
     // it from the directory it happened to be found in (#2872).
     runtime,
     scope: resolvedScope,
+    // #4377: a surface re-apply is a separate process and cannot rely on the
+    // installer's environment. Persist only a safe project-relative prefix.
+    relativeIncludePrefix: resolvedScope === 'local' && hasRelativeIncludes
+      ? runtimeArtifactConversion._projectRelativePrefixFromProjectRoot(process.cwd(), configDir)
+      : undefined,
     files: {},
   };
 

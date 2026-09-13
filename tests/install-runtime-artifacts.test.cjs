@@ -5278,6 +5278,13 @@ describe('#4377 _computePathPrefix — project-relative local includes', () => {
     );
   });
 
+  test('an explicit local target derives its prefix from the resolved target, not the runtime default', () => {
+    assert.equal(
+      prefix({ projectRelative: true, projectRoot: '/project', resolvedTarget: '/project/.custom/claude', localDirName: '.claude' }),
+      '.custom/claude/',
+    );
+  });
+
   test('a Windows-style descriptor value is normalized to POSIX', () => {
     // The prefix is substituted into markdown @-references, which are POSIX
     // universally — a backslash here leaks into shipped content (#1615).

@@ -8320,6 +8320,11 @@ describe('#4377: --relative-includes emits project-relative @ includes for a loc
     assert.ok(withRelative.length > 0, 'expected @.claude/gsd-core/ includes in the relative install');
   });
 
+  test('the local install manifest persists the relative style for a later surface apply', () => {
+    const manifest = JSON.parse(fs.readFileSync(path.join(relDir, '.claude', 'gsd-file-manifest.json'), 'utf8'));
+    assert.equal(manifest.relativeIncludePrefix, '.claude/');
+  });
+
   test('a project-root runtime falls back to absolute includes instead of inventing its descriptor directory', (t) => {
     // Cline declares localTargetIsProjectRoot: local agents live in `agents/`,
     // not `.cline/agents/`.  A relative `.cline/` prefix would therefore point
