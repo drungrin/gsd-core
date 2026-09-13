@@ -29,7 +29,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const { cleanup, createTempDir, installSpawnEnv, withAmbientCapabilityHome } = require('./helpers.cjs');
+const { cleanup, installSpawnEnv, withAmbientCapabilityHome } = require('./helpers.cjs');
 
 const GSD_TOOLS = path.join(__dirname, '..', 'gsd-core', 'bin', 'gsd-tools.cjs');
 

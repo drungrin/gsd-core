@@ -23,7 +23,7 @@ const path = require('path');
 const os = require('os');
 const { spawnSync } = require('child_process');
 
-const { runGsdTools, createTempProject, createTempDir, cleanup, installSpawnEnv, withAmbientCapabilityHome } = require('./helpers.cjs');
+const { runGsdTools, createTempProject, cleanup, installSpawnEnv, withAmbientCapabilityHome } = require('./helpers.cjs');
 const { LOOP_HOOK_POINT_CLI_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
 const GSD_TOOLS = path.join(__dirname, '..', 'gsd-core', 'bin', 'gsd-tools.cjs');
