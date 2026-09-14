@@ -18,15 +18,9 @@
       "reductionPct": 16.51
     },
     "execute-phase": {
-<<<<<<< HEAD
-      "offTokens": 25952,
-      "onTokens": 23701,
+      "offTokens": 25960,
+      "onTokens": 23709,
       "reductionPct": 8.67
-=======
-      "offTokens": 25835,
-      "onTokens": 23584,
-      "reductionPct": 8.71
->>>>>>> d29de43d4 (chore(#4483): refresh compact-content baseline)
     },
     "new-project": {
       "offTokens": 14279,
@@ -45,19 +39,8 @@
     }
   },
   "aggregate": {
-<<<<<<< HEAD
-<<<<<<< HEAD
-    "offTokens": 107411,
-    "onTokens": 90763,
+    "offTokens": 107419,
+    "onTokens": 90771,
     "reductionPct": 15.5
-=======
-    "offTokens": 107293,
-    "onTokens": 90645,
-=======
-    "offTokens": 107294,
-    "onTokens": 90646,
->>>>>>> 332fc4ccf (chore(#4483): regenerate compact content baseline)
-    "reductionPct": 15.52
->>>>>>> d29de43d4 (chore(#4483): refresh compact-content baseline)
   }
 }
