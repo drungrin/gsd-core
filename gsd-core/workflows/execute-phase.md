@@ -1082,7 +1082,29 @@ When executor returns a checkpoint AND `AUTO_MODE` is `true`:
    [Awaiting section from agent return]
    ```
 5. User responds: "approved"/"done" | issue description | decision selection
-6. **Spawn continuation agent (NOT resume)** using continuation-prompt.md template:
+6. **Spawn continuation agent (NOT resume)** with the prompt below. This is the authoritative
+   form: build the prompt from it, do not look for a template file. (The template this step
+   used to name was retired in January 2026 when the logic moved into the subagents; the four
+   values it carried are contracted below.) Substitute each placeholder, keep the section
+   order, and add nothing the fresh agent cannot verify from the repository:
+
+   ```
+   Continue this plan from a checkpoint. You are a FRESH agent — you did not run the tasks
+   below and must not assume their state; verify each commit before continuing.
+
+   ## Completed tasks
+   {completed_tasks_table}
+
+   ## Resume at
+   Task {resume_task_number}: {resume_task_name}
+
+   ## User response to the checkpoint
+   {user_response}
+
+   ## Resume instructions
+   {resume_instructions}
+   ```
+
    - `{completed_tasks_table}`: From checkpoint return
    - `{resume_task_number}` + `{resume_task_name}`: Current task
    - `{user_response}`: What user provided
