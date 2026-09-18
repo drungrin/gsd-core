@@ -686,14 +686,28 @@ describe('#3177: debug.md dispatches its session manager in the foreground', () 
       '{resume_instructions}',
     ];
 
-    /** Step 6 of checkpoint_handling, up to step 7. */
+    const PART = path.join(
+      ROOT, 'gsd-core', 'workflows', 'execute-phase', 'steps', 'checkpoint-continuation-prompt.md',
+    );
+
+    /**
+     * Step 6 of checkpoint_handling plus the part it points at. The prompt lives
+     * in the part because execute-phase.md sits under a frozen ADR-857 byte
+     * ceiling — the same reason `stale-reverification.md` is a part. What this
+     * guard cares about is that ONE authoritative prompt exists and that no
+     * unshipped template is named; which of the two files carries it is a size
+     * decision, not a contract one.
+     */
     function spawnStep() {
       const text = fs.readFileSync(WORKFLOW, 'utf8');
       const start = text.indexOf('6. **Spawn continuation agent (NOT resume)**');
       assert.notEqual(start, -1, 'the continuation-agent spawn step is gone — this guard is pointed at nothing');
       const rest = text.slice(start);
       const end = rest.indexOf('\n7. ');
-      return rest.slice(0, end === -1 ? rest.length : end);
+      const spine = rest.slice(0, end === -1 ? rest.length : end);
+      assert.match(spine, /checkpoint-continuation-prompt\.md/,
+        'the spine step must point at the part that carries the prompt');
+      return `${spine}\n${fs.readFileSync(PART, 'utf8')}`;
     }
 
     __contTest('does not send the agent to a template file that is not shipped', () => {
