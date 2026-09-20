@@ -958,6 +958,10 @@ describe('issue #3210: execute-phase auto-mode carve-out exempts precondition-un
 // update_roadmap when the marker is unticked, without redoing verification.
 
 describe('execute-phase workflow: #3684 verified-unmarked resume', () => {
+  const PASSED_RESUME_PATH = path.join(
+    __dirname, '..', 'gsd-core', 'workflows', 'execute-phase', 'steps', 'passed-resume.md',
+  );
+
   function stepText() {
     const content = fs.readFileSync(WORKFLOW_PATH, 'utf-8');
     const start = content.indexOf('<step name="discover_and_group_plans">');
@@ -1001,6 +1005,20 @@ describe('execute-phase workflow: #3684 verified-unmarked resume', () => {
       branch.includes('#3684'),
       'the branch must cite #3684',
     );
+    assert.ok(
+      branch.includes('execute-phase/steps/passed-resume.md'),
+      'the compact host arm must route to the part that owns the preserved behavior',
+    );
+  });
+
+  test('passed-resume part preserves the user-facing report and tail route', () => {
+    const part = fs.readFileSync(PASSED_RESUME_PATH, 'utf-8');
+    assert.match(part, /Phase \{X\} is verified but never marked complete/,
+      'the extracted part must preserve the verified-but-unmarked report');
+    assert.match(part, /Continue directly at `update_roadmap`/,
+      'the extracted part must preserve the tail route');
+    assert.match(part, /do not rerun it or any gate/,
+      'the extracted part must forbid repeating verification and prior gates');
   });
 
   test('genuinely-finished exit and the 2868 branch are unchanged', () => {
