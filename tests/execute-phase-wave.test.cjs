@@ -1337,20 +1337,29 @@ describe('execute-phase workflow: #4765 not-passed verification resume', () => {
       'the arm must forbid the route that produced the false "verified" claim');
   });
 
-  test('the new arm is ordered after stale and missing, before the marked-complete exit', () => {
-    // Order is the contract here: the ladder is "first match decides". A stale
-    // report is re-verifiable and must keep reaching its own arm; a missing one
-    // must keep reaching the #2868 route.
+  test('the new arm follows every prior resume route', () => {
     const step = stepText();
     const stale = step.indexOf('`VERIFY_STATUS == stale`');
     const missing = step.indexOf('`VERIFY_STATUS == missing`');
     const marked = step.indexOf('**`PHASE_MARKED` is `true`**');
+    const passed = step.indexOf('`VERIFY_STATUS == passed` + `PHASE_MARKED` not `true`');
     const unpassed = step.indexOf('`gaps_found`, `human_needed` or `unknown`');
-    assert.ok(stale !== -1 && missing !== -1 && marked !== -1 && unpassed !== -1,
-      'all four arms must be present');
+    assert.ok(stale !== -1 && missing !== -1 && marked !== -1 && passed !== -1 && unpassed !== -1,
+      'all five resume arms must be present');
     assert.ok(stale < missing, 'stale stays first');
     assert.ok(missing < marked, 'missing stays ahead of the marked-complete exit');
-    assert.ok(marked < unpassed, 'the marked-complete exit is unchanged and still wins');
+    assert.ok(marked < passed, 'the marked-complete exit stays ahead of the passed resume');
+    assert.ok(passed < unpassed, 'the unpassed route follows the #3684 passed route');
+  });
+
+  test('the part fails loudly when verification does not provide a next action', () => {
+    const part = fs.readFileSync(PART_PATH, 'utf-8');
+    assert.match(part, /gsd_run query verification\.status "\$\{PHASE_DIR\}" 2>\/dev\/null/,
+      'the verification query should tolerate a read failure');
+    assert.match(part, /jq -r '.next_action \/\/ ""' 2>\/dev\/null \|\| echo ""/,
+      'next_action extraction should tolerate malformed verification output');
+    assert.match(part, /Verification did not provide a next action\. Inspect the report before continuing\./,
+      'an absent next_action must be explicit rather than rendering a blank line');
   });
 
   test('the part presents the status\'s own next action instead of restating it', () => {
