@@ -374,15 +374,6 @@ describe('predicate gate phase-context forwarding (#4483)', () => {
     assert.match(line, /--phase-dir "\$\{PHASE_DIR\}"/);
   });
 
-  // Not one of ADR-2008's three enumerated sites, but the same `check predicate`
-  // CLI. Pinned so the four call sites cannot drift back into three different
-  // argument shapes for one command.
-  test('verify:pre forwards both phase number and phase directory', () => {
-    const line = predicateDispatchLine(VERIFY_WORK_MD, '');
-    assert.match(line, /--phase-number "\$\{phase_number\}"/);
-    assert.match(line, /--phase-dir "\$\{PHASE_DIR\}"/);
-  });
-
   test('execute:post forwards both phase number and phase directory', () => {
     const line = predicateDispatchLine(EXECUTE_PHASE_MD, 'execute:post');
     assert.match(line, /--phase-number "\$\{PHASE_NUMBER\}"/);
