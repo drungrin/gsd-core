@@ -345,7 +345,6 @@ const SHIP_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'ship.md');
 const EXECUTE_PHASE_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-phase.md');
 const WAVE_POST_GATE_HOOKS_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-phase', 'steps', 'wave-post-gate-hooks.md');
 const PLAN_PHASE_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'plan-phase.md');
-const VERIFY_WORK_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'verify-work.md');
 
 // The repo's shared generic-gate-dispatch phrasing, used verbatim at execute:wave:post
 // (execute-phase.md), execute:post (execute-phase.md) and plan:post (plan-phase.md).
