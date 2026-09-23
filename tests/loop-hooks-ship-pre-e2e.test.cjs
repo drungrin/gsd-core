@@ -347,7 +347,7 @@ const WAVE_POST_GATE_HOOKS_MD = path.join(__dirname, '..', 'gsd-core', 'workflow
 const PLAN_PHASE_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'plan-phase.md');
 
 // The repo's shared generic-gate-dispatch phrasing, used verbatim at execute:wave:post
-// (execute-phase.md), execute:post (execute-phase.md) and plan:post (plan-phase.md).
+// (wave-post-gate-hooks.md), execute:post (execute-phase.md) and plan:post (plan-phase.md).
 // Matching the shared phrase — rather than an arbitrary literal — is what makes this a
 // contract assertion: ship:pre either speaks the same dispatch language as its siblings
 // or it is hand-rolling, which is precisely what references/loop-hook-dispatch.md forbids.
