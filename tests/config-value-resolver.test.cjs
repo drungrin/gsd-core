@@ -273,6 +273,24 @@ describe('Config Value Resolution Module (#5096)', () => {
     });
   });
 
+  test('a null parent blocks lower files but not schema or builtin defaults', () => {
+    withLayers((cwd) => {
+      writeLayer(cwd, 'root', { workflow: null, git: null });
+      writeLayer(cwd, 'global-defaults', {
+        workflow: { research: false },
+        git: { branching_strategy: 'global' },
+      });
+      const schema = resolveConfigValue('workflow.research', { cwd });
+      assert.equal(schema.found, true);
+      assert.equal(schema.value, true);
+      assert.equal(schema.layer, 'schema-default');
+      const builtin = resolveConfigValue('git.branching_strategy', { cwd });
+      assert.equal(builtin.found, true);
+      assert.equal(builtin.value, 'none');
+      assert.equal(builtin.layer, 'builtin-default');
+    });
+  });
+
   test('a composite inherited from root records workstream fallback reason', () => {
     withLayers((cwd) => {
       writeLayer(cwd, 'root', { agent_tools: { planner: [] } });

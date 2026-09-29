@@ -82,13 +82,18 @@ const SCHEMA_DEFAULTS: Record<string, unknown> = {
  * default — the same registry default the runtime's capability-activation
  * resolver (resolveConfigKey Level 4, capability-activation.cts) already honors,
  * so `query config-get` can no longer disagree with the runtime about an absent
- * key's effective value.
+ * key's effective value. The optional callback shares one registry snapshot with
+ * per-key resolution; CLI callers keep their existing lazy lookup.
  */
-function resolveSchemaDefault(cwd: string, kp: string): { found: boolean; value: unknown } {
+function resolveSchemaDefault(
+  cwd: string,
+  kp: string,
+  capabilitySchema: () => Record<string, unknown> = () => getCapabilityConfigSchema(cwd),
+): { found: boolean; value: unknown } {
   if (Object.prototype.hasOwnProperty.call(SCHEMA_DEFAULTS, kp)) {
     return { found: true, value: SCHEMA_DEFAULTS[kp] };
   }
-  const capSchema = getCapabilityConfigSchema(cwd);
+  const capSchema = capabilitySchema();
   if (capSchema && typeof capSchema === 'object'
       && Object.prototype.hasOwnProperty.call(capSchema, kp)) {
     const entry = capSchema[kp];

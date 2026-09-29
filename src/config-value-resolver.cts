@@ -13,7 +13,7 @@ import loader = require('./config-loader.cjs');
 const { _readConfigFile, _warnUnusableConfig, CONFIG_REASON } = loader;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import schema = require('./config-schema.cjs');
-const { isValidConfigKey, isCentralConfigKey, getCapabilityConfigSchema } = schema;
+const { isCentralConfigKey, getCapabilityConfigSchema } = schema;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import federatedConfig = require('./federated-config.cjs');
 const { isWellFormedSlice, typeMatchesSlice } = federatedConfig;
@@ -112,12 +112,12 @@ function mergeValues(
 }
 
 /** A key belongs to exactly one ladder. An explicit family is only an assertion. */
-function keyFamily(key: string, cwd: string): ConfigFamily | null {
+function keyFamily(key: string, capabilitySchema: () => Record<string, unknown>): ConfigFamily | null {
   if (FAMILY_B_KEYS.has(key)) return 'B';
   if (Object.prototype.hasOwnProperty.call(MERGE_KEYS, key)) return 'A';
-  if (!isValidConfigKey(key, cwd)) return null;
-  if (!isCentralConfigKey(key) && !isWellFormedSlice(getCapabilityConfigSchema(cwd)[key])) return null;
-  return 'A';
+  if (isCentralConfigKey(key)) return 'A';
+  const registry = capabilitySchema();
+  return Object.prototype.hasOwnProperty.call(registry, key) && isWellFormedSlice(registry[key]) ? 'A' : null;
 }
 
 function fileLayers(cwd: string, family: ConfigFamily): Array<{ layer: ConfigLayer; file: string }> {
@@ -146,19 +146,21 @@ function resolveConfigValue(
   key: string,
   opts: { cwd: string; family?: ConfigFamily },
 ): ConfigValueResolution {
-  const family = keyFamily(key, opts.cwd);
+  let cachedSchema: Record<string, unknown> | undefined;
+  const capabilitySchema = (): Record<string, unknown> =>
+    cachedSchema ??= getCapabilityConfigSchema(opts.cwd);
+  const family = keyFamily(key, capabilitySchema);
   const missing = (reason: ConfigReason): ConfigValueResolution => ({
     found: false, value: undefined, layer: null, reason,
   });
   if (family === null) return missing(CONFIG_REASON.NOT_CONFIGURED);
   if (opts.family && opts.family !== family) throw new RangeError(`Config key ${key} belongs to family ${family}`);
   const federatedSlice = family === 'A' && !isCentralConfigKey(key)
-    ? getCapabilityConfigSchema(opts.cwd)[key] : null;
+    ? capabilitySchema()[key] : null;
   const entries: Array<{ layer: ConfigLayer; value: unknown }> = [];
   let emptyFile = false;
   let faultReason: ConfigReason | null = null;
   let workstreamMissing = false;
-  let blocked = false;
   for (const { layer, file } of fileLayers(opts.cwd, family)) {
     const read = _readConfigFile(file, family === 'B' ? parseJsonc : JSON.parse);
     if (read.kind === 'fault') {
@@ -193,13 +195,10 @@ function resolveConfigValue(
         && typeMatchesSlice(resolved.value, federatedSlice)))) {
       entries.push({ layer, value: resolved.value });
     }
-    if (resolved.blocked) {
-      blocked = true;
-      break;
-    }
+    if (resolved.blocked) break;
   }
-  if (family === 'A' && !blocked) {
-    const schemaDefault = resolveSchemaDefault(opts.cwd, key);
+  if (family === 'A') {
+    const schemaDefault = resolveSchemaDefault(opts.cwd, key, capabilitySchema);
     if (schemaDefault.found) entries.push({ layer: 'schema-default', value: schemaDefault.value });
     const builtin = ownValue(CONFIG_DEFAULTS, key);
     if (builtin.found) entries.push({ layer: 'builtin-default', value: builtin.value });
