@@ -291,6 +291,25 @@ describe('Config Value Resolution Module (#5096)', () => {
     });
   });
 
+  test('family B null parents block values from lower runtime layers', () => {
+    for (const [higher, lower] of [
+      ['runtime-local', 'runtime-shared'],
+      ['runtime-local', 'runtime-user'],
+      ['runtime-shared', 'runtime-user'],
+    ]) {
+      withLayers((cwd) => {
+        writeLayer(cwd, lower, { worktree: { baseRef: 'lower' } });
+        assert.deepEqual(resolveConfigValue('worktree.baseRef', { cwd }), {
+          found: true, value: 'lower', layer: lower, reason: 'resolved',
+        });
+        writeLayer(cwd, higher, { worktree: null });
+        assert.deepEqual(resolveConfigValue('worktree.baseRef', { cwd }), {
+          found: false, value: undefined, layer: null, reason: 'not_configured',
+        });
+      });
+    }
+  });
+
   test('a composite inherited from root records workstream fallback reason', () => {
     withLayers((cwd) => {
       writeLayer(cwd, 'root', { agent_tools: { planner: [] } });
