@@ -342,12 +342,12 @@ describe('real registry ship:pre — structural guards', () => {
 //       wired at ship:pre; these rows pin the contract the prose depends on.
 
 const SHIP_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'ship.md');
-const EXECUTE_PHASE_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-phase.md');
+const VERIFY_PHASE_GOAL_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-phase', 'steps', 'verify-phase-goal.md');
 const WAVE_POST_GATE_HOOKS_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-phase', 'steps', 'wave-post-gate-hooks.md');
 const PLAN_PHASE_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'plan-phase.md');
 
 // The repo's shared generic-gate-dispatch phrasing, used verbatim at execute:wave:post
-// (wave-post-gate-hooks.md), execute:post (execute-phase.md) and plan:post (plan-phase.md).
+// (wave-post-gate-hooks.md), execute:post (verify-phase-goal.md) and plan:post (plan-phase.md).
 // Matching the shared phrase — rather than an arbitrary literal — is what makes this a
 // contract assertion: ship:pre either speaks the same dispatch language as its siblings
 // or it is hand-rolling, which is precisely what references/loop-hook-dispatch.md forbids.
@@ -374,7 +374,7 @@ describe('predicate gate phase-context forwarding (#4483)', () => {
   });
 
   test('execute:post forwards both phase number and phase directory', () => {
-    const line = predicateDispatchLine(EXECUTE_PHASE_MD, 'execute:post');
+    const line = predicateDispatchLine(VERIFY_PHASE_GOAL_MD, 'execute:post');
     assert.match(line, /--phase-number "\$\{PHASE_NUMBER\}"/);
     assert.match(line, /--phase-dir "\$\{PHASE_DIR\}"/);
   });
