@@ -69,6 +69,9 @@ const CASES = [
         hasUiSpec: false,
         block: true,
         message: 'UI files changed in this wave but no UI-SPEC.md exists for Phase 1. Run /gsd:ui-phase 1 to generate the design contract before continuing.',
+        // #5164: the phase records no task commits, so its scope is the widened phase-directory range, and says so.
+        scopeStatus: 'degraded',
+        scopeReason: 'no-summary',
       };
     },
   },
@@ -92,6 +95,8 @@ const CASES = [
         hasUiFiles: true,
         hasUiSpec: true,
         block: false,
+        scopeStatus: 'degraded',
+        scopeReason: 'no-summary',
       };
     },
   },
@@ -115,6 +120,8 @@ const CASES = [
         hasUiFiles: false,
         hasUiSpec: false,
         block: false,
+        scopeStatus: 'degraded',
+        scopeReason: 'no-summary',
       };
     },
   },
@@ -124,6 +131,7 @@ const CASES = [
     git: true,
     setup(dir, h) {
       h.w(dir, '.planning/ROADMAP.md', ['# Roadmap', '', '### Phase 1: Database migration', '**Goal**: Move rows between tables', ''].join('\n'));
+      h.w(dir, '.planning/phases/01-database/01-01-PLAN.md', '# p\n');
       h.w(dir, 'src/components/Button.tsx', 'export const B = 1;\n');
       h.git(dir, 'add', '-A');
       h.git(dir, 'commit', '-m', 'feat: add button');
@@ -137,6 +145,8 @@ const CASES = [
         hasUiFiles: true,
         hasUiSpec: false,
         block: false,
+        scopeStatus: 'degraded',
+        scopeReason: 'no-summary',
       };
     },
   },
@@ -148,7 +158,9 @@ const CASES = [
       h.w(dir, '.planning/ROADMAP.md', ['# Roadmap', '', '### Phase 1: Dashboard frontend', '**Goal**: Build the React dashboard UI for operators', ''].join('\n'));
     },
     args() { return ['9']; },
-    outcome: 'pass',
+    // #5164/#5170: a phase the resolver cannot find is "could not look" — an `unreadable` verdict
+    // (exit UNAVAILABLE), never a `pass`; `block` stays the gate's own policy (false).
+    outcome: 'unreadable',
     block: false,
     expected() {
       return {
@@ -157,17 +169,19 @@ const CASES = [
         hasUiSpec: false,
         block: false,
         phaseLookupFailed: true,
+        scopeStatus: 'unresolvable',
+        scopeReason: 'phase-dir-not-found',
       };
     },
   },
   {
     id: 'U4f',
-    title: 'no git repository -> git failure swallowed, hasUiFiles false',
+    title: 'no git repository -> hasUiFiles false, and the unreadable scope is reported (unreadable), not passed',
     setup(dir, h) {
       h.w(dir, '.planning/ROADMAP.md', ['# Roadmap', '', '### Phase 1: Dashboard frontend', '**Goal**: Build the React dashboard UI for operators', ''].join('\n'));
     },
     args() { return ['1']; },
-    outcome: 'pass',
+    outcome: 'unreadable',
     block: false,
     expected() {
       return {
@@ -175,6 +189,8 @@ const CASES = [
         hasUiFiles: false,
         hasUiSpec: false,
         block: false,
+        scopeStatus: 'unresolvable',
+        scopeReason: 'git-failed:rev-parse',
       };
     },
   },

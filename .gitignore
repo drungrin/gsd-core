@@ -286,6 +286,7 @@ build/
 /gsd-core/bin/lib/gate-config.cjs
 /gsd-core/bin/lib/gate-decision-coverage-plan.cjs
 /gsd-core/bin/lib/gate-decision-coverage-verify.cjs
+/gsd-core/bin/lib/gate-evaluation-scope.cjs
 /gsd-core/bin/lib/gate-api-coverage-verify-pre.cjs
 /gsd-core/bin/lib/gate-gap-analysis-plan-post.cjs
 /gsd-core/bin/lib/gate-predicate.cjs
@@ -294,7 +295,13 @@ build/
 /gsd-core/bin/lib/gate-tdd-review-checkpoint.cjs
 /gsd-core/bin/lib/gate-ui-plan.cjs
 /gsd-core/bin/lib/gate-ui-safety.cjs
+/gsd-core/bin/lib/gate-schema-drift.cjs
+/gsd-core/bin/lib/gate-codebase-drift.cjs
+/gsd-core/bin/lib/gate-context-drift.cjs
+/gsd-core/bin/lib/gate-prohibition-enforcement.cjs
 /gsd-core/bin/lib/gate-verdict.cjs
+/gsd-core/bin/lib/gate-evidence.cjs
+/gsd-core/bin/lib/gate-exit.cjs
 /gsd-core/bin/lib/gate-verify-command-paths.cjs
 /gsd-core/bin/lib/gate-verify-failure-directions.cjs
 /gsd-core/bin/lib/verify-command-grounding.cjs
@@ -338,6 +345,7 @@ build/
 /gsd-core/bin/lib/host-runtime-detection.cjs
 /gsd-core/bin/lib/task-content-resolution.cjs
 /gsd-core/bin/lib/tdd-red-evidence.cjs
+/gsd-core/bin/lib/report-parser.cjs
 /gsd-core/bin/lib/pr-branch-patterns.cjs
 /gsd-core/bin/lib/undo-commit-selection.cjs
 __pycache__/

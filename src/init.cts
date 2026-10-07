@@ -1507,14 +1507,17 @@ function buildInitCompletenessFields(cwd: string): Record<string, boolean> {
 function cmdInitNewProject(cwd: string, raw: boolean, options: Record<string, unknown> = {}): void {
   const config = loadConfig(cwd);
 
-  const homedir = os.homedir();
-  const braveKeyFile = path.join(homedir, '.gsd', 'brave_api_key');
+  // #4976: probe the GSD-owned store the config loader resolves
+  // (`GSD_HOME || homedir()`), so these flags agree with config-new-project's
+  // key probes in the same /gsd-new-project run.
+  const gsdHome = process.env['GSD_HOME'] || os.homedir();
+  const braveKeyFile = path.join(gsdHome, '.gsd', 'brave_api_key');
   const hasBraveSearch = !!(process.env['BRAVE_API_KEY'] || fs.existsSync(braveKeyFile));
 
-  const firecrawlKeyFile = path.join(homedir, '.gsd', 'firecrawl_api_key');
+  const firecrawlKeyFile = path.join(gsdHome, '.gsd', 'firecrawl_api_key');
   const hasFirecrawl = !!(process.env['FIRECRAWL_API_KEY'] || fs.existsSync(firecrawlKeyFile));
 
-  const exaKeyFile = path.join(homedir, '.gsd', 'exa_api_key');
+  const exaKeyFile = path.join(gsdHome, '.gsd', 'exa_api_key');
   const hasExaSearch = !!(process.env['EXA_API_KEY'] || fs.existsSync(exaKeyFile));
 
   const hasCode = hasCodeFilesInternal(cwd);

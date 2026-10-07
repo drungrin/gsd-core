@@ -289,6 +289,68 @@ shrinks: growth happens by adding an acknowledgment carrying a real issue
 number (a reviewable diff), never by widening the generator's tolerance and
 never by prose alone.
 
+## The gate positive-control ratchet
+
+A gate that has never been seen to fail cannot be trusted to pass. Every gate
+module has a **positive control**: a test that drives the gate, through its real
+`evaluate*` export, to the verdict that makes it fail and to a different one
+(ADR-5057 §4, #5204). `scripts/lint-gate-positive-control.cjs` (part of
+`npm run lint:ci`) fails when a gate has none.
+
+### Reference
+
+- **What counts as a gate.** A module `src/gate-<id>.cts` that exports an
+  `evaluate*` function declared to return `GateResult` (a function declaration,
+  a `const` arrow or function expression, or an `export { … }` re-export). Gates
+  are discovered, never listed, so a new gate is covered without editing the
+  lint. The verb entries outside gate modules (`phase uat-passed`, `verify
+  artifacts`) are covered by the exit guard (`lint-gate-evidence-drift`), not by
+  this ratchet.
+- **The control.** `gateControl({ gate, module, fn, red, expectRed, redScenario,
+  greenScenario })` from `tests/helpers/gate-positive-control.cjs`, as a top-level
+  statement of a `tests/**/*.test.cjs` file (by convention
+  `tests/gate-positive-control.test.cjs`) with `gateControl` bound from that
+  helper (a single top-level `const`, resolved against the file, never rebound or
+  redeclared); an inert call (a local function of that name, a nested call, a
+  reassigned binding, a file that exits or throws before the call, a file the
+  runner does not execute) does not count. Each scenario runs in a fresh temp
+  project (`git: true` for a git repository); `setup(dir)` may return a restore
+  function for a monkeypatched `fs` method (never a `chmod`: root bypasses mode
+  bits). `expectRed` pins the red verdict to the arm the control is about
+  (`outcome` and/or payload keys), so a scenario that fails for an unrelated
+  reason does not count. A misspelled option key is rejected.
+- **`red` is derived, not chosen.** From the exported `evaluate*` and the
+  same-file functions it reaches: `block` when some `gateVerdict` or
+  `gateUnreadable` call's block argument is anything but the literal `false`
+  (the red verdict carries `block: true`, the green one `block: false`);
+  `unreadable` for a gate that can never block (the red verdict is the typed
+  `unreadable` outcome, the green one any other). A control that declares the
+  other value is `wrong-red`, so a control cannot dodge a blocking arm.
+- **Rules.** `no-control`, `duplicate-control`, `wrong-red`,
+  `no-failing-verdict` (a gate that can neither block nor reach `unreadable`),
+  `wrong-module` (the `module` must resolve to `gsd-core/bin/lib/gate-<id>.cjs`),
+  `wrong-fn`, `malformed-control` (a field the lint cannot read as a literal, a
+  call that is not a top-level statement, or a `gateControl` not bound from the
+  helper), `orphan-control`, `unclassified-evaluate` (an exported `evaluate*`
+  with no `GateResult` return, one that cannot be resolved, or a gate file using
+  `export default`, `export * from` or an `evaluate*` class/object member, shapes
+  the lint does not read), `multiple-evaluates` (one gate module, one gate).
+  The allowlist is empty by decision and a stale entry is itself a problem.
+- **Fail-closed.** Zero discovered gates, a `gate-*.cts` file whose name the lint
+  cannot read, or a source the parser cannot read, is a violation: an inert scan
+  does not report a clean tree.
+
+### How-to: you added a gate and `lint:ci` reports `no-control`
+
+1. Add a `gateControl({...})` call to `tests/gate-positive-control.test.cjs`
+   naming your gate, its module and its `evaluate*` function.
+   `expectRed` names the arm the red scenario reaches.
+2. Take `red` from the lint's message (`wrong-red` states what the gate reaches).
+3. Write the red scenario from the input that makes the gate fail, and the green
+   scenario from the nearest input that does not. Reuse the cases in your gate's
+   own unit test; the control asserts the pair through one harness.
+4. Run `npm run lint:gate-positive-control`.
+
 ## Running suites locally
 
 ```bash

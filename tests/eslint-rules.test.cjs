@@ -3048,6 +3048,149 @@ describe('no-adhoc-markdown-parsing rule', () => {
     });
   });
 
+  // ── ADR-5057 §6 (Phase 13, #5217): split/join and line-indexed mutations ──────
+  // Positive controls: each invalid row is one of the shapes ADR-4910's census
+  // could not see (the `src/roadmap-upgrade.cts` cross-reference loop and
+  // `applyRoadmapEdits`), and must go red.
+
+  test('invalid: roadmapContent.split(x).join(y) — a literal substitution over a planning-named receiver', () => {
+    ruleTester.run('no-adhoc-markdown-parsing', noAdhocMarkdownParsing, {
+      valid: [],
+      invalid: [
+        {
+          code: `const out = roadmapContent.split('Phase 1:').join('Phase 1-01:');`,
+          filename: 'src/some-module.cts',
+          errors: [{ messageId: 'adhocSplitJoinMutation' }],
+        },
+      ],
+    });
+  });
+
+  test('invalid: split/join over a binding read from a planning location (the cross-reference loop shape)', () => {
+    ruleTester.run('no-adhoc-markdown-parsing', noAdhocMarkdownParsing, {
+      valid: [],
+      invalid: [
+        {
+          code: [
+            'const pDir = planningDir(cwd);',
+            'for (const [fileName, edits] of crossRefsByFile) {',
+            '  const filePath = path.join(pDir, fileName);',
+            "  let content = fs.readFileSync(filePath, 'utf8');",
+            '  for (const edit of edits) content = content.split(edit.from).join(edit.to);',
+            '}',
+          ].join('\n'),
+          filename: 'src/some-module.cts',
+          errors: [{ messageId: 'adhocSplitJoinMutation' }],
+        },
+      ],
+    });
+  });
+
+  test('invalid: a line-indexed rewrite of a planning document split on newlines (the applyRoadmapEdits shape)', () => {
+    ruleTester.run('no-adhoc-markdown-parsing', noAdhocMarkdownParsing, {
+      valid: [],
+      invalid: [
+        {
+          code: ["const lines = roadmapContent.split('\\n');", "lines[edit.lineIndex] = edit.to;"].join('\n'),
+          filename: 'src/some-module.cts',
+          errors: [{ messageId: 'adhocLineIndexedMutation' }],
+        },
+        {
+          code: ["const lines = stateContent.split(/\\r?\\n/);", "lines.splice(3, 0, 'x');"].join('\n'),
+          filename: 'src/some-module.cts',
+          errors: [{ messageId: 'adhocLineIndexedMutation' }],
+        },
+      ],
+    });
+  });
+
+  test('valid: a newline split+join (line-ending conversion), a non-planning read, and an unresolvable parameter are not flagged', () => {
+    ruleTester.run('no-adhoc-markdown-parsing', noAdhocMarkdownParsing, {
+      valid: [
+        { code: `const out = stateMd.split('\\n').join(eol);`, filename: 'src/some-module.cts' },
+        // A path-named receiver is not planning content (separator normalisation idiom).
+        { code: `const out = projectPath.split(path.sep).join('/');`, filename: 'src/some-module.cts' },
+        { code: `const out = roadmapDir.split('\\\\').join('/');`, filename: 'src/some-module.cts' },
+        {
+          code: [
+            "const content = fs.readFileSync(agentFile, 'utf8');",
+            "const out = content.split('a').join('b');",
+          ].join('\n'),
+          filename: 'src/some-module.cts',
+        },
+        {
+          code: `function f(content) { return content.split('a').join('b'); }`,
+          filename: 'src/some-module.cts',
+        },
+        {
+          code: ["const lines = agentBody.split('\\n');", "lines[0] = 'x';"].join('\n'),
+          filename: 'src/some-module.cts',
+        },
+      ],
+      invalid: [],
+    });
+  });
+
+  // Boundary: the receiver's path evidence is followed EVIDENCE_HOPS (4)
+  // same-scope bindings deep — 3 and 4 bindings are flagged, 5 is not.
+  function bindingChain(count) {
+    const lines = [];
+    for (let i = 1; i < count; i++) lines.push(`const hop${i} = hop${i + 1};`);
+    lines.push(`const hop${count} = 'ROADMAP.md';`);
+    lines.push("const content = fs.readFileSync(hop1, 'utf8');");
+    lines.push("const out = content.split('a').join('b');");
+    return lines.join('\n');
+  }
+
+  test('boundary: path evidence reaches a planning artifact through 3 and 4 bindings (flagged), not 5', () => {
+    ruleTester.run('no-adhoc-markdown-parsing', noAdhocMarkdownParsing, {
+      valid: [{ code: bindingChain(5), filename: 'src/some-module.cts' }],
+      invalid: [
+        { code: bindingChain(3), filename: 'src/some-module.cts', errors: [{ messageId: 'adhocSplitJoinMutation' }] },
+        { code: bindingChain(4), filename: 'src/some-module.cts', errors: [{ messageId: 'adhocSplitJoinMutation' }] },
+      ],
+    });
+  });
+
+  test('invalid: path evidence through a template literal, a member expression and a concatenation', () => {
+    ruleTester.run('no-adhoc-markdown-parsing', noAdhocMarkdownParsing, {
+      valid: [],
+      invalid: [
+        {
+          code: ["const p = `${dir}/ROADMAP.md`;", "const content = fs.readFileSync(p, 'utf8');", "content.split('a').join('b');"].join('\n'),
+          filename: 'src/some-module.cts',
+          errors: [{ messageId: 'adhocSplitJoinMutation' }],
+        },
+        {
+          code: ["const content = fs.readFileSync(paths.statePath, 'utf8');", "content.split('a').join('b');"].join('\n'),
+          filename: 'src/some-module.cts',
+          errors: [{ messageId: 'adhocSplitJoinMutation' }],
+        },
+        {
+          code: ["const content = fs.readFileSync(dir + '/PROJECT.md', 'utf8');", "content.split('a').join('b');"].join('\n'),
+          filename: 'src/some-module.cts',
+          errors: [{ messageId: 'adhocSplitJoinMutation' }],
+        },
+      ],
+    });
+  });
+
+  test('valid: allow-adhoc-markdown suppresses a split/join and a line-indexed mutation', () => {
+    ruleTester.run('no-adhoc-markdown-parsing', noAdhocMarkdownParsing, {
+      valid: [
+        {
+          code: `const out = roadmapContent.split('a').join('b'); // allow-adhoc-markdown: fixture text, not a planning write`,
+          filename: 'src/some-module.cts',
+        },
+        {
+          code: ["const lines = roadmapContent.split('\\n');", "lines[0] = 'x'; // allow-adhoc-markdown: fixture"].join('\n'),
+          filename: 'src/some-module.cts',
+        },
+      ],
+      invalid: [],
+    });
+  });
+
   test('valid: someUnrelatedVar.replace(<field-shaped regex>, ...) — receiver name does not match REPLACE_RECEIVER_RE, not flagged', () => {
     ruleTester.run('no-adhoc-markdown-parsing', noAdhocMarkdownParsing, {
       valid: [

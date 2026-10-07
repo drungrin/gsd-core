@@ -875,10 +875,11 @@ describe('#3912 A3-A5: output({error}) records DEGRADED — shape-exhaustive plu
   // ioMod`) whose first argument is an object literal carrying an `error`
   // property. This is the SHAPE the design measured, over the real tree,
   // not a hand-picked subset — and it independently reproduces the design
-  // doc's per-file breakdown (frontmatter 7, phase 4, roadmap 3, state 25,
-  // verify 8, workstream 7, commands 5, template 3, gsd2-import 2 = 64),
-  // which is itself the corrected count over ADR-2980's stale 60.
-  test('A3 census: exactly 69 output({error}) call sites exist in src/, across the 9 modules the design measured', () => {
+  // doc's per-file breakdown AS MEASURED THEN (frontmatter 7, phase 4, roadmap 3,
+  // state 25, verify 8, workstream 7, commands 5, template 3, gsd2-import 2 = 64,
+  // the corrected count over ADR-2980's stale 60). The live per-file table is
+  // the one asserted below; verify.cts has since left it (see that entry).
+  test('A3 census: exactly 61 output({error}) call sites exist in src/, across the 8 modules that still carry one', () => {
     const SRC_ROOT = path.resolve(__dirname, '../src');
 
     function listCtsFiles(dir) {
@@ -932,11 +933,20 @@ describe('#3912 A3-A5: output({error}) records DEGRADED — shape-exhaustive plu
         // frontmatter.cts +2 #5105: spliceOrReportRefusal's write-refusal report (shared by
         // set/merge) and cmdFrontmatterMerge's #1660 lossy-object-list-field refusal (parity
         // with cmdFrontmatterSet's existing site) — 8 -> 10.
-        'roadmap.cts': 3, 'state.cts': 27, 'template.cts': 3, 'verify.cts': 8, 'workstream.cts': 7,  // +1 #3807: advance-plan's ambiguous-position error; +1 #3784: advance-plan's ambiguous-PLAN-position error (two plan spellings, different numbers); +1 #4806: cmdFrontmatterGet's unparseable-frontmatter error
+        // verify.cts 8 -> 0 #5170: the eight sites became typed verdicts printed by emitVerbVerdict
+        // (src/verify.cts), which calls output(verdict.payload) with a NON-literal argument (so the
+        // literal-shape census no longer sees them) and then declareGateExit (src/gate-exit.cts). Pending
+        // outcome, read from those two functions: output() still records DEGRADED for a payload carrying an
+        // `error` key, exactly as before; declareGateExit then OVERRIDES it for a non-PASS verdict
+        // (unreadable -> UNAVAILABLE 69, empty -> NO_INPUT 66, block in status mode -> FAIL 1), and for a
+        // PASS leaves output()'s DEGRADED untouched. So the migrated sites record a declared outcome where
+        // they used to record DEGRADED, and the census count falls because of the call shape, not because
+        // the error key stopped being recorded.
+        'roadmap.cts': 3, 'state.cts': 27, 'template.cts': 3, 'workstream.cts': 7,  // +1 #3807: advance-plan's ambiguous-position error; +1 #3784: advance-plan's ambiguous-PLAN-position error (two plan spellings, different numbers); +1 #4806: cmdFrontmatterGet's unparseable-frontmatter error
       },
       `per-file output({error}) census drifted: ${JSON.stringify(perFile)}`,
     );
-    assert.strictEqual(total, 69, `enumerated output({error}) population drifted from the measured 69 (67 + #5105's 2 new frontmatter write-refusal sites): got ${total}`);
+    assert.strictEqual(total, 61, `enumerated output({error}) population drifted from the measured 61 (69 - verify.cts's 8 sites that #5170 converted to typed verdicts): got ${total}`);
   });
 });
 

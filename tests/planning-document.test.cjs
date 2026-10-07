@@ -25,7 +25,7 @@ try {
 }
 const {
   parsePlanningDoc, findField, readNode, setFieldValue, hasUnreadableNodes, serialize, PLANNING_ARTIFACTS,
-  readFrontmatterField, readFrontmatterFieldFromSource,
+  readFrontmatterField, readFrontmatterFieldFromSource, replaceProse,
 } = mod;
 
 const artifactsMod = require(ARTIFACTS_PATH);
@@ -1028,5 +1028,69 @@ describe('#5026 follow-up: readFrontmatterField / readFrontmatterFieldFromSource
 
   test('malformed/unparseable frontmatter: both entry points agree (unparseable-frontmatter)', () => {
     assertParity(malformed, 'wave');
+  });
+});
+
+// ─── replaceProse (ADR-5057 §6, Phase 13, #5217) ───────────────────────────────
+
+describe('replaceProse: verbatim cross-reference rewrite through the seam', () => {
+  const sourceOf = (result) => {
+    assert.strictEqual(result.ok, true, `expected ok: ${JSON.stringify(result)}`);
+    const out = serialize(result.value);
+    assert.strictEqual(out.ok, true);
+    return out.value;
+  };
+
+  test('replaces every occurrence outside fenced code and leaves fenced code verbatim', () => {
+    const source = 'Phase 1: Setup\nsee Phase 1: Setup again Phase 1:\n```\nPhase 1: in a fence\n```\nend\n';
+    const out = sourceOf(replaceProse(parseOk(source, 'PROJECT.md'), 'Phase 1:', 'Phase 1-01:'));
+    assert.strictEqual(
+      out,
+      'Phase 1-01: Setup\nsee Phase 1-01: Setup again Phase 1-01:\n```\nPhase 1: in a fence\n```\nend\n',
+    );
+  });
+
+  test('frontmatter lines are rewritten too (STATE.md keeps phase refs there)', () => {
+    const source = '---\nstopped_at: "Phase 2: Auth"\n---\n\nbody\n';
+    const out = sourceOf(replaceProse(parseOk(source), 'Phase 2:', 'Phase 1-02:'));
+    assert.strictEqual(out, '---\nstopped_at: "Phase 1-02: Auth"\n---\n\nbody\n');
+  });
+
+  test('CRLF terminators are preserved byte-for-byte', () => {
+    const source = 'a Phase 1: x\r\nb\r\nc Phase 1: y';
+    const out = sourceOf(replaceProse(parseOk(source), 'Phase 1:', 'P:'));
+    assert.strictEqual(out, 'a P: x\r\nb\r\nc P: y');
+  });
+
+  test('absent literal: the same doc comes back, source byte-identical', () => {
+    const doc = parseOk('nothing here\n');
+    const result = replaceProse(doc, 'Phase 9:', 'x');
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.value.source, doc.source);
+  });
+
+  test('refuses an empty `from`, a multi-line `from` or `to`, and a doc with staged field edits', () => {
+    const doc = parseOk('**Plans:** a\ntext\n');
+    assert.strictEqual(replaceProse(doc, '', 'x').ok, false);
+    assert.strictEqual(replaceProse(doc, 'a\nb', 'x').ok, false);
+    assert.strictEqual(replaceProse(doc, 'text', 'x\ny').ok, false);
+    const staged = setFieldValue(doc, findField(doc, 'Plans'), 'b');
+    assert.strictEqual(staged.ok, true);
+    assert.strictEqual(replaceProse(staged.value, 'text', 'x').ok, false);
+  });
+
+  test('property: equals a naive substitution when the document has no fence, and re-parses', () => {
+    const piece = fc.constantFrom('Phase 1:', 'Phase 2:', 'text', ' ', '\n', '\r\n', '- [ ] ', '**Plans:** x');
+    fc.assert(
+      fc.property(fc.array(piece, { maxLength: 20 }), (parts) => {
+        const source = parts.join('');
+        const parsed = parsePlanningDoc(source, 'PROJECT.md');
+        fc.pre(parsed.ok);
+        const result = replaceProse(parsed.value, 'Phase 1:', 'Phase 1-01:');
+        assert.strictEqual(result.ok, true);
+        assert.strictEqual(result.value.source, source.split('Phase 1:').join('Phase 1-01:'));
+        assert.strictEqual(serialize(result.value).value, result.value.source);
+      }),
+    );
   });
 });

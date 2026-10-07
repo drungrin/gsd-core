@@ -47,6 +47,10 @@ const GATE_MODULES = [
   'gate-gap-analysis-plan-post',
   'gate-predicate',
   'gate-api-coverage-verify-pre',
+  'gate-schema-drift',
+  'gate-codebase-drift',
+  'gate-context-drift',
+  'gate-prohibition-enforcement',
   'gate-verdict',
   'gate-phase-context',
   'gate-args',
@@ -219,7 +223,43 @@ describe('B2 the router may not import fs, child_process or the exec helpers', (
   });
 });
 
-describe('B3 the real files carry the boundary and honour it', () => {
+describe('B2b the router imports a verb implementation only from a gate module (ADR-5057 §4, #5219)', () => {
+  // The four verbs that Phase 6 left in verify.cts / prohibition-enforcement.cts printed their own
+  // payload. Wiring a verb's logic into the router from any non-gate module is the same defect again.
+  const outside = [
+    ['verify.cjs (require style)', "import verifyMod = require('./verify.cjs');\nexport = { verifyMod };\n"],
+    ['verify.cjs (ES style)', "import { cmdVerifyArtifacts } from './verify.cjs';\nexport = { cmdVerifyArtifacts };\n"],
+    ['prohibition-enforcement.cjs', "import { runProhibitionEnforcement } from './prohibition-enforcement.cjs';\nexport = { runProhibitionEnforcement };\n"],
+    ['drift.cjs', "import drift = require('./drift.cjs');\nexport = { drift };\n"],
+    ['a parent-relative module', "import x = require('../verify.cjs');\nexport = { x };\n"],
+  ];
+  for (const [label, code] of outside) {
+    test(`B2b: ${label} is reported in ${ROUTER}`, async () => {
+      const messages = await boundaryMessages(ROUTER, code);
+      assert.equal(messages.length, 1, JSON.stringify(messages));
+      assert.equal(messages[0].severity, 2);
+    });
+  }
+
+  const allowed = [
+    'gate-schema-drift', 'gate-codebase-drift', 'gate-context-drift', 'gate-prohibition-enforcement',
+    'gate-verdict', 'gate-exit', 'gate-args', 'io', 'check-auto-mode', 'decision-coverage-support',
+  ];
+  for (const mod of allowed) {
+    test(`B2b: ./${mod}.cjs is not reported in ${ROUTER}`, async () => {
+      const code = `import m = require('./${mod}.cjs');\nexport = { m };\n`;
+      assert.deepStrictEqual(await boundaryMessages(ROUTER, code), []);
+    });
+  }
+
+  test('B2b: the same non-gate imports in an unrelated src file are not reported', async () => {
+    for (const [, code] of outside) {
+      assert.deepStrictEqual(await boundaryMessages('src/other.cts', code), []);
+    }
+  });
+});
+
+describe('B3the real files carry the boundary and honour it', () => {
   const realFiles = [...GATE_MODULES.map((m) => `src/${m}.cts`), ROUTER];
 
   test('B3: every gate module, the shared support modules and the router exist', () => {

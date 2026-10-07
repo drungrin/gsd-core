@@ -432,7 +432,7 @@ function buildMessage(
     lines.push(`Auto-remap scheduled for paths: ${affectedPaths.join(', ')}`);
   } else if (affectedPaths.length > 0) {
     // drift.cts is a pure library — it must never read env/config. The
-    // caller (verify.cmdVerifyCodebaseDrift) resolves the runtime once and
+    // caller (gate-codebase-drift.cts) resolves the runtime once and
     // passes it in via input.runtime so emitted commands match the project
     // the caller is targeting, not the current process directory.
     const mapCmd = formatGsdSlash('map-codebase', runtime || 'claude');
