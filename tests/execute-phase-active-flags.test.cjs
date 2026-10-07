@@ -714,23 +714,30 @@ describe('#3177: debug.md dispatches its session manager in the foreground', () 
       return `${spine}\n${fs.readFileSync(PART, 'utf8')}`;
     }
 
-    __contTest('does not send the agent to a template file that is not shipped', () => {
-      // `templates/continuation-prompt.md` was deleted in January 2026 and the
-      // instruction naming it survived for eight months. Nothing failed at
-      // runtime — each lane improvised the prompt around the four values
-      // below — which is why only a text guard can catch it.
-      const step = spawnStep();
+    function missingTemplates(step) {
       const named = [...step.matchAll(/`?\b([A-Za-z0-9][A-Za-z0-9._-]*\.md)`?\s+template\b/g)].map((m) => m[1]);
-      const missing = named.filter((name) => ![
+      return named.filter((name) => ![
         path.join(ROOT, 'gsd-core', 'references', name),
         path.join(ROOT, 'gsd-core', 'templates', name),
         path.join(ROOT, 'gsd-core', 'workflows', name),
       ].some((p) => fs.existsSync(p)));
+    }
+
+    __contTest('detects the unshipped template in the old continuation instruction', () => {
+      assert.deepEqual(
+        missingTemplates('6. **Spawn continuation agent (NOT resume)** — use continuation-prompt.md template'),
+        ['continuation-prompt.md'],
+      );
+    });
+
+    __contTest('does not send the agent to a template file that is not shipped', () => {
+      // The positive control above proves this guard catches the retired instruction.
+      const missing = missingTemplates(spawnStep());
       assert.deepEqual(missing, [],
         `the continuation-agent step names template file(s) that do not ship: ${missing.join(', ')}`);
     });
 
-    __contTest('carries the prompt inline, with every contracted placeholder', () => {
+    __contTest('carries the prompt in the workflow part, with every contracted placeholder', () => {
       // Criterion 3 of the issue: the four values stay supported exactly as
       // named, so no lane reading them silently breaks. The fenced block is
       // what makes the prompt authoritative rather than reconstructed per lane.
@@ -738,7 +745,7 @@ describe('#3177: debug.md dispatches its session manager in the foreground', () 
       // scanFencedBlocks, not a local fence regex: same seam this file already
       // imports, and what local/no-adhoc-markdown-parsing requires.
       const fenced = scanFencedBlocks(step.split('\n')).filter((b) => b.closeLineIdx !== -1);
-      assert.ok(fenced.length >= 1, 'the spawn step must carry the prompt itself, not a pointer to one');
+      assert.ok(fenced.length >= 1, 'the workflow part must carry a closed prompt block');
       for (const placeholder of PLACEHOLDERS) {
         assert.ok(step.includes(placeholder), `contracted placeholder missing: ${placeholder}`);
       }
