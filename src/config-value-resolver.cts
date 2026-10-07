@@ -161,6 +161,7 @@ function resolveConfigValue(
   let emptyFile = false;
   let faultReason: ConfigReason | null = null;
   let workstreamMissing = false;
+  let detected: string[] | undefined;
   for (const { layer, file } of fileLayers(opts.cwd, family)) {
     const read = _readConfigFile(file, family === 'B' ? parseJsonc : JSON.parse);
     if (read.kind === 'fault') {
@@ -181,7 +182,7 @@ function resolveConfigValue(
     if (data?.normalizations.some((normalization) => normalization.requiresFilesystem)) {
       const planningSection = data.parsed['planning'];
       if (!isConfigSection(planningSection) || !planningSection['sub_repos']) {
-        const detected = detectSubRepos(opts.cwd);
+        detected ??= detectSubRepos(opts.cwd);
         if (detected.length > 0) {
           const section = isConfigSection(planningSection) ? planningSection : {};
           section['sub_repos'] = detected;
