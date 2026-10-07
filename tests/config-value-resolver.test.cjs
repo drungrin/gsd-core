@@ -370,6 +370,27 @@ describe('Config Value Resolution Module (#5096)', () => {
     });
   });
 
+  test('legacy multiRepo discovery is cached per resolution, including empty results', (t) => {
+    withLayers((cwd) => {
+      for (const layer of ['workstream', 'root', 'global-defaults']) {
+        writeLayer(cwd, layer, { multiRepo: true });
+      }
+      const readdir = fs.readdirSync;
+      let scans = 0;
+      t.mock.method(fs, 'readdirSync', (dir, ...args) => {
+        if (dir === cwd) scans += 1;
+        return readdir.call(fs, dir, ...args);
+      });
+      resolveConfigValue('planning.sub_repos', { cwd });
+      assert.equal(scans, 1, 'all legacy layers share one discovery, even when empty');
+      fs.mkdirSync(path.join(cwd, 'api', '.git'), { recursive: true });
+      const result = resolveConfigValue('planning.sub_repos', { cwd });
+      assert.deepEqual(result.value, ['api']);
+      assert.equal(result.layer, 'workstream');
+      assert.equal(scans, 2, 'a new resolution must refresh filesystem discovery');
+    });
+  });
+
   test('normalizes legacy keys per layer without writing to either file', () => {
     withLayers((cwd) => {
       const global = writeLayer(cwd, 'global-defaults', { base_branch: 'global' });
