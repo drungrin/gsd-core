@@ -803,5 +803,47 @@ export function serialize(doc: PlanningDoc): SerializeOutcome {
   return { ok: true, value: out };
 }
 
+/**
+ * Replace every occurrence of the single-line literal `from` with `to` in the
+ * document's prose — the seam's answer to a verbatim cross-reference rewrite
+ * (ADR-5057 §6, Phase 13, #5217: the migration's "Phase 1:" -> "Phase 1-01:"
+ * substitution in PROJECT.md / STATE.md).
+ *
+ * Fenced code blocks are never rewritten (rows 9/14: fenced content is not a
+ * node), every other byte — each line's own terminator included — is copied
+ * from `doc.source`, and a substitution that changes nothing returns a doc
+ * whose `source` is byte-identical. The result is re-parsed so its node spans
+ * describe the new text. Refuses (Result failure, nothing written) when `from`
+ * is empty or spans a line break, or when `doc` already carries staged
+ * field edits (their spans address the pre-substitution text).
+ */
+export function replaceProse(doc: PlanningDoc, from: string, to: string): Result<PlanningDoc> {
+  if (typeof from !== 'string' || from.length === 0) {
+    return { ok: false, reason: 'replaceProse: `from` must be a non-empty string' };
+  }
+  if (typeof to !== 'string' || /[\r\n]/.test(from) || /[\r\n]/.test(to)) {
+    return { ok: false, reason: 'replaceProse: `from` and `to` must be single-line strings' };
+  }
+  if (doc.staged.size > 0) {
+    return { ok: false, reason: 'replaceProse: refused while field edits are staged' };
+  }
+
+  const lines = splitLinesInfo(doc.source);
+  const fenced = fencedLineIndices(lines);
+  let out = '';
+  let cursor = 0;
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (fenced.has(i) || !line.text.includes(from)) continue;
+    out += doc.source.slice(cursor, line.start) + line.text.split(from).join(to);
+    cursor = line.end;
+    changed = true;
+  }
+  if (!changed) return { ok: true, value: doc };
+  out += doc.source.slice(cursor);
+  return parsePlanningDoc(out, doc.artifact);
+}
+
 // Consumers: require('../gsd-core/bin/lib/planning-document.cjs')
 // Named CJS exports are the canonical surface (ADR-457 .cts → .cjs build-at-publish).

@@ -224,7 +224,8 @@ function validateShipPrBodySections(value: unknown): void {
  *
  * Merges (increasing priority):
  *   1. Hardcoded defaults — every key that loadConfig() resolves, plus mode/granularity
- *   2. User-level defaults from ~/.gsd/defaults.json (if present)
+ *   2. User-level defaults from $GSD_HOME/.gsd/defaults.json (if present;
+ *      GSD_HOME defaults to the home directory, as in the config loader)
  *   3. userChoices — the settings the user explicitly selected during /gsd:new-project
  *
  * Uses the canonical `git` namespace for branching keys (consistent with VALID_CONFIG_KEYS
@@ -235,26 +236,29 @@ function validateShipPrBodySections(value: unknown): void {
  */
 function buildNewProjectConfig(userChoices: Record<string, unknown>): Record<string, unknown> {
   const choices = userChoices || {};
-  const homedir = os.homedir();
+  // #4976: the GSD-owned store resolves exactly as the config loader resolves
+  // it (`GSD_HOME || homedir()`), so the defaults.json seeding this project is
+  // the one the loader and its #3532 shadow warning read in the same run.
+  const gsdHome = process.env['GSD_HOME'] || os.homedir();
 
   // Detect API key availability
-  const braveKeyFile = path.join(homedir, '.gsd', 'brave_api_key');
+  const braveKeyFile = path.join(gsdHome, '.gsd', 'brave_api_key');
   const hasBraveSearch = !!(process.env['BRAVE_API_KEY'] || fs.existsSync(braveKeyFile));
-  const firecrawlKeyFile = path.join(homedir, '.gsd', 'firecrawl_api_key');
+  const firecrawlKeyFile = path.join(gsdHome, '.gsd', 'firecrawl_api_key');
   const hasFirecrawl = !!(process.env['FIRECRAWL_API_KEY'] || fs.existsSync(firecrawlKeyFile));
-  const exaKeyFile = path.join(homedir, '.gsd', 'exa_api_key');
+  const exaKeyFile = path.join(gsdHome, '.gsd', 'exa_api_key');
   const hasExaSearch = !!(process.env['EXA_API_KEY'] || fs.existsSync(exaKeyFile));
-  const tavilyKeyFile = path.join(homedir, '.gsd', 'tavily_api_key');
+  const tavilyKeyFile = path.join(gsdHome, '.gsd', 'tavily_api_key');
   const hasTavilySearch = !!(process.env['TAVILY_API_KEY'] || fs.existsSync(tavilyKeyFile));
-  const refKeyFile = path.join(homedir, '.gsd', 'ref_api_key');
+  const refKeyFile = path.join(gsdHome, '.gsd', 'ref_api_key');
   const hasRefSearch = !!(process.env['REF_API_KEY'] || fs.existsSync(refKeyFile));
-  const perplexityKeyFile = path.join(homedir, '.gsd', 'perplexity_api_key');
+  const perplexityKeyFile = path.join(gsdHome, '.gsd', 'perplexity_api_key');
   const hasPerplexity = !!(process.env['PERPLEXITY_API_KEY'] || fs.existsSync(perplexityKeyFile));
-  const jinaKeyFile = path.join(homedir, '.gsd', 'jina_api_key');
+  const jinaKeyFile = path.join(gsdHome, '.gsd', 'jina_api_key');
   const hasJina = !!(process.env['JINA_API_KEY'] || fs.existsSync(jinaKeyFile));
 
-  // Load user-level defaults from ~/.gsd/defaults.json if available
-  const globalDefaultsPath = path.join(homedir, '.gsd', 'defaults.json');
+  // Load user-level defaults from $GSD_HOME/.gsd/defaults.json if available
+  const globalDefaultsPath = path.join(gsdHome, '.gsd', 'defaults.json');
   let userDefaults: Record<string, unknown> = {};
   try {
     if (fs.existsSync(globalDefaultsPath)) {
@@ -400,7 +404,7 @@ function buildNewProjectConfig(userChoices: Record<string, unknown>): Record<str
  *
  * Accepts user-chosen settings as a JSON string (the keys the user explicitly
  * configured during /gsd:new-project). All remaining keys are filled from
- * hardcoded defaults and optional ~/.gsd/defaults.json.
+ * hardcoded defaults and optional $GSD_HOME/.gsd/defaults.json.
  *
  * Idempotent: if config.json already exists, returns { created: false }.
  */
@@ -894,6 +898,14 @@ function cmdConfigSet(cwd: string, keyPath: string | undefined, value: string | 
   if (kp === 'planner.stall_detection_enabled') {
     if (typeof parsedValue !== 'boolean') {
       error(`Invalid planner.stall_detection_enabled '${val}'. Must be a boolean (true or false).`);
+    }
+  }
+
+  // Dispatch audit-trail opt-in (#4975) — boolean only. The live seams honour
+  // only a real `true`, so any other stored value would be silently ignored.
+  if (kp === 'audit.enabled') {
+    if (typeof parsedValue !== 'boolean') {
+      error(`Invalid audit.enabled '${val}'. Must be a boolean (true or false).`);
     }
   }
 

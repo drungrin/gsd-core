@@ -4,7 +4,8 @@
  * `check decision-coverage-verify` on a project that is NOT a git repository writes nothing to
  * stderr (#5139, epic #5056, ADR-5057 Phase 6 review finding).
  *
- * `recentCommitMessages` (src/decision-coverage-support.cts) runs `git log`; with no repository git
+ * `phaseCommitMessages` (src/decision-coverage-support.cts, #5164) asks the evaluation-scope resolver
+ * for the phase's commits, which runs `git`; with no repository git
  * prints `fatal: not a git repository` on ITS stderr, and a child's stderr is inherited by the
  * parent unless the call pipes it — a write to file descriptor 2 that no `process.stderr.write`
  * spy can see. So the assertion runs the gate in a CHILD node process and captures that child's

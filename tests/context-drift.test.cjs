@@ -7,8 +7,15 @@ const path = require('node:path');
 const { createTempGitProject, createTempDir, cleanup, runGsdTools } = require('./helpers.cjs');
 const { gitOrThrow } = require('./helpers/git-fixture.cjs');
 
-const VERIFY_PATH = path.join(__dirname, '..', 'gsd-core', 'bin', 'lib', 'verify.cjs');
-const { computeContextDrift } = require(VERIFY_PATH);
+// #5219 (ADR-5057 §4 arm C): the context-drift gate is its own module; the check router formats its result.
+const GATE_PATH = path.join(__dirname, '..', 'gsd-core', 'bin', 'lib', 'gate-context-drift.cjs');
+const ROUTER_PATH = path.join(__dirname, '..', 'gsd-core', 'bin', 'lib', 'check-command-router.cjs');
+const { computeContextDrift } = require(GATE_PATH);
+
+/** A child-process statement running the router's `check verify-context-drift <phase>` for `cwd`. */
+function routeContextDriftStatement(cwd, phase) {
+  return `require(${JSON.stringify(ROUTER_PATH)}).routeCheckCommand({ args: ['check', 'verify-context-drift', ${JSON.stringify(phase)}], cwd: ${JSON.stringify(cwd)}, raw: false });`;
+}
 
 describe('computeContextDrift', () => {
   test('returns no stale artifacts when there is nothing to compare', () => {
@@ -84,7 +91,7 @@ describe('verify context-drift CLI', () => {
 
   test('treats a whitespace phase arg as not found, not a usage error', () => {
     const r = runGsdTools(['verify', 'context-drift', '   '], tmp);
-    assert.strictEqual(r.success, true, r.error);
+    assert.strictEqual(r.exitCode, 69, `a phase that does not resolve is could-not-look: UNAVAILABLE with the non-blocking JSON (#5170): ${r.error}`);
     const data = JSON.parse(r.output);
     assert.strictEqual(data.skipped, true);
     assert.strictEqual(data.reason, 'phase-not-found');
@@ -92,7 +99,7 @@ describe('verify context-drift CLI', () => {
 
   test('degrades gracefully for an unresolvable phase', () => {
     const r = runGsdTools(['verify', 'context-drift', '99'], tmp);
-    assert.strictEqual(r.success, true, r.error);
+    assert.strictEqual(r.exitCode, 69, `a phase that does not resolve is could-not-look: UNAVAILABLE with the non-blocking JSON (#5170): ${r.error}`);
     const data = JSON.parse(r.output);
     assert.strictEqual(data.skipped, true);
     assert.strictEqual(data.reason, 'phase-not-found');
@@ -101,7 +108,7 @@ describe('verify context-drift CLI', () => {
 
   test('does not interpret shell metacharacters in the phase arg', () => {
     const r = runGsdTools(['verify', 'context-drift', '1; echo pwned'], tmp);
-    assert.strictEqual(r.success, true, r.error);
+    assert.strictEqual(r.exitCode, 69, `a phase that does not resolve is could-not-look: UNAVAILABLE with the non-blocking JSON (#5170): ${r.error}`);
     const data = JSON.parse(r.output);
     assert.strictEqual(data.skipped, true);
     assert.strictEqual(data.reason, 'phase-not-found');
@@ -109,7 +116,7 @@ describe('verify context-drift CLI', () => {
 
   test('does not path-traverse via a hostile phase arg', () => {
     const r = runGsdTools(['verify', 'context-drift', '../../etc'], tmp);
-    assert.strictEqual(r.success, true, r.error);
+    assert.strictEqual(r.exitCode, 69, `a phase that does not resolve is could-not-look: UNAVAILABLE with the non-blocking JSON (#5170): ${r.error}`);
     const data = JSON.parse(r.output);
     assert.strictEqual(data.skipped, true);
     assert.strictEqual(data.reason, 'phase-not-found');
@@ -122,7 +129,7 @@ describe('verify context-drift CLI', () => {
     // reason). validatePath must reject this by real-path containment, not by
     // accidental non-existence.
     const r = runGsdTools(['verify', 'context-drift', '../../../../../../../../../../etc'], tmp);
-    assert.strictEqual(r.success, true, r.error);
+    assert.strictEqual(r.exitCode, 69, `a phase that does not resolve is could-not-look: UNAVAILABLE with the non-blocking JSON (#5170): ${r.error}`);
     const data = JSON.parse(r.output);
     assert.strictEqual(data.skipped, true);
     assert.strictEqual(data.reason, 'phase-not-found');
@@ -366,7 +373,7 @@ describe('verify context-drift CLI', () => {
     const { spawnSync } = require('node:child_process');
     const { TEST_ENV_BASE } = require('./helpers.cjs');
     const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
-    const script = `require(${JSON.stringify(VERIFY_PATH)}).cmdVerifyContextDrift(${JSON.stringify(tmp)}, '01-setup', false);`;
+    const script = routeContextDriftStatement(tmp, '01-setup');
     return spawnSync(process.execPath, ['-e', script], {
       cwd: tmp,
       encoding: 'utf-8',
@@ -397,18 +404,63 @@ describe('verify context-drift CLI', () => {
     assert.strictEqual(data.reason, 'no-upstream-artifacts');
   });
 
-  test('always exits 0 (query command contract)', () => {
-    // Only cases that are legitimately part of the "always exits 0" JSON-output
-    // contract belong here — a missing phase arg is a DIFFERENT, already-covered
-    // contract ('errors with usage message on missing phase arg' above correctly
-    // asserts exitCode !== 0 / r.success === false for exactly that case).
+  test('never exits with a failure code: a phase that does not resolve is UNAVAILABLE, not an error (#5170)', () => {
+    // A missing phase arg is a DIFFERENT, already-covered contract ('errors with usage message on
+    // missing phase arg' above asserts exitCode !== 0 / r.success === false for exactly that case).
+    // A phase that does not resolve is the gate saying "could not look": the non-blocking JSON is
+    // printed and the exit status is UNAVAILABLE (69) — which the plan-phase consumer treats as a
+    // skipped, advisory check (it never halts planning), not as a command error.
     const cases = [
       ['verify', 'context-drift', '99'],
     ];
     for (const args of cases) {
       const r = runGsdTools(args, tmp);
-      assert.strictEqual(r.exitCode, 0, `args=${JSON.stringify(args)} exitCode=${r.exitCode}`);
+      assert.strictEqual(r.exitCode, 69, `args=${JSON.stringify(args)} exitCode=${r.exitCode}`);
+      assert.strictEqual(JSON.parse(r.output).block, false, 'the payload stays non-blocking');
     }
+  });
+
+  // The `none` policy is shared with `verify schema-drift`: an ABSENT `.planning/phases` is the
+  // documented skip (nothing to compare), never "could not look".
+  test('an absent .planning/phases is the documented skip, exit 0 — the same answer schema-drift gives (#5170)', () => {
+    cleanup(path.join(tmp, '.planning', 'phases'));
+    assert.ok(!fs.existsSync(path.join(tmp, '.planning', 'phases')), 'precondition: no phases tree');
+    const ctx = runGsdTools(['verify', 'context-drift', '01'], tmp);
+    assert.strictEqual(ctx.exitCode, 0, ctx.error);
+    const data = JSON.parse(ctx.output);
+    assert.strictEqual(data.skipped, true);
+    assert.strictEqual(data.reason, 'no-phases-directory');
+    assert.strictEqual(data.block, false);
+    const schema = runGsdTools(['verify', 'schema-drift', '01'], tmp);
+    assert.strictEqual(schema.exitCode, ctx.exitCode, 'both drift gates agree on the policy for an absent phases tree');
+    assert.strictEqual(JSON.parse(schema.output).message, 'No phases directory');
+    assert.strictEqual(JSON.parse(schema.output).block, false);
+  });
+
+  test('a phases tree that exists but cannot be examined is unreadable, not a skip (#5170)', () => {
+    const { spawnSync } = require('node:child_process');
+    const { TEST_ENV_BASE } = require('./helpers.cjs');
+    const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+    const phasesDir = path.join(tmp, '.planning', 'phases');
+    fs.mkdirSync(phasesDir, { recursive: true });
+    // The failure is injected by monkeypatching fs.statSync in the child (never a chmod: root ignores
+    // mode bits); the patch is local to that process.
+    const script = [
+      "const fs = require('node:fs');",
+      'const real = fs.statSync;',
+      `fs.statSync = function (p, ...rest) { if (String(p) === ${JSON.stringify(phasesDir)}) { throw Object.assign(new Error('EACCES: injected'), { code: 'EACCES' }); } return real.call(fs, p, ...rest); };`,
+      routeContextDriftStatement(tmp, '01'),
+    ].join('\n');
+    const r = spawnSync(process.execPath, ['-e', script], {
+      cwd: tmp,
+      encoding: 'utf-8',
+      timeout: PROBE_TIMEOUT_MS,
+      env: { ...process.env, ...TEST_ENV_BASE, HOME: tmp, USERPROFILE: tmp, GSD_WORKSTREAM: '' },
+    });
+    const data = JSON.parse(r.stdout);
+    assert.strictEqual(data.skipped, true);
+    assert.strictEqual(data.reason, 'phases-dir-unreadable', 'the unreadable arm, not the documented skip (no-phases-directory)');
+    assert.strictEqual(data.block, false, 'the payload stays non-blocking');
   });
 });
 

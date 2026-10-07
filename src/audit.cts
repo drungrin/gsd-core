@@ -22,7 +22,7 @@ import coreUtils = require('./core-utils.cjs');
 const { normalizeLineEndings } = coreUtils;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspace = require('./planning-workspace.cjs');
-const { planningDir, quickDirFrom, todosDir } = planningWorkspace;
+const { planningDir, quickDirFrom, debugDir, todosDir } = planningWorkspace;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import frontmatter = require('./frontmatter.cjs');
 // #4378 (roll-in): scanSeeds publishes the SAME canonical seed identity the
@@ -47,6 +47,7 @@ import { parseNamedArgsOrExit } from './command-arg-projection.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import verificationMod = require('./verification.cjs');
 const { reportStatusOf, VERIFICATION_STATUS, VerificationStatusError } = verificationMod;
+import { realClock } from './clock.cjs';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -431,19 +432,28 @@ function deriveOpenQuestionsDigest(questions: string[]): string {
 // ─── scanDebugSessions ────────────────────────────────────────────────────────
 
 /**
- * Scan .planning/debug/ for open sessions.
- * Open = status NOT in ['resolved', 'complete'].
- * Ignores the resolved/ subdirectory.
+ * #4869: gsd-debugger's archive_session step appends every resolved session to
+ * this file in the debug directory. It is a document, not a session: it has no
+ * frontmatter, so its status would derive `unknown` and read as open forever.
+ * Excluded by this fixed name only. Any other file with missing or unparseable
+ * frontmatter is still an open session. Every shipped debug-directory reader
+ * excludes the same name from active sessions (#5011).
  */
-function scanDebugSessions(planDir: string): ScanOutcome<DebugSessionItem> {
-  const debugDir = path.join(planDir, 'debug');
-  if (!fs.existsSync(debugDir)) return { items: [], acknowledged: 0 };
+const DEBUG_KNOWLEDGE_BASE_FILENAME = 'knowledge-base.md';
+
+/**
+ * Scan the root-scoped .planning/debug/ directory supplied by the caller for open sessions.
+ * Open = status NOT in ['resolved', 'complete'].
+ * Ignores the resolved/ subdirectory and the debugger's knowledge base.
+ */
+function scanDebugSessions(debugPath: string): ScanOutcome<DebugSessionItem> {
+  if (!fs.existsSync(debugPath)) return { items: [], acknowledged: 0 };
 
   const results: DebugSessionItem[] = [];
   let acknowledged = 0;
   let files: fs.Dirent[];
   try {
-    files = fs.readdirSync(debugDir, { withFileTypes: true });
+    files = fs.readdirSync(debugPath, { withFileTypes: true });
   } catch {
     return { items: [{ scan_error: true, slug: '', status: '', updated: '', hypothesis: '' }], acknowledged: 0 };
   }
@@ -451,12 +461,13 @@ function scanDebugSessions(planDir: string): ScanOutcome<DebugSessionItem> {
   for (const entry of files) {
     if (!entry.isFile()) continue;
     if (!entry.name.endsWith('.md')) continue;
+    if (entry.name === DEBUG_KNOWLEDGE_BASE_FILENAME) continue;
 
-    const filePath = path.join(debugDir, entry.name);
+    const filePath = path.join(debugPath, entry.name);
 
     let safeFilePath: string;
     try {
-      safeFilePath = requireSafePath(filePath, planDir, 'debug session file', PathAcceptance.AbsoluteInsideRoot);
+      safeFilePath = requireSafePath(filePath, path.dirname(debugPath), 'debug session file', PathAcceptance.AbsoluteInsideRoot);
     } catch {
       continue;
     }
@@ -465,9 +476,9 @@ function scanDebugSessions(planDir: string): ScanOutcome<DebugSessionItem> {
     // document at this read boundary, same seam as `src/uat.cts`'s
     // `readNormalizedDocument` — `platformReadSync` performs no line-ending
     // normalization itself, and extractFrontmatter/status-derivation below
-    // degrade a lone-CR file's frontmatter to `unknown`, which every scan
-    // in this module treats as "not open" (fail-open, the permissive
-    // direction) rather than a real parse gap.
+    // degrade a lone-CR file's frontmatter to `unknown`, which this scan
+    // reports as an open session (#4869) — so an un-normalized resolved
+    // session would resurface as open.
     const rawContent = platformReadSync(safeFilePath);
     if (rawContent === null) continue;
     const content = normalizeLineEndings(rawContent);
@@ -1045,9 +1056,9 @@ function scanUatGaps(planDir: string, cwd: string): ScanOutcome<UatGapItem> {
       // document at this read boundary, same seam as `src/uat.cts`'s
       // `readNormalizedDocument` — `platformReadSync` performs no line-ending
       // normalization itself, and extractFrontmatter/status-derivation below
-      // degrade a lone-CR file's frontmatter to `unknown`, which every scan
-      // in this module treats as "not open" (fail-open, the permissive
-      // direction) rather than a real parse gap.
+      // degrade a lone-CR file's frontmatter to `unknown`, which this scan
+      // reports as an open gap unless `result: all_pass` (#4869 triage) — so
+      // an un-normalized terminal UAT would resurface as open.
       const rawContent = platformReadSync(safeFilePath);
       if (rawContent === null) continue;
       const content = normalizeLineEndings(rawContent);
@@ -1333,7 +1344,9 @@ function auditOpenArtifacts(cwd: string): AuditResult {
   const planDir = planningDir(cwd);
 
   const debugSessions = (() => {
-    try { return scanDebugSessions(planDir); } catch { return { items: [{ scan_error: true, slug: '', status: '', updated: '', hypothesis: '' }], acknowledged: 0 }; }
+    // #5042: debug sessions are shared project state; workflow writers use
+    // the root .planning/debug directory even when a workstream is active.
+    try { return scanDebugSessions(debugDir(cwd)); } catch { return { items: [{ scan_error: true, slug: '', status: '', updated: '', hypothesis: '' }], acknowledged: 0 }; }
   })();
 
   const quickTasks = (() => {
@@ -1345,7 +1358,7 @@ function auditOpenArtifacts(cwd: string): AuditResult {
   })();
 
   const todos = (() => {
-    // #4256: the ONE root-scoped category — todos are shared project state,
+    // #4256: todos are shared project state, like debug sessions (#5042),
     // so the close gate reads todosDir(cwd) (the root), not the workstream-
     // scoped planDir every other scan below receives. Reading planDir here
     // made audit-open print "All artifact types clear. Safe to proceed."
@@ -1687,7 +1700,9 @@ function cmdAuditAcknowledge(cwd: string, args: string[], raw: boolean): void {
   // All declared flags above are value flags, so each resolves to `string |
   // null` at runtime; the cast narrows away the `boolean` arm of
   // ParsedNamedArgs's value type that this call site never produces.
-  const at = (atFlag as string | null) || new Date().toISOString().slice(0, 10);
+  // #4905: without --at, the operator-facing local calendar day (#2136)
+  // through the clock seam, which honors the GSD_NOW_MS pin (#474).
+  const at = (atFlag as string | null) || realClock.localToday();
 
   const planDir = planningDir(cwd);
   const markerBase = { milestone: milestone as string, at };

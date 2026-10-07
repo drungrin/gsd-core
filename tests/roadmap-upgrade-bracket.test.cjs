@@ -34,7 +34,7 @@ const {
   computeMigrationPlan,
   applyMigration,
   computeDependsOnRewrites,
-  applyRoadmapEdits,
+  rewriteRoadmapLines,
 } = require('../gsd-core/bin/lib/roadmap-upgrade.cjs');
 const { readVerificationStatus } = require('../gsd-core/bin/lib/verification.cjs');
 const { scopeToPhase, matchPhaseDirs, isSentinelPhaseId, parsePhaseId, renderPhaseId } = require('../gsd-core/bin/lib/phase-id.cjs');
@@ -3449,7 +3449,7 @@ describe('roadmap upgrade --convention bracket', () => {
   // line lost its trailing `\r` (checklist bullets kept theirs, since their
   // rewrite slices the line's own remainder instead of reassembling
   // captured regex groups), leaving a mixed-EOL file despite
-  // applyRoadmapEdits' own "preserve every terminator" contract.
+  // the roadmap rewrite's own "preserve every terminator" contract.
   describe('preserves CRLF line terminators on converted headings (#4144 round 6 W-CRLF)', () => {
     test('every line stays CRLF after apply, including converted headings', () => {
       const cwd = materializeEmptyFixture('crlf');
@@ -3868,7 +3868,7 @@ describe('roadmap upgrade --convention bracket', () => {
 //
 // What this drives: the REAL planner (`computeMigrationPlan(cwd, { convention:
 // 'bracket' })`) against a generated `.planning/` tree, and the REAL roadmap
-// writer (`applyRoadmapEdits` — the same function `applyMigration` writes
+// writer (`rewriteRoadmapLines` — the same function `applyMigration` writes
 // through), never a hand-rolled line-replacer. `applyMigration` itself is not
 // driven here: its real run demands a clean git tree, and a `git init` +
 // commit per generated case would put this suite in minutes rather than
@@ -4005,7 +4005,7 @@ describe('roadmap upgrade --convention bracket: transform properties', () => {
         assert.ok(!plan1.alreadyMigrated, 'planner reported nothing to migrate');
         assert.ok(plan1.roadmapEdits.length > 0, 'planner produced no edits');
 
-        const migrated = applyRoadmapEdits(content, plan1.roadmapEdits);
+        const migrated = rewriteRoadmapLines(content, plan1.roadmapEdits);
         const before = content.split('\n');
         const afterLines = migrated.split('\n');
 
@@ -4078,7 +4078,7 @@ describe('roadmap upgrade --convention bracket: transform properties', () => {
         const plan2 = planFor(migrated, spec.projectCode);
         assert.equal(plan2.alreadyMigrated, true);
         assert.equal(plan2.roadmapEdits.length, 0);
-        assert.equal(applyRoadmapEdits(migrated, plan2.roadmapEdits), migrated);
+        assert.equal(rewriteRoadmapLines(migrated, plan2.roadmapEdits), migrated);
       }),
     );
 

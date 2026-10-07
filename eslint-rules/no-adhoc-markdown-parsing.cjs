@@ -118,6 +118,10 @@ const rule = {
         'Ad-hoc table-row/cell regex detected (escaped pipe + negated-pipe cell-capture class). Use parseMarkdownTable() / findTableWithColumns() / TABLE_SCHEMAS from ./markdown-table instead. Suppress with: // allow-adhoc-markdown: <reason>',
       adhocReplaceMutation:
         'Ad-hoc .replace() mutation of a roadmap/state document using a hand-rolled table or section regex. Use updateTableCell() (./markdown-table) or withSection()/withPhaseSection() (./markdown-sectionizer) instead. Suppress with: // allow-adhoc-markdown: <reason>',
+      adhocSplitJoinMutation:
+        'Ad-hoc split(x).join(y) substitution over a planning document. Use replaceProse() (./planning-document) or the artifact\'s own write seam instead. Suppress with: // allow-adhoc-markdown: <reason>',
+      adhocLineIndexedMutation:
+        'Ad-hoc line-indexed rewrite (lines[i] = … / lines.splice(…)) of a planning document split on newlines. Use updateBullet()/updateHeading()/withSection() (./markdown-sectionizer) instead. Suppress with: // allow-adhoc-markdown: <reason>',
       fieldShapedReplaceMutation:
         'Ad-hoc .replace() mutation of a roadmap/state document using a hand-rolled bold-label field regex (field-shaped: \\*\\*Label:\\*\\*...). Use findField() + setFieldValue() (./planning-document) instead. Suppress with: // allow-adhoc-markdown: <reason>',
     },
@@ -526,7 +530,136 @@ const rule = {
       return null;
     }
 
+    // ── SPLIT-JOIN / LINE-INDEXED MUTATION detection (ADR-5057 §6, Phase 13) ──
+    // The two mutation shapes ADR-4910's census could not see because neither
+    // carries a regex: `<doc>.split(x).join(y)` (a literal substitution) and an
+    // index-addressed rewrite of `<doc>.split('\n')` (`lines[i] = …`,
+    // `lines.splice(…)`). Receiver gate is the same roadmap/state/content name
+    // fingerprint patterns 4/5 use. A split/join whose separator AND joiner are
+    // both line breaks is a line-ending normalisation, not a substitution of
+    // planning text, and is not flagged.
+    //
+    // Receiver gate for THESE two detectors is narrower than patterns 4/5's
+    // (a bare `content` is every markdown-ish string in the tree — agent
+    // files, skill bodies, fixtures). A receiver is planning content when
+    //   (a) its own name is planning-specific (`roadmapContent`, `stateMd`…), or
+    //   (b) it is a same-scope binding initialised by a file READ whose path
+    //       argument — followed through same-scope bindings, a few hops —
+    //       names a planning location or artifact (`ROADMAP.md`, `statePath`,
+    //       `planningDir(cwd)`, `.planning`…).
+    // A function parameter or any other unresolvable receiver is NOT planning
+    // content: the rule is a fingerprint of the two shapes ADR-4910's census
+    // missed, not a dataflow proof, and refuses to guess.
+    const PLANNING_RECEIVER_RE = /roadmap|state|project|requirement|reqContent/i;
+    const PLANNING_PATH_EVIDENCE_RE = /(?:ROADMAP|STATE|PROJECT|REQUIREMENTS)\.md|\.planning\b|planningDir|planningPath|roadmapPath|statePath|projectPath|requirementsPath/i;
+    const READ_CALLEE_RE = /^(?:readFileSync|readFile|platformReadSync|readTextEvidence|readText)$/;
+    const EVIDENCE_HOPS = 4;
+
+    function calleeName(callNode) {
+      const c = callNode.callee;
+      if (!c) return '';
+      if (c.type === 'Identifier') return c.name;
+      if (c.type === 'MemberExpression' && !c.computed && c.property) return c.property.name || '';
+      return '';
+    }
+
+    /** Concatenate the identifier names, string literals and callee names under `node`, following same-scope bindings. */
+    function pathEvidenceText(node, scope, hops) {
+      if (!node || hops < 0) return '';
+      switch (node.type) {
+        case 'Literal':
+          return typeof node.value === 'string' ? `${node.value} ` : '';
+        case 'TemplateLiteral':
+          return `${node.quasis.map((q) => (q.value && q.value.cooked) || '').join(' ')} ${node.expressions.map((e) => pathEvidenceText(e, scope, hops - 1)).join(' ')}`;
+        case 'Identifier': {
+          const init = resolveVariableInit(node.name, scope);
+          return `${node.name} ${init ? pathEvidenceText(init, scope, hops - 1) : ''}`;
+        }
+        case 'CallExpression':
+          return `${calleeName(node)} ${node.arguments.map((a) => pathEvidenceText(a, scope, hops - 1)).join(' ')}`;
+        case 'MemberExpression':
+          return `${pathEvidenceText(node.object, scope, hops - 1)} ${node.computed ? '' : (node.property && node.property.name) || ''}`;
+        case 'BinaryExpression':
+          return `${pathEvidenceText(node.left, scope, hops - 1)} ${pathEvidenceText(node.right, scope, hops - 1)}`;
+        default:
+          return '';
+      }
+    }
+
+    // A name that says it holds a path, directory or identifier (`projectPath`,
+    // `stateDir`, `roadmapSlug`) is not planning CONTENT, whatever noun it
+    // starts with — `projectPath.split(path.sep).join('/')` is the repo's own
+    // separator-normalisation idiom.
+    const NON_CONTENT_NAME_RE = /(?:path|paths|dir|root|file|filename|name|slug|id|label)$/i;
+
+    function isPlanningReceiver(identifier, scope) {
+      if (NON_CONTENT_NAME_RE.test(identifier.name)) return false;
+      if (PLANNING_RECEIVER_RE.test(identifier.name)) return true;
+      const init = resolveVariableInit(identifier.name, scope);
+      if (!init || init.type !== 'CallExpression' || !READ_CALLEE_RE.test(calleeName(init))) return false;
+      return PLANNING_PATH_EVIDENCE_RE.test(pathEvidenceText(init.arguments[0], scope, EVIDENCE_HOPS));
+    }
+
+    const LINE_BREAK_LITERALS = new Set(['\n', '\r\n', '\r']);
+
+    function isLineBreakLiteral(arg) {
+      if (!arg || arg.type !== 'Literal') return false;
+      if (arg.regex) return /^(?:\\r\?\\n|\\r\\n\|\\n|\\n|\\r\?\\n\|\\r)$/.test(arg.regex.pattern || '');
+      return typeof arg.value === 'string' && LINE_BREAK_LITERALS.has(arg.value);
+    }
+
+    /** `<receiver>.split(…)` where receiver is a planning-content identifier. */
+    function isPlanningSplit(node, scope) {
+      if (!node || node.type !== 'CallExpression') return false;
+      const callee = node.callee;
+      if (!callee || callee.type !== 'MemberExpression' || callee.computed) return false;
+      if (!callee.property || callee.property.name !== 'split') return false;
+      const receiver = callee.object;
+      return !!receiver && receiver.type === 'Identifier' && isPlanningReceiver(receiver, scope);
+    }
+
+    function isSplitJoinSubstitution(node, scope) {
+      if (node.type !== 'CallExpression') return false;
+      const callee = node.callee;
+      if (!callee || callee.type !== 'MemberExpression' || callee.computed) return false;
+      if (!callee.property || callee.property.name !== 'join') return false;
+      const inner = callee.object;
+      if (!isPlanningSplit(inner, scope)) return false;
+      // A split on a line break is a line-ending conversion / line operation,
+      // never a substitution of planning text (that shape is the line-indexed
+      // detector's); only a non-line-break separator is a literal substitution.
+      return !isLineBreakLiteral(inner.arguments[0]);
+    }
+
+    /** Identifier whose declared initializer is `<planning content>.split(…)`. */
+    function isPlanningLinesIdentifier(node, scope) {
+      if (!node || node.type !== 'Identifier') return false;
+      return isPlanningSplit(resolveVariableInit(node.name, scope), scope);
+    }
+
+    function isLineIndexedMutation(node, scope) {
+      if (node.type === 'AssignmentExpression') {
+        const left = node.left;
+        return !!left && left.type === 'MemberExpression' && left.computed
+          && isPlanningLinesIdentifier(left.object, scope);
+      }
+      if (node.type === 'CallExpression') {
+        const callee = node.callee;
+        return !!callee && callee.type === 'MemberExpression' && !callee.computed
+          && !!callee.property && callee.property.name === 'splice'
+          && isPlanningLinesIdentifier(callee.object, scope);
+      }
+      return false;
+    }
+
     return {
+      AssignmentExpression(node) {
+        const scope = context.getScope ? context.getScope() : sourceCode.getScope(node);
+        if (isLineIndexedMutation(node, scope) && !isAllowed(node)) {
+          context.report({ node, messageId: 'adhocLineIndexedMutation' });
+        }
+      },
+
       Literal(node) {
         // 1. Fence-block-strip regex
         if (isFenceBlockStripRegex(node)) {
@@ -572,6 +705,12 @@ const rule = {
           if (!isAllowed(node)) {
             context.report({ node, messageId });
           }
+        }
+        // 6/7. split/join substitution; line-indexed splice.
+        if (isSplitJoinSubstitution(node, scope) && !isAllowed(node)) {
+          context.report({ node, messageId: 'adhocSplitJoinMutation' });
+        } else if (isLineIndexedMutation(node, scope) && !isAllowed(node)) {
+          context.report({ node, messageId: 'adhocLineIndexedMutation' });
         }
       },
     };

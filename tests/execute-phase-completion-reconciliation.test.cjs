@@ -255,7 +255,9 @@ describe('execute-phase completion reconciliation (#4217 — split A of #3754)',
 
     test('fragment keeps the #4003 anchored commit-scope probe and dispatch bound', () => {
       const fragment = readFragment();
-      assert.match(fragment, /0\*\$\{SPOT_PHASE_N\}/, 'probe keeps the zero-pad-tolerant anchored scope (#4003)');
+      // #5164: the anchored, zero-pad-tolerant scope (#4003) is the evaluation-scope resolver's plan
+      // pattern; the probe asks it for this branch's commits within the same 1-hour window.
+      assert.match(fragment, /gsd_run check evaluation-scope --plan "\{phase_number\}-\{plan_padded\}" --ref "\$\{EXPECTED_BRANCH\}" --commits-only --committed-since "1 hour ago"/, 'probe asks the resolver for the plan\'s commits on the expected branch (#4003, #5164)');
       assert.match(fragment, /--since="\$\{DISPATCH_TS\}"/, 'probe keeps the dispatch-time bound');
       assert.match(fragment, /SUMMARY_EXISTS/, 'probe keeps the SUMMARY existence check');
     });

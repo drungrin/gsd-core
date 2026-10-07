@@ -57,6 +57,8 @@ const {
   buildPhaseHeadingScanRegex,
 } = phaseIdMod;
 import { escapeRegex } from './pattern.cjs';
+import { declareGateExit } from './gate-exit.cjs';
+import { gateVerdict } from './gate-verdict.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- phase-locator.cjs is an export= CommonJS module
 import phaseLocatorMod = require('./phase-locator.cjs');
 const { findPhaseInternal, getArchivedPhaseDirs, listMilestonePhaseDirs, listAllPhaseDirs } = phaseLocatorMod;
@@ -4147,11 +4149,19 @@ function cmdPhaseComplete(cwd: string, phaseNum: string, raw: boolean): void {
               const planId = summaryFile.replace('-SUMMARY.md', '').replace('SUMMARY.md', '');
               if (!planId) continue;
               const planEscaped = escapeRegex(planId);
+              // ADR-5057 §6 (Phase 13, #5217): the per-plan flip is a bullet
+              // mutation, so it goes through `updateBullet` like the phase
+              // checkbox flip above — first matching bullet only, never a
+              // fenced line, never a mid-line occurrence.
               const planCheckboxPattern = new RegExp(
-                `(-\\s*\\[) (\\]\\s*(?:\\*\\*)?${planEscaped}(?:\\*\\*)?)`,
+                `^(\\s*-\\s*\\[) (\\]\\s*(?:\\*\\*)?${planEscaped}(?:\\*\\*)?)`,
                 'i',
               );
-              b = b.replace(planCheckboxPattern, '$1x$2');
+              b = updateBullet(
+                b,
+                (_bulletText, rawLine) => planCheckboxPattern.test(rawLine),
+                (rawLine) => rawLine.replace(planCheckboxPattern, '$1x$2'),
+              );
             }
             return b;
           });
@@ -5072,6 +5082,9 @@ function cmdPhaseUatPassed(
   const report = evaluateUatPassed(phaseFullDir, { policy: opts.policy });
 
   output({ phase: phaseNum, ...report }, raw);
+  // #5170: the exit status follows the verdict (status mode: a failing verdict is exit 1). Declared
+  // AFTER output(), which rewrites the pending-outcome cell. The JSON above is unchanged.
+  declareGateExit(gateVerdict(report.passed ? 'pass' : 'block', !report.passed, { phase: phaseNum, ...report }), 'status');
 }
 
 // #1437 — phase.list-plans: list plan files for a given phase number.

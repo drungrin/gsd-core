@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "count": 293,
+  "count": 303,
   "classes": {
     "ARCH": 1,
     "CI": 2,
@@ -19,7 +19,7 @@
     "PROHIB": 10,
     "RELEASE-NOTES": 31,
     "RULESET": 61,
-    "SEAM": 20,
+    "SEAM": 30,
     "SESSION": 9,
     "WAVE": 5,
     "WORKSTREAM": 5,
@@ -1247,6 +1247,36 @@
       "value": "the config-key four-level precedence walk (loadConfig result → workstream config.json → root config.json → registry.configSchema default → absent), owned solely by src/capability-activation.cts"
     },
     {
+      "id": "SEAM.evaluation-scope.enforced-by",
+      "klass": "SEAM",
+      "value": "test:tests/evaluation-scope-drift-lint.test.cjs"
+    },
+    {
+      "id": "SEAM.evaluation-scope.owns",
+      "klass": "SEAM",
+      "value": "resolveEvaluationScope(projectDir, unit, options) (src/gate-evaluation-scope.cts) is the single owner of which commits and files a gate or workflow step evaluates (ADR-5057 §4, #5164)"
+    },
+    {
+      "id": "SEAM.gate-evidence.enforced-by",
+      "klass": "SEAM",
+      "value": "test:tests/gate-evidence.test.cjs"
+    },
+    {
+      "id": "SEAM.gate-evidence.owns",
+      "klass": "SEAM",
+      "value": "Evidence<T> / readTextEvidence / readDirEvidence / verdictFromEvidence (src/gate-evidence.cts) is the single owner of found-versus-none-versus-unreadable for a gate read (ADR-5057 §4, #5170)"
+    },
+    {
+      "id": "SEAM.gate-exit.enforced-by",
+      "klass": "SEAM",
+      "value": "test:tests/gate-exit.test.cjs"
+    },
+    {
+      "id": "SEAM.gate-exit.owns",
+      "klass": "SEAM",
+      "value": "gateExitOutcome / declareGateExit (src/gate-exit.cts) is the single owner of the exit status a gate verdict projects to; declareOutcome (src/cli-exit.cts) is the only writer of the pending-outcome cell besides output() (ADR-5057 §4, #5170)"
+    },
+    {
       "id": "SEAM.gate-verdict.enforced-by",
       "klass": "SEAM",
       "value": "test:tests/gate-verdict.test.cjs"
@@ -1297,6 +1327,16 @@
       "value": "phaseStatus(phaseDir, deps?) / phaseStatusFromFacts(...) is the single canonical owner of \"what state is phase P in?\" (ADR-5057 §2, epic #5056)"
     },
     {
+      "id": "SEAM.runtime-descriptor-owner.enforced-by",
+      "klass": "SEAM",
+      "value": "test:tests/runtime-descriptor-owner.test.cjs"
+    },
+    {
+      "id": "SEAM.runtime-descriptor-owner.owns",
+      "klass": "SEAM",
+      "value": "hostBehaviorsFor / assertKnownRuntime (src/runtime-name-policy.cts) are the single owners of a runtime's host behaviors and of refusing an unknown runtime id; no install or hook code compares a runtime-name literal (ADR-5057 §5, #5169)"
+    },
+    {
       "id": "SEAM.shellcmdproj-win-binary-resolution.enforced-by",
       "klass": "SEAM",
       "value": "lint-rule:no-private-binary-resolution"
@@ -1305,6 +1345,16 @@
       "id": "SEAM.shellcmdproj-win-binary-resolution.owns",
       "klass": "SEAM",
       "value": "Windows binary resolution (resolveExecutableBinary, projectSpawnInvocation) — which file a declared command name actually names, and cmd.exe mediation"
+    },
+    {
+      "id": "SEAM.test-report-adapter.enforced-by",
+      "klass": "SEAM",
+      "value": "test:tests/report-parser.property.test.cjs"
+    },
+    {
+      "id": "SEAM.test-report-adapter.owns",
+      "klass": "SEAM",
+      "value": "parseTestReport(output) (src/report-parser.cts) is the single owner of turning a test report into individual results; the RED-evidence policy consumes its contract and parses no report text (#4692)"
     },
     {
       "id": "SEAM.verification-isphasecomplete.enforced-by",

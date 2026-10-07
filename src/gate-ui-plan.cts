@@ -11,11 +11,12 @@
  * Argv after the verb: `<phase>`.
  */
 
-import { gateVerdict, gateUsageFailure, GATE_FAILURE_CODE } from './gate-verdict.cjs';
+import { gateVerdict, gateUnreadable, gateUsageFailure, GATE_FAILURE_CODE } from './gate-verdict.cjs';
 import type { GateResult } from './gate-verdict.cjs';
-import { findUiSpecInDir, lookupRoadmapPhase, resolvePhaseDirOrEmpty } from './gate-phase-context.cjs';
+import { locateUiSpec, lookupRoadmapPhase } from './gate-phase-context.cjs';
 import { checkUiPresence } from './ui-safety-gate.cjs';
-import { hasStaticFrontendEvidence } from './ui-frontend-evidence.cjs';
+import { readStaticFrontendEvidence } from './ui-frontend-evidence.cjs';
+import { evidenceNone } from './gate-evidence.cjs';
 
 export interface UiPlanGateResult {
   frontend: boolean;
@@ -26,6 +27,11 @@ export interface UiPlanGateResult {
   matchedToken: string | null;
   matchedLine: string | null;
   phaseLookupFailed?: boolean;
+  /**
+   * Present only when the ROADMAP, the phase directory, or (for a frontend phase with no UI-SPEC) the static
+   * frontend evidence could not be read (#5170): the verdict is `unreadable`.
+   */
+  readError?: string;
 }
 
 /**
@@ -47,18 +53,29 @@ export interface UiPlanGateResult {
  */
 export function computeUiPlanGate(projectDir: string, phase: string): UiPlanGateResult {
   // (a) phase section text
-  const { phaseSection, phaseLookupFailed } = lookupRoadmapPhase(projectDir, phase);
+  const { phaseSection, phaseLookupFailed, readError: roadmapReadError } = lookupRoadmapPhase(projectDir, phase);
 
   // (b) frontend detection — reuse the existing helper; no reimplementation
   const presenceResult = checkUiPresence(phaseSection);
   const frontend = presenceResult.hasUI;
 
-  // (b') #3312 — static structural corroboration. Only probed when the sniffer matched.
-  const hasFrontendEvidence = frontend ? hasStaticFrontendEvidence(projectDir) : false;
+  // (b') #3312 — static structural corroboration. Only probed when the sniffer matched. `unreadable`
+  // (#5170) is a manifest or tree the probe could not look at: absence of evidence is then not
+  // established, and the verdict says so (below) instead of reading it as "no frontend".
+  const frontendEvidence = frontend ? readStaticFrontendEvidence(projectDir) : evidenceNone<true>();
+  const hasFrontendEvidence = frontendEvidence.kind === 'found';
 
-  // (c) phase directory and *-UI-SPEC.md
-  const uiSpecPath = findUiSpecInDir(resolvePhaseDirOrEmpty(projectDir, phase));
+  // (c) phase directory and *-UI-SPEC.md. `none` is "no spec"; `unreadable` is "could not look"
+  // (#5170) and is carried to the verdict, never read as "no spec".
+  const uiSpec = locateUiSpec(projectDir, phase);
+  const uiSpecPath = uiSpec.kind === 'found' ? uiSpec.value : '';
   const hasUiSpec = uiSpecPath !== '';
+  // Unreadable frontend evidence only matters when it could flip the verdict: with a UI-SPEC present the
+  // gate does not block whatever the tree holds.
+  const frontendReadError = frontendEvidence.kind === 'unreadable' && !hasUiSpec
+    ? `static frontend evidence could not be read (${frontendEvidence.reason})`
+    : undefined;
+  const readError = roadmapReadError ?? (uiSpec.kind === 'unreadable' ? uiSpec.reason : undefined) ?? frontendReadError;
 
   // block = frontend phase with structural frontend evidence and no UI-SPEC (#3312)
   const block = frontend && hasFrontendEvidence && !hasUiSpec;
@@ -70,6 +87,7 @@ export function computeUiPlanGate(projectDir: string, phase: string): UiPlanGate
     matchedLine: presenceResult.matchedLine,
   };
   if (phaseLookupFailed) result.phaseLookupFailed = true;
+  if (readError !== undefined) result.readError = readError;
   return result;
 }
 
@@ -79,5 +97,8 @@ export function evaluateUiPlanGate(input: { projectDir: string; args: readonly s
     return gateUsageFailure(GATE_FAILURE_CODE.SDK_MISSING_ARG, 'ui-plan-gate requires a phase argument: check ui-plan-gate <phase>');
   }
   const result = computeUiPlanGate(input.projectDir, phase);
+  // Evidence the gate could not read is "could not look", never a pass (ADR-5057 §4). `block` is
+  // the gate's own policy and is unchanged; the exit status follows the outcome.
+  if (result.readError !== undefined) return gateUnreadable(result.block, { ...result });
   return gateVerdict(result.block ? 'block' : 'pass', result.block, { ...result });
 }

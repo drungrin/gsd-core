@@ -669,6 +669,8 @@ Runtime-neutral predicate that evaluates HUMAN-UAT results for a phase and repor
 | `no_uat_artifacts` | `boolean` | `true` when no real UAT test items were parsed (no `*-UAT.md` files, unreadable dir, or files with no test blocks); when `true`, `passed` is always `false` |
 | `policy.require_verification` | `boolean` | Whether `--require-verification` was active |
 
+**Exit status:** `0` when `passed` is `true`, `1` when it is `false` (#5170). The JSON on stdout is the verdict either way, so a caller reads it for `exit 0` and `exit 1` and treats any other status as "could not run".
+
 **Programmatic access:** `node gsd-tools.cjs phase uat-passed <N> [--require-verification] [--raw]` — see [CLI Tools Reference](CLI-TOOLS.md)
 
 ```bash
@@ -1318,6 +1320,10 @@ pass and handed to `gsd-plan-checker`; runnable by hand to see what the checker 
 **Prerequisites:** none — an unresolvable phase degrades to a JSON payload with `readError` set
 rather than failing.
 **Produces:** JSON on stdout. Nothing is written to disk.
+**Exit status:** `0` whenever the probe could look — a blocker finding is still exit `0` (the
+payload's `counts.blocker` carries the verdict). A probe that **could not look** (`status:
+"unresolvable"`, `readError` set) exits `69` (`UNAVAILABLE`) with the same JSON on stdout: "could
+not look" is never a clean exit (#5170).
 
 **It never executes command text.** PLAN.md is LLM-authored, so the probe only resolves paths
 and stats directories; a `package.json` it finds is read for script *names* only.
@@ -1378,6 +1384,9 @@ constitutes failure. A command with no expressible failure mode is not an accept
 **Prerequisites:** none — an unresolvable phase degrades to a JSON payload with `readError` set
 rather than failing.
 **Produces:** JSON on stdout. Nothing is written to disk.
+**Exit status:** `0` whenever the probe could look — a blocker finding is still exit `0` (the
+payload's `counts.blocker` carries the verdict). A probe that **could not look** (`status:
+"unresolvable"`, `readError` set) exits `69` (`UNAVAILABLE`) with the same JSON on stdout (#5170).
 
 **It never executes command text**, and it never authors a statement for the planner — a
 prescribed failure signal would be copied verbatim and carry no information.
@@ -2116,6 +2125,7 @@ node gsd-tools.cjs effort sync --apply    # write the changes
 | `--config-dir <path>` | Point at a specific runtime config directory |
 
 **On `claude`** it re-syncs the `effort:` frontmatter of installed `gsd-*.md` agents.
+An explicit `--config-dir` takes precedence. Otherwise, a project-local Claude install uses its adjacent `.claude/agents/` directory; other installs use the global Claude agents directory. If the selected directory exists but has no `gsd-*.md` files, the report includes `reason: "no GSD agent files found"`.
 
 **On `codex`** it repairs `.toml` files that drift from the passive model posture ([ADR-2313](adr/2313-codex-passive-model-posture.md)) — the counterpart to the detection that [`validate agents`](#validate-agents) performs:
 

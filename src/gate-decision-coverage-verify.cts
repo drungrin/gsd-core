@@ -7,8 +7,7 @@
  * Argv after the verb: `<phase-dir> <context-path>` (positional; no `--context` flag here).
  */
 
-import fs from 'node:fs';
-import { gateVerdict, isGateUsageFailure } from './gate-verdict.cjs';
+import { gateVerdict, gateUnreadable, isGateUsageFailure } from './gate-verdict.cjs';
 import type { GateResult } from './gate-verdict.cjs';
 import { resolveContainedPath } from './gate-phase-context.cjs';
 import { isDecisionCoverageGateEnabled } from './gate-config.cjs';
@@ -18,10 +17,33 @@ import {
   loadSummaryContents,
   loadDecisionExtraction,
   readModifiedFilesContent,
-  recentCommitMessages,
+  phaseCommitMessages,
   buildVerifyMessage,
 } from './decision-coverage-support.cjs';
 import type { UncoveredItem } from './decision-coverage-support.cjs';
+
+/**
+ * The verdict when CONTEXT.md or a shipped artifact could not be read. The gate stays advisory
+ * (`block: false`, `blocking: false`); the outcome is `unreadable`, so the exit status is
+ * UNAVAILABLE and no decision is reported honored or not honored from content never seen (#5170).
+ */
+function unreadableVerify(readError: string): GateResult {
+  return gateUnreadable(false, {
+    skipped: false,
+    blocking: false,
+    reason: 'unreadable evidence',
+    total: null,
+    honored: null,
+    not_honored: [],
+    readError,
+    message: `Decision coverage verify (warning): could not read its evidence (${readError}); no decision was checked.`,
+  });
+}
+
+/** The verdict when there is no CONTEXT.md: the legitimate green skip (authoritatively `none`, never `unreadable`). */
+function contextMissingSkip(): GateResult {
+  return gateVerdict('skip', false, { skipped: true, blocking: false, reason: 'CONTEXT.md missing', total: 0, honored: 0, not_honored: [], message: 'No CONTEXT.md - nothing to check.' });
+}
 
 export function evaluateDecisionCoverageVerify(input: { projectDir: string; args: readonly string[] }): GateResult {
   const { projectDir, args } = input;
@@ -41,11 +63,19 @@ export function evaluateDecisionCoverageVerify(input: { projectDir: string; args
   if (!isDecisionCoverageGateEnabled(projectDir)) {
     return gateVerdict('skip', false, { skipped: true, blocking: false, reason: 'workflow.context_coverage_gate is false', total: 0, honored: 0, not_honored: [], message: 'Decision coverage gate disabled by config.' });
   }
-  if (!contextPath || !fs.existsSync(contextPath)) {
-    return gateVerdict('skip', false, { skipped: true, blocking: false, reason: 'CONTEXT.md missing', total: 0, honored: 0, not_honored: [], message: 'No CONTEXT.md - nothing to check.' });
+  // No context argument is the only up-front skip: an absent file is `none` and an unreadable one is
+  // `unreadable` below, from the one read that loads the decisions (`fs.existsSync` answered `false`
+  // for an EACCES on a parent, skipping a CONTEXT.md the gate never saw — #5170).
+  if (!contextPath) {
+    return contextMissingSkip();
   }
 
-  const { trackable: decisions, outcome: decisionOutcome } = loadDecisionExtraction(contextPath);
+  const extracted = loadDecisionExtraction(contextPath);
+  if (extracted.kind === 'unreadable') return unreadableVerify(`${extracted.span ?? contextPath}: ${extracted.reason}`);
+  if (extracted.kind === 'none') {
+    return contextMissingSkip();
+  }
+  const { trackable: decisions, outcome: decisionOutcome } = extracted.value;
 
   // Mirror could-not-parse surface for verify (non-blocking advisory WARN).
   // Fire independent of decisions.length — a parse-miss on any bullet must surface,
@@ -73,13 +103,19 @@ export function evaluateDecisionCoverageVerify(input: { projectDir: string; args
     return gateVerdict('skip', false, { skipped: true, blocking: false, reason: 'no trackable decisions', total: 0, honored: 0, not_honored: [], message: 'No trackable decisions in CONTEXT.md.' });
   }
 
+  // Every file the haystack is built from is typed evidence (#5170): one that exists but cannot be
+  // read is `unreadable`, never an empty slice of the haystack that makes a decision look unhonored.
   const planContents = loadPlanContents(phaseDir);
+  if (planContents.kind === 'unreadable') return unreadableVerify(`${planContents.span ?? phaseDir}: ${planContents.reason}`);
   const summaryParts = loadSummaryContents(phaseDir);
+  if (summaryParts.kind === 'unreadable') return unreadableVerify(`${summaryParts.span ?? phaseDir}: ${summaryParts.reason}`);
+  const modifiedFiles = readModifiedFilesContent(projectDir, summaryParts.value);
+  if (modifiedFiles.kind === 'unreadable') return unreadableVerify(`${modifiedFiles.span ?? 'files_modified'}: ${modifiedFiles.reason}`);
   const haystack = [
-    planContents.join('\n\n'),
-    summaryParts.join('\n\n'),
-    readModifiedFilesContent(projectDir, summaryParts),
-    recentCommitMessages(projectDir),
+    planContents.value.join('\n\n'),
+    summaryParts.value.join('\n\n'),
+    modifiedFiles.value,
+    phaseCommitMessages(projectDir, phaseDir),
   ].join('\n\n');
 
   const notHonored: UncoveredItem[] = [];
