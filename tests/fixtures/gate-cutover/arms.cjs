@@ -11,6 +11,14 @@
  * Deterministic by construction: fixed file content, no clock, no random. The
  * only run-dependent text is the temp root, which `normalize` rewrites to
  * `<TMP>` in BOTH capture and comparison.
+ *
+ * PROVENANCE (#5219, ADR-5057 §4 arm C). The goldens of groups E12–E15 (the drift gates and
+ * prohibition-enforcement) were captured by executing `origin/next` at
+ * 8bbdded7efd00fa7beffc10d6e39550c165875d6 (the build BEFORE the four verbs moved into gate
+ * modules). To re-verify: check that commit out detached, `npm run build:lib`, copy this file and
+ * fail-read-preload.cjs into its tests/fixtures/gate-cutover/, run each E12–E15 arm and diff stdout,
+ * stderr and exit code against the checked-in goldens. Review-round arms whose behaviour was
+ * DELIBERATELY changed by the move are marked in the golden catalogue test (E13 stamp validation).
  */
 
 const fs = require('node:fs');
@@ -354,7 +362,128 @@ function buildBare(root) {
   write(root, '.planning/config.json', '{}\n');
 }
 
+// ─── #5219 (ADR-5057 §4 arm C): the four drift / prohibition `check` gates ───────────────────────
+//
+// Commit dates are pinned so a fixture's commit shas, and the `last_mapped_commit` stamps derived from
+// them, are identical on every machine: the goldens carry them.
+
+const FIXED_DATE = '2026-01-01T00:00:00+00:00';
+const LATER_DATE = '2026-03-01T00:00:00+00:00';
+
+/** A git repository whose commits are dated `date` (pin both author and committer). */
+function makeDatedGit(root) {
+  const base = {
+    ...process.env,
+    GIT_AUTHOR_NAME: 'Test',
+    GIT_AUTHOR_EMAIL: 'test@test.com',
+    GIT_COMMITTER_NAME: 'Test',
+    GIT_COMMITTER_EMAIL: 'test@test.com',
+  };
+  const run = (date, ...args) => gitOrThrow(args, { cwd: root, env: { ...base, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } }).trim();
+  run(FIXED_DATE, 'init', '--initial-branch=main');
+  run(FIXED_DATE, 'config', 'user.email', 'test@test.com');
+  run(FIXED_DATE, 'config', 'user.name', 'Test');
+  run(FIXED_DATE, 'config', 'commit.gpgsign', 'false');
+  return (date, message) => {
+    run(date, 'add', '-A');
+    run(date, 'commit', '--allow-empty', '-m', message);
+    return run(date, 'rev-parse', 'HEAD');
+  };
+}
+
+const PLAN_FILES = (files) => `---\nphase: 01\nfiles_modified:\n${files.map((f) => `  - ${f}`).join('\n')}\n---\n\n# Plan\n`;
+
+function buildSchemaDrift(root) {
+  write(root, '.planning/config.json', '{}\n');
+  write(root, 'prisma/schema.prisma', 'model User { id Int @id }\n');
+  write(root, '.planning/phases/01-schema/01-01-PLAN.md', PLAN_FILES(['prisma/schema.prisma']));
+  write(root, '.planning/phases/02-clean/02-01-PLAN.md', PLAN_FILES(['src/a.js']));
+  write(root, '.planning/phases/03-pushed/03-01-PLAN.md', PLAN_FILES(['prisma/schema.prisma']));
+  write(root, '.planning/phases/03-pushed/03-01-SUMMARY.md', '---\nphase: 03\n---\n\nRan `npx prisma db push` against the dev database.\n');
+  makeDatedGit(root)(FIXED_DATE, 'chore: scaffold');
+}
+
+function buildContextDrift(action) {
+  return (root) => {
+    write(root, '.planning/config.json', `${JSON.stringify(action === undefined ? {} : { workflow: { context_drift_action: action } })}\n`);
+    write(root, '.planning/phases/01-stale/01-RESEARCH.md', '# research\n');
+    write(root, '.planning/phases/02-sync/02-CONTEXT.md', '# context\n');
+    write(root, '.planning/phases/02-sync/02-RESEARCH.md', '# research\n');
+    write(root, '.planning/phases/03-nocontext/03-RESEARCH.md', '# research\n');
+    write(root, '.planning/phases/04-noupstream/04-CONTEXT.md', '# context\n');
+    const commitAt = makeDatedGit(root);
+    commitAt(FIXED_DATE, 'chore: research and baseline context');
+    write(root, '.planning/phases/01-stale/01-CONTEXT.md', '# context decided later\n');
+    commitAt(LATER_DATE, 'docs: decide context after research');
+  };
+}
+
+const UNRESOLVABLE_SHA = '0123456789abcdef0123456789abcdef01234567';
+const STRUCTURE_BODY = '# Structure\n\n- `src/` application sources\n';
+
+/** `stamp`: how STRUCTURE.md names its baseline; `extraDirs`: new top-level dirs added after it. */
+function buildCodebaseDrift({ git = true, stamp = 'none', extraDirs = [], dirDocument = false }) {
+  return (root) => {
+    write(root, '.planning/config.json', '{}\n');
+    if (stamp === 'absent-file') return;
+    write(root, '.planning/codebase/STRUCTURE.md', STRUCTURE_BODY);
+    write(root, 'src/main.js', 'main\n');
+    if (!git) return;
+    const commitAt = makeDatedGit(root);
+    const baseline = commitAt(FIXED_DATE, 'feat: baseline');
+    const tree = gitOrThrow(['rev-parse', `${baseline}^{tree}`], { cwd: root }).trim();
+    const stampValue = {
+      none: null,
+      fake: UNRESOLVABLE_SHA,
+      tree,
+      head: baseline,
+      // #5219 (f): stamps that are not an object id spelled in full, or are not a hex id at all.
+      ref: 'HEAD',
+      option: '--batch',
+      upper: baseline.toUpperCase(),
+      short7: baseline.slice(0, 7),
+      short6: baseline.slice(0, 6),
+      fake64: 'f'.repeat(64),
+    }[stamp];
+    if (stampValue !== null) {
+      write(root, '.planning/codebase/STRUCTURE.md', `---\nlast_mapped_commit: ${stampValue}\n---\n${STRUCTURE_BODY}`);
+    }
+    if (dirDocument) write(root, '.planning/codebase/ARCHITECTURE.md/keep.txt', 'a directory where a document is expected\n');
+    commitAt(FIXED_DATE, 'docs: stamp the map');
+    for (const dir of extraDirs) write(root, `${dir}/index.js`, `${dir}\n`);
+    if (extraDirs.length > 0) commitAt(FIXED_DATE, 'feat: add directories');
+  };
+}
+
+const PROHIBITION_REQUEST = { prohibition: { verification: 'test', text: 'never log secrets' }, check: null };
+
+function buildProhibition(root) {
+  write(root, '.planning/config.json', '{}\n');
+  write(root, 'req/located-false.json', `${JSON.stringify(PROHIBITION_REQUEST)}\n`);
+  write(root, 'req/judgment.json', `${JSON.stringify({ prohibition: { verification: 'judgment', text: 'prefer clarity' }, check: { kind: 'unknown-kind', target: 't' }, mode: 'interactive' })}\n`);
+  write(root, 'req/not-json.json', '{not json\n');
+}
+
 const FIXTURES = {
+  'schema-drift': buildSchemaDrift,
+  'ctx-drift': buildContextDrift(undefined),
+  'ctx-drift-block': buildContextDrift('block'),
+  'cb-no-map': buildCodebaseDrift({ stamp: 'absent-file' }),
+  'cb-no-git': buildCodebaseDrift({ git: false }),
+  'cb-no-stamp': buildCodebaseDrift({ stamp: 'none' }),
+  'cb-fake-stamp': buildCodebaseDrift({ stamp: 'fake' }),
+  'cb-tree-stamp': buildCodebaseDrift({ stamp: 'tree' }),
+  'cb-clean': buildCodebaseDrift({ stamp: 'head' }),
+  'cb-below': buildCodebaseDrift({ stamp: 'head', extraDirs: ['alpha'] }),
+  'cb-block': buildCodebaseDrift({ stamp: 'head', extraDirs: ['alpha', 'beta', 'gamma'] }),
+  'cb-doc-unreadable': buildCodebaseDrift({ stamp: 'head', dirDocument: true }),
+  'cb-ref-stamp': buildCodebaseDrift({ stamp: 'ref', extraDirs: ['alpha', 'beta', 'gamma'] }),
+  'cb-option-stamp': buildCodebaseDrift({ stamp: 'option', extraDirs: ['alpha', 'beta', 'gamma'] }),
+  'cb-upper-stamp': buildCodebaseDrift({ stamp: 'upper', extraDirs: ['alpha', 'beta', 'gamma'] }),
+  'cb-short7-stamp': buildCodebaseDrift({ stamp: 'short7', extraDirs: ['alpha', 'beta', 'gamma'] }),
+  'cb-short6-stamp': buildCodebaseDrift({ stamp: 'short6', extraDirs: ['alpha', 'beta', 'gamma'] }),
+  'cb-fake64-stamp': buildCodebaseDrift({ stamp: 'fake64' }),
+  prohibition: buildProhibition,
   dc: buildDecisionCoverage,
   'dc-disabled': buildDecisionCoverageDisabled,
   'cap-files': buildCapFiles,
@@ -386,10 +515,15 @@ const arms = [];
  * @param {string} fixture  key of FIXTURES
  * @param {string} verb     check verb (dotted or hyphenated)
  * @param {string[]} args   argv after the verb
- * @param {object} [extra]  { failRead: '<path suffix>' }
+ * @param {object} [extra]  { failRead: '<path suffix>', env: { NAME: 'value' } }
  */
 function arm(gate, id, fixture, verb, args, extra = {}) {
   arms.push({ gate, id, fixture, argv: ['query', `check.${verb}`, ...args], ...extra });
+}
+
+/** An arm whose argv is not a `check` query (the `verify` surface of the same gates). */
+function armArgv(gate, id, fixture, argv, extra = {}) {
+  arms.push({ gate, id, fixture, argv, ...extra });
 }
 
 const P = DC_PHASE;
@@ -520,6 +654,86 @@ arm('E11', 'api-coverage-verify-pre-detected', 'api', 'api-coverage-verify-pre',
 arm('E11', 'api-coverage-verify-pre-no-integration', 'api', 'api-coverage-verify-pre', [`${API}/02-plain`]);
 arm('E11', 'api-coverage-verify-pre-token-only', 'api', 'api-coverage-verify-pre', ['01-detected']);
 
+// E12 verify-schema-drift (#5219)
+arm('E12', 'verify-schema-drift-no-arg', 'schema-drift', 'verify-schema-drift', []);
+arm('E12', 'verify-schema-drift-no-phases-dir', 'bare', 'verify-schema-drift', ['1']);
+arm('E12', 'verify-schema-drift-phase-not-found', 'schema-drift', 'verify-schema-drift', ['99']);
+arm('E12', 'verify-schema-drift-blocks', 'schema-drift', 'verify-schema-drift', ['1']);
+arm('E12', 'verify-schema-drift-clean', 'schema-drift', 'verify-schema-drift', ['2']);
+arm('E12', 'verify-schema-drift-pushed', 'schema-drift', 'verify-schema-drift', ['3']);
+arm('E12', 'verify-schema-drift-env-skip', 'schema-drift', 'verify-schema-drift', ['1'], { env: { GSD_SKIP_SCHEMA_CHECK: 'true' } });
+arm('E12', 'verify-schema-drift-env-not-true', 'schema-drift', 'verify-schema-drift', ['1'], { env: { GSD_SKIP_SCHEMA_CHECK: '1' } });
+arm('E12', 'verify-schema-drift-plan-unreadable', 'schema-drift', 'verify-schema-drift', ['1'], { failRead: '01-schema/01-01-PLAN.md' });
+arm('E12', 'verify-schema-drift-plan-unreadable-skipped', 'schema-drift', 'verify-schema-drift', ['1'], { failRead: '01-schema/01-01-PLAN.md', env: { GSD_SKIP_SCHEMA_CHECK: 'true' } });
+arm('E12', 'verify-schema-drift-dotted-verb', 'schema-drift', 'verify.schema-drift', ['1']);
+armArgv('E12', 'verify-surface-schema-drift-blocks', 'schema-drift', ['verify', 'schema-drift', '1']);
+armArgv('E12', 'verify-surface-schema-drift-skip-flag', 'schema-drift', ['verify', 'schema-drift', '1', '--skip']);
+armArgv('E12', 'verify-surface-schema-drift-skip-flag-first', 'schema-drift', ['verify', 'schema-drift', '--skip', '1']);
+armArgv('E12', 'verify-surface-schema-drift-env-ignored', 'schema-drift', ['verify', 'schema-drift', '1'], { env: { GSD_SKIP_SCHEMA_CHECK: 'true' } });
+armArgv('E12', 'verify-surface-schema-drift-no-arg', 'schema-drift', ['verify', 'schema-drift']);
+// Added in the #5219 review round, captured from origin/next before the move was re-checked.
+armArgv('E12', 'verify-surface-schema-drift-skip-flag-no-phase', 'schema-drift', ['verify', 'schema-drift', '--skip']);
+// The usage failures under the two observable error modes (JSON diagnostics; exit contract v2): the
+// reason code the gates pass is part of both.
+const JSON_ERRORS = { GSD_JSON_ERRORS: '1' };
+const CONTRACT_V2 = { GSD_EXIT_CONTRACT: 'v2' };
+arm('E12', 'verify-schema-drift-no-arg-json-errors', 'schema-drift', 'verify-schema-drift', [], { env: JSON_ERRORS });
+arm('E12', 'verify-schema-drift-no-arg-contract-v2', 'schema-drift', 'verify-schema-drift', [], { env: CONTRACT_V2 });
+armArgv('E12', 'verify-surface-schema-drift-no-arg-json-errors', 'schema-drift', ['verify', 'schema-drift'], { env: JSON_ERRORS });
+armArgv('E12', 'verify-surface-schema-drift-no-arg-contract-v2', 'schema-drift', ['verify', 'schema-drift'], { env: CONTRACT_V2 });
+
+// E13 verify-codebase-drift (#5219)
+arm('E13', 'verify-codebase-drift-no-structure-md', 'cb-no-map', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-not-a-git-repo', 'cb-no-git', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-no-mapped-commit', 'cb-no-stamp', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-unresolvable-mapped-commit', 'cb-fake-stamp', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-non-commit-baseline', 'cb-tree-stamp', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-clean', 'cb-clean', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-below-threshold', 'cb-below', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-blocks', 'cb-block', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-document-unreadable', 'cb-doc-unreadable', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-dotted-verb', 'cb-block', 'verify.codebase-drift', []);
+armArgv('E13', 'verify-surface-codebase-drift-blocks', 'cb-block', ['verify', 'codebase-drift']);
+// The stamp is validated as a hex object id before git sees it (#5219 review round): arms captured from
+// origin/next, where a ref name or an abbreviation shorter than 7 was handed to `git cat-file`.
+// `changed`: the golden is the origin/next behaviour; the move DELIBERATELY changes it (the stamp is no
+// longer a hex object id), and the cutover test pins both the old golden and the new answer.
+const STAMP_NOT_A_HEX_ID = { changed: { reason: 'unresolvable-mapped-commit', exitCode: 69 } };
+arm('E13', 'verify-codebase-drift-stamp-ref-name', 'cb-ref-stamp', 'verify-codebase-drift', [], STAMP_NOT_A_HEX_ID);
+arm('E13', 'verify-codebase-drift-stamp-option-shaped', 'cb-option-stamp', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-stamp-uppercase-hex', 'cb-upper-stamp', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-stamp-7-hex-abbreviation', 'cb-short7-stamp', 'verify-codebase-drift', []);
+arm('E13', 'verify-codebase-drift-stamp-6-hex-abbreviation', 'cb-short6-stamp', 'verify-codebase-drift', [], STAMP_NOT_A_HEX_ID);
+arm('E13', 'verify-codebase-drift-stamp-64-hex-unresolvable', 'cb-fake64-stamp', 'verify-codebase-drift', []);
+
+// E14 verify-context-drift (#5219)
+arm('E14', 'verify-context-drift-no-arg', 'ctx-drift', 'verify-context-drift', []);
+arm('E14', 'verify-context-drift-no-phases-dir', 'bare', 'verify-context-drift', ['1']);
+arm('E14', 'verify-context-drift-phase-not-found', 'ctx-drift', 'verify-context-drift', ['99']);
+arm('E14', 'verify-context-drift-stale-warns', 'ctx-drift', 'verify-context-drift', ['1']);
+arm('E14', 'verify-context-drift-stale-blocks', 'ctx-drift-block', 'verify-context-drift', ['1']);
+arm('E14', 'verify-context-drift-in-sync', 'ctx-drift', 'verify-context-drift', ['2']);
+arm('E14', 'verify-context-drift-no-context-md', 'ctx-drift', 'verify-context-drift', ['3']);
+arm('E14', 'verify-context-drift-no-upstream-artifacts', 'ctx-drift', 'verify-context-drift', ['4']);
+arm('E14', 'verify-context-drift-dotted-verb', 'ctx-drift', 'verify.context-drift', ['1']);
+armArgv('E14', 'verify-surface-context-drift-stale-warns', 'ctx-drift', ['verify', 'context-drift', '1']);
+armArgv('E14', 'verify-surface-context-drift-no-arg', 'ctx-drift', ['verify', 'context-drift']);
+armArgv('E14', 'verify-surface-context-drift-stale-blocks', 'ctx-drift-block', ['verify', 'context-drift', '1']);
+arm('E14', 'verify-context-drift-no-arg-json-errors', 'ctx-drift', 'verify-context-drift', [], { env: JSON_ERRORS });
+arm('E14', 'verify-context-drift-no-arg-contract-v2', 'ctx-drift', 'verify-context-drift', [], { env: CONTRACT_V2 });
+
+// E15 prohibition-enforcement (#5219)
+arm('E15', 'prohibition-enforcement-no-arg', 'prohibition', 'prohibition-enforcement', []);
+arm('E15', 'prohibition-enforcement-request-file-absent', 'prohibition', 'prohibition-enforcement', ['req/absent.json']);
+arm('E15', 'prohibition-enforcement-request-not-json', 'prohibition', 'prohibition-enforcement', ['req/not-json.json']);
+arm('E15', 'prohibition-enforcement-request-file-located-false', 'prohibition', 'prohibition-enforcement', ['req/located-false.json']);
+arm('E15', 'prohibition-enforcement-request-file-judgment-mode', 'prohibition', 'prohibition-enforcement', ['req/judgment.json']);
+arm('E15', 'prohibition-enforcement-json-flag', 'prohibition', 'prohibition-enforcement', ['--json', JSON.stringify(PROHIBITION_REQUEST)]);
+arm('E15', 'prohibition-enforcement-json-flag-invalid', 'prohibition', 'prohibition-enforcement', ['--json', '{not json']);
+arm('E15', 'prohibition-enforcement-json-flag-without-value', 'prohibition', 'prohibition-enforcement', ['--json']);
+arm('E15', 'prohibition-enforcement-no-arg-json-errors', 'prohibition', 'prohibition-enforcement', [], { env: JSON_ERRORS });
+arm('E15', 'prohibition-enforcement-no-arg-contract-v2', 'prohibition', 'prohibition-enforcement', [], { env: CONTRACT_V2 });
+
 // auto-mode (non-gate)
 arm('auto', 'auto-mode-both', 'auto-both', 'auto-mode', []);
 arm('auto', 'auto-mode-none', 'auto-none', 'auto-mode', []);
@@ -555,6 +769,7 @@ function runArm(spec, root) {
     HOME: root,
     USERPROFILE: root,
     GSD_CUTOVER_FAIL_READ_SUFFIX: spec.failRead || '',
+    ...(spec.env || {}),
   };
   const nodeArgs = spec.failRead ? ['--require', PRELOAD_PATH] : [];
   const r = runNode([...nodeArgs, TOOLS_PATH, ...spec.argv], {
@@ -566,6 +781,7 @@ function runArm(spec, root) {
     argv: spec.argv,
     fixture: spec.fixture,
     ...(spec.failRead ? { failRead: spec.failRead } : {}),
+    ...(spec.env ? { env: spec.env } : {}),
     stdout: normalize(r.stdout, root),
     stderr: normalize(r.stderr, root),
     exitCode: r.exitCode,

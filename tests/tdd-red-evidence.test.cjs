@@ -140,7 +140,7 @@ describe('classifyRedEvidence (#3770)', () => {
   });
 
   test('row 4 — classifyRedEvidence rejects nonzero exit without a failing test', () => {
-    const result = classifyRedEvidence(validRedInput({ output: TARGET_FAILURE_TAP.replace('# fail 1', '# fail 0') }));
+    const result = classifyRedEvidence(validRedInput({ output: 'TAP version 13\nok 1 - rejects empty email\n1..1\n' }));
     assert.equal(result.verdict, 'INVALID_RED');
     assert.equal(result.reason, 'nonzero_exit_without_test_failure');
   });
@@ -161,6 +161,14 @@ describe('classifyRedEvidence (#3770)', () => {
     const result = classifyRedEvidence({ command: null, exitCode: '1', output: 42, targetTest: '' });
     assert.equal(result.verdict, 'INVALID_RED');
     assert.equal(result.reason, 'invalid_record');
+  });
+
+  test('#4692: an exit code that is not a non-negative integer is an invalid record', () => {
+    for (const exitCode of [-1, 1.5, '1', null]) {
+      const result = classifyRedEvidence(validRedInput({ exitCode }));
+      assert.equal(result.reason, 'invalid_record', JSON.stringify(exitCode));
+    }
+    assert.equal(classifyRedEvidence(validRedInput({ exitCode: 137 })).verdict, 'RED_EVIDENCE_OK');
   });
 });
 
@@ -232,20 +240,57 @@ describe('check tdd-red-evidence verb (#3770)', () => {
 
 // ─── Spec surfaces (#3770 acceptance: gate must require evidence before GREEN) ─
 
-describe('executor spec requires intentional RED evidence before GREEN (#3770)', () => {
+describe('executor requires format-based RED evidence (#4692)', () => {
   const read = (p) => fs.readFileSync(path.join(__dirname, '..', p), 'utf8');
+  // Read inside each test: a missing reference fails that test instead of
+  // throwing before any test registers.
+  const canonical = () => read('gsd-core/references/tdd.md');
+  const runtime = () => read('gsd-core/references/execute-mvp-tdd.md');
 
-  test('row 11 — executor spec names INVALID_RED and blocks GREEN without evidence', () => {
-    const agent = read('agents/gsd-executor.md');
-    const tddRef = read('gsd-core/references/tdd.md');
-    const mvpRef = read('gsd-core/references/execute-mvp-tdd.md');
-    for (const [name, content] of [['gsd-executor.md', agent], ['tdd.md', tddRef], ['execute-mvp-tdd.md', mvpRef]]) {
-      assert.match(content, /INVALID_RED/, `${name} must name the INVALID_RED verdict`);
-      assert.match(content, /tdd-red-evidence/, `${name} must wire the check tdd-red-evidence gate`);
+  test('#4692: TAP and JUnit share mandatory classification, with no Vitest exemption', () => {
+    assert.match(canonical(), /report format/);
+    assert.match(canonical(), /shared TAP adapter[^\n]*Node[^\n]*Vitest/);
+    assert.match(canonical(), /JUnit XML adapter[^\n]*Surefire\/Failsafe/);
+    assert.match(canonical(), /`gsd_run check tdd-red-evidence <record\.json> --raw`[^\n]*require `RED_EVIDENCE_OK` before GREEN/);
+    assert.match(canonical(), /unsupported format requires a supported reporter or a parser adapter before GREEN/);
+    assert.match(canonical(), /Classifier rejection never authorizes a fallback to self-attestation/);
+  });
+
+  test('#4692: reruns and current Maven reports retain evidence provenance', () => {
+    assert.match(canonical(), /reporter is incompatible[^\n]*rerun the planned target[^\n]*submit the rerun's record to the classifier/);
+    assert.match(canonical(), /unmodified report/);
+    assert.match(canonical(), /target\/surefire-reports\/TEST-\*\.xml[^\n]*target\/failsafe-reports\/TEST-\*\.xml/);
+    assert.match(canonical(), /require the report to be newer than the run start/);
+    assert.match(canonical(), /Missing, stale, or ambiguous reports require STOP/);
+  });
+
+  test('#4692: a parser pass still requires the intended target assertion to fail', () => {
+    const assessment = canonical().split('\n').find((line) => line.includes('After machine validation'));
+    assert.ok(assessment, 'RED step 4 has a semantic-assessment bullet');
+    assert.match(assessment, /target actually executed[^\n]*planned assertion[^\n]*intended reason/);
+    for (const stop of ['zero tests', 'skipped', 'setup', 'collection', 'import', 'syntax', 'fixture', 'unrelated', 'unexpected green', 'incomplete', 'ambiguous']) {
+      assert.match(assessment, new RegExp(stop, 'i'), stop);
     }
-    // The gate must block GREEN on invalid RED, not merely warn.
-    assert.match(mvpRef, /INVALID_RED[^\n]{0,120}(block|halt|trip|STOP)/i,
-      'execute-mvp-tdd.md must halt GREEN on INVALID_RED');
+    for (const reason of ['unexpected_green', 'zero_tests_discovered', 'nonzero_exit_without_test_failure', 'fixture_or_load_failure', 'no_target_test_failure', 'invalid_record', 'unreadable_record']) {
+      assert.ok(canonical().includes('`' + reason + '`'), reason);
+    }
+  });
+
+  test('row 11 — the executor and tdd.md name INVALID_RED and the tdd-red-evidence check', () => {
+    for (const content of [read('agents/gsd-executor.md'), canonical()]) {
+      assert.match(content, /INVALID_RED/);
+      assert.match(content, /tdd-red-evidence/);
+    }
+    // execute-mvp-tdd.md delegates the check to tdd.md but must still halt on the verdict.
+    assert.match(runtime(), /INVALID_RED[^\n]{0,120}(block|halt|trip|STOP)/i);
+  });
+
+  test('#4692: the runtime gate loads the canonical evidence contract before GREEN', () => {
+    assert.match(runtime(), /Read `gsd-core\/references\/tdd\.md`, "Red-Green-Refactor Cycle", RED step 4/);
+    assert.match(runtime(), /follow its complete evidence contract before GREEN/);
+    assert.match(runtime(), /`INVALID_RED` verdict[^\n]*trips this gate/);
+    assert.match(runtime(), /self-attestation cannot substitute for machine validation/);
+    assert.match(read('agents/gsd-executor.md'), /references\/tdd\.md[^\n]*"Gate Enforcement Rules"/);
   });
 });
 
@@ -390,6 +435,7 @@ test('#4724: a TAP red whose message quotes <testsuite> stays on the TAP path', 
     '    error: |-',
     '      expected <testsuite> was 2',
     '  ...',
+    '1..1',
     '# tests 1',
     '# pass 0',
     '# fail 1',
@@ -409,7 +455,7 @@ test('#4724: a TAP red whose message quotes <testsuite> stays on the TAP path', 
 test('#4724: CDATA sections in a passing case are never scanned as failures', () => {
   // A passing case whose captured System.out (CDATA) echoes an <error .../>
   // literal must not count as failing — CDATA is verbatim content.
-  const cd = '<testcase name="prints" classname="com.example.AppTest"><system-out><![CDATA[echo <error x/></system-out>]]></testcase>';
+  const cd = '<testcase name="prints" classname="com.example.AppTest"><system-out><![CDATA[echo <error x/></system-out>]]></system-out></testcase>';
   const fl = '<testcase name="x" classname="com.other.Unrelated"><failure message="e">1 != 2</failure></testcase>';
   const result = classifyRedEvidence({
     command: 'mvn test',
@@ -457,18 +503,20 @@ describe('#4957 — swift-testing RED evidence', () => {
     assert.equal(result.evidence.fail, 1);
   });
 
-  test("the issue's literal aggregate-only repro reports the real test count, not zero_tests_discovered (#4957)", () => {
+  test("the issue's literal aggregate-only repro is an incomplete report, not zero_tests_discovered (#4957)", () => {
     // The issue's exact repro JSON: only the aggregate summary line, no per-test
     // lines at all. We cannot identify which named test failed, so this must NOT
     // reach RED_EVIDENCE_OK — but it must also never lie that zero tests ran.
+    // Like a TAP plan or JUnit count mismatch, the report is incomplete.
     const result = classifyRedEvidence({
       ...INPUT,
       output: '✘ Test run with 3 tests in 1 suite failed after 0.004 seconds with 6 issues.\n',
     });
-    assert.equal(result.evidence.tests, 3, 'the real test count must be reported, never zero');
     assert.notEqual(result.reason, 'zero_tests_discovered');
     assert.equal(result.verdict, 'INVALID_RED');
-    assert.equal(result.reason, 'nonzero_exit_without_test_failure');
+    assert.equal(result.reason, 'invalid_record');
+    assert.equal(result.evidence.format, 'swift-testing');
+    assert.deepEqual(result.evidence.report_errors, ['Incomplete swift-testing report']);
   });
 
   test('an unrelated swift-testing failure is not the target test', () => {
@@ -512,7 +560,69 @@ describe('#4957 — swift-testing RED evidence', () => {
     assert.equal(result.evidence.fail, 1);
   });
 
-  test('a stray swift-testing-looking per-test line with no aggregate marker stays on the TAP path', () => {
+  test('skipped, cancelled, known-issue and parameterized siblings count toward the aggregate', () => {
+    // swift-testing counts started AND skipped tests in "Test run with N tests",
+    // and a parameterized test ends with "with N test cases" before its verb.
+    // Line shapes come from swiftlang/swift-testing
+    // Sources/Testing/Events/Recorder/Event.HumanReadableOutputRecorder.swift
+    // (testEnded, testSkipped, _issueCounts) and Event.Symbol.swift (➜ skip, ━ known-issue pass).
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([
+        '➜ Test "S" skipped.',
+        '➜ Test "R" skipped: "needs network"',
+        '➜ Test "C" was cancelled after 0.01 seconds.',
+        '━ Test "K" passed after 0.01 seconds with 1 known issue.',
+        '✔ Test "P" with 3 test cases passed after 0.01 seconds.',
+        failLine('X'),
+      ], { tests: 6 }),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.tests, 6);
+    assert.equal(result.evidence.pass, 2);
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('a skipped or cancelled target is never RED evidence', () => {
+    for (const line of ['➜ Test "X" skipped.', '➜ Test "X" was cancelled after 0.01 seconds: "timeout"']) {
+      const result = classifyRedEvidence({ ...INPUT, output: swiftTesting([line, failLine('Y')], { tests: 2 }) });
+      assert.equal(result.verdict, 'INVALID_RED', line);
+      assert.equal(result.reason, 'no_target_test_failure', line);
+      assert.deepEqual(result.evidence.report_errors, [], line);
+    }
+  });
+
+  test('a known-issue run summary is still swift-testing, and a result line with trailing text is not a result', () => {
+    const knownIssueRun = [
+      '━ Test "X" passed after 0.01 seconds with 1 known issue.',
+      '━ Test run with 1 test in 1 suite passed after 0.02 seconds with 1 known issue.',
+    ].join('\n');
+    const green = classifyRedEvidence({ ...INPUT, exitCode: 0, output: knownIssueRun });
+    assert.equal(green.evidence.format, 'swift-testing');
+    assert.equal(green.reason, 'unexpected_green');
+    const trailing = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([`${failLine('X')} (retried)`], { tests: 1 }),
+    });
+    assert.equal(trailing.reason, 'invalid_record');
+    assert.deepEqual(trailing.evidence.report_errors, ['Incomplete swift-testing report']);
+  });
+
+  test('a failing parameterized target classifies RED_EVIDENCE_OK', () => {
+    const result = classifyRedEvidence({
+      ...INPUT,
+      output: swiftTesting([
+        passLine('Y'),
+        '✘ Test "X" with 3 test cases failed after 0.01 seconds with 2 issues.',
+      ], { tests: 2 }),
+    });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(result.evidence.failing_tests, ['X']);
+  });
+
+  test('a stray swift-testing-looking per-test line with no aggregate marker is not a swift-testing report', () => {
     // No "Test run with N tests in M suites ..." aggregate line present at all —
     // must not be confidently classified as swift-testing off a per-test line alone.
     const result = classifyRedEvidence({
@@ -520,7 +630,8 @@ describe('#4957 — swift-testing RED evidence', () => {
       output: failLine('X'),
     });
     assert.equal(result.verdict, 'INVALID_RED');
-    assert.equal(result.reason, 'zero_tests_discovered');
+    assert.equal(result.reason, 'invalid_record');
+    assert.equal(result.evidence.format, 'unknown');
   });
 
   test('property: swift-testing target matching is exactly failing-set membership (#4957)', () => {
@@ -573,6 +684,7 @@ describe('#4957 — swift-testing RED evidence', () => {
       '  actual: |-',
       '    Got: "Test run with 2 tests in 1 suite passed after 0.02 seconds."',
       '  ...',
+      '1..1',
       '# tests 1',
       '# pass 0',
       '# fail 1',
@@ -599,6 +711,47 @@ describe('#4957 — swift-testing RED evidence', () => {
     assert.equal(result.evidence.tests, 5, 'tests must be the sum of every aggregate block, not just the first');
     assert.equal(result.evidence.pass + result.evidence.fail, 5, 'pass+fail must never exceed the reported tests');
     assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+  });
+
+  // Event.HumanReadableOutputRecorder names a test by its quoted display name
+  // only when it has one; a plain `@Test func` is named by its bare function
+  // name, and --verbose adds `(aka 'function()')` after a display name.
+  const bare = [
+    '✘ Test addsNumbers() failed after 0.001 seconds with 1 issue.',
+    '✔ Test subtracts() passed after 0.001 seconds.',
+  ];
+
+  test('a test without a display name is named by its bare function name', () => {
+    for (const targetTest of ['addsNumbers()', 'addsNumbers']) {
+      const result = classifyRedEvidence({ ...INPUT, targetTest, output: swiftTesting(bare, { tests: 2 }) });
+      assert.equal(result.verdict, 'RED_EVIDENCE_OK', targetTest);
+      assert.deepEqual(result.evidence.report_errors, []);
+      assert.equal(result.evidence.matched_test, 'addsNumbers()');
+    }
+  });
+
+  test('a verbose display name also matches its function name', () => {
+    const output = swiftTesting([
+      `✘ Test "Adds numbers" (aka 'addsNumbers()') failed after 0.001 seconds with 1 issue.`,
+      `✔ Test "Subtracts" (aka 'subtracts()') passed after 0.001 seconds.`,
+    ], { tests: 2 });
+    for (const targetTest of ['Adds numbers', 'addsNumbers()', 'addsNumbers']) {
+      const result = classifyRedEvidence({ ...INPUT, targetTest, output });
+      assert.equal(result.verdict, 'RED_EVIDENCE_OK', targetTest);
+      assert.equal(result.evidence.matched_test, 'Adds numbers');
+    }
+  });
+
+  test('Windows console glyphs mark the same results', () => {
+    // Event.Symbol substitutes √ × - for ✔ ✘ ━ on Windows.
+    const output = [
+      '× Test run with 2 tests in 1 suite failed after 0.002 seconds with 1 issue.',
+      '× Test addsNumbers() failed after 0.001 seconds with 1 issue.',
+      '√ Test subtracts() passed after 0.001 seconds.',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, targetTest: 'addsNumbers()', output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.deepEqual(result.evidence.report_errors, []);
   });
 });
 
@@ -693,13 +846,14 @@ describe('#4970 — Python unittest RED evidence', () => {
     assert.equal(result.reason, 'unexpected_green');
   });
 
-  test('an aggregate-only report with no FAIL/ERROR header is honest, not fabricated (fail:0)', () => {
+  test('an aggregate-only report with no FAIL/ERROR header is incomplete, not fabricated (fail:0)', () => {
     // A truncated/aggregate-only report must never fabricate a target match —
-    // fail:0 correctly falls through to the existing generic reason.
+    // a counted failure without its header makes the report incomplete.
     const output = ['', 'Ran 1 test in 0.001s', '', 'FAILED (failures=1)', ''].join('\n');
     const result = classifyRedEvidence({ ...INPUT, output });
     assert.equal(result.verdict, 'INVALID_RED');
-    assert.equal(result.reason, 'nonzero_exit_without_test_failure');
+    assert.equal(result.reason, 'invalid_record');
+    assert.deepEqual(result.evidence.report_errors, ['Incomplete unittest report']);
     assert.equal(result.evidence.fail, 0);
     assert.deepEqual(result.evidence.failing_tests, []);
   });
@@ -763,7 +917,7 @@ describe('#4970 — Python unittest RED evidence', () => {
     // The issue's explicit carve-out: a module import/collection crash makes
     // unittest synthesize a _FailedTest whose method name can coincidentally
     // equal the plan's target test. This must NOT be fabricated into a real
-    // failure — it must fall through to the existing fail-closed reason.
+    // failure — the load failure invalidates the whole report.
     const output = [
       'ERROR: test_adds_two_numbers (unittest.loader._FailedTest.test_adds_two_numbers)',
       '----------------------------------------------------------------------',
@@ -778,9 +932,129 @@ describe('#4970 — Python unittest RED evidence', () => {
     ].join('\n');
     const result = classifyRedEvidence({ ...INPUT, output });
     assert.equal(result.verdict, 'INVALID_RED');
-    assert.equal(result.reason, 'nonzero_exit_without_test_failure');
+    assert.equal(result.reason, 'invalid_record');
+    assert.deepEqual(result.evidence.report_errors, ['unittest module failed to load']);
     assert.equal(result.evidence.fail, 0, '_FailedTest must not be counted as a real failure');
     assert.deepEqual(result.evidence.failing_tests, []);
+  });
+
+  test('a target failing in several subTests is one failing test, not an ambiguous or overcounted report', () => {
+    // Real Python 3.14 `-m unittest -v` output: each failing subTest prints its
+    // own identical FAIL: header, and failures= counts subTests while Ran
+    // counts methods (3 subTest failures > Ran 2).
+    const output = [
+      'test_ok (test_demo.AddTest.test_ok) ... ok',
+      'test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) ... ',
+      '  test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=0) ... FAIL',
+      '  test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=1) ... FAIL',
+      '  test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=2) ... FAIL',
+      '',
+      ...[0, 1, 2].flatMap((i) => [
+        '======================================================================',
+        `FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=${i})`,
+        '----------------------------------------------------------------------',
+        'Traceback (most recent call last):',
+        '  File "tests/test_demo.py", line 10, in test_adds_two_numbers',
+        '    self.assertEqual(add(i, 2), i + 2)',
+        `AssertionError: 0 != ${i + 2}`,
+        '',
+      ]),
+      '----------------------------------------------------------------------',
+      'Ran 2 tests in 0.001s',
+      '',
+      'FAILED (failures=3)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.tests, 2);
+    assert.equal(result.evidence.pass, 1);
+    assert.equal(result.evidence.fail, 1);
+    assert.deepEqual(result.evidence.failing_tests, ['test_adds_two_numbers']);
+  });
+
+  // Real Python 3.14 `-m unittest -v` output: an @expectedFailure test that
+  // passes is listed as UNEXPECTED SUCCESS and counted in the FAILED line, but
+  // it is a test that ran and passed, not a failure.
+  const UNEXPECTED_SUCCESS = [
+    'test_known_bug (test_demo.AddTest.test_known_bug) ... unexpected success',
+    '',
+    '======================================================================',
+    'UNEXPECTED SUCCESS: test_known_bug (test_demo.AddTest.test_known_bug)',
+    '----------------------------------------------------------------------',
+    'Ran 2 tests in 0.000s',
+    '',
+  ];
+
+  test('an unexpected success beside the failing target still classifies RED_EVIDENCE_OK', () => {
+    const output = [
+      'test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) ... FAIL',
+      ...UNEXPECTED_SUCCESS.slice(0, 2),
+      '======================================================================',
+      'FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers)',
+      '----------------------------------------------------------------------',
+      'Traceback (most recent call last):',
+      '  File "tests/test_demo.py", line 6, in test_adds_two_numbers',
+      '    self.assertEqual(add(1, 2), 3)',
+      'AssertionError: 0 != 3',
+      '',
+      ...UNEXPECTED_SUCCESS.slice(2),
+      'FAILED (failures=1, unexpected successes=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'RED_EVIDENCE_OK');
+    assert.equal(result.reason, 'target_test_failed');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.tests, 2);
+    assert.equal(result.evidence.pass, 1);
+    assert.equal(result.evidence.fail, 1);
+  });
+
+  test('an unexpected success alone fails the run without a failing test', () => {
+    const output = [
+      'test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) ... ok',
+      ...UNEXPECTED_SUCCESS,
+      'FAILED (unexpected successes=1)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'nonzero_exit_without_test_failure');
+    assert.deepEqual(result.evidence.report_errors, []);
+    assert.equal(result.evidence.pass, 2);
+  });
+
+  test('subTest headers must still account exactly for the counted failures', () => {
+    const header = 'FAIL: test_adds_two_numbers (test_demo.AddTest.test_adds_two_numbers) (i=0)\nAssertionError: boom\n';
+    for (const [headers, failures, ran] of [[2, 1, 1], [1, 2, 1], [2, 2, 0]]) {
+      const output = `${header.repeat(headers)}\nRan ${ran} tests in 0.001s\n\nFAILED (failures=${failures})\n`;
+      const result = classifyRedEvidence({ ...INPUT, output });
+      assert.equal(result.reason, 'invalid_record', `${headers} headers, failures=${failures}, Ran ${ran}`);
+      assert.deepEqual(result.evidence.report_errors, ['Incomplete unittest report']);
+    }
+  });
+
+  test('subTest failures of an unrelated method still do not satisfy the target', () => {
+    const output = [
+      ...[0, 1].flatMap((i) => [
+        `FAIL: test_other (test_demo.AddTest.test_other) (i=${i})`,
+        '----------------------------------------------------------------------',
+        'AssertionError: boom',
+        '',
+      ]),
+      'Ran 2 tests in 0.001s',
+      '',
+      'FAILED (failures=2)',
+      '',
+    ].join('\n');
+    const result = classifyRedEvidence({ ...INPUT, output });
+    assert.equal(result.verdict, 'INVALID_RED');
+    assert.equal(result.reason, 'no_target_test_failure');
+    assert.equal(result.evidence.fail, 1);
+    assert.equal(result.evidence.pass, 1);
   });
 
   test('property: fail count and failing_tests always match the FAIL/ERROR headers actually present (#4970)', () => {

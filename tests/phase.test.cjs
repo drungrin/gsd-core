@@ -30,6 +30,7 @@ const {
 const PHASE_COMPLETE_TIMEOUT_MS = 60000;
 const { runGsdTools, createTempProject, cleanup } = require('./helpers.cjs');
 const { splitTableRow } = require('../gsd-core/bin/lib/markdown-table.cjs');
+const { splitLines } = require('../gsd-core/bin/lib/text-lines.cjs');
 const fc = require('fast-check');
 
 const GSD_TOOLS_BIN = path.resolve(__dirname, '..', 'gsd-core', 'bin', 'gsd-tools.cjs');
@@ -6362,6 +6363,49 @@ Plans:
     assert.ok(!roadmap.includes('[ ] **01-01**'), 'bold plan 01-01 should not remain unchecked');
     assert.ok(!roadmap.includes('[ ] **01-02**'), 'bold plan 01-02 should not remain unchecked');
   });
+
+  // ADR-5057 §6 (Phase 13, #5217): the per-plan flip is a bullet mutation
+  // routed through updateBullet — the first matching BULLET, never a fenced
+  // example or a mid-line mention that happens to come earlier in the section.
+  test('flips the real plan bullet, not an earlier fenced example or mid-line mention', () => {
+    const FENCED = '- [ ] 01-01-PLAN.md (fenced example)';
+    const MENTION = 'Note: see - [ ] 01-01-PLAN.md mentioned mid-line';
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      [
+        '# Roadmap',
+        '',
+        '- [ ] Phase 1: Foundation',
+        '',
+        '### Phase 1: Foundation',
+        '**Goal:** Setup',
+        '**Plans:** 1 plan',
+        '',
+        MENTION,
+        '```',
+        FENCED,
+        '```',
+        '- [ ] 01-01-PLAN.md real',
+        '',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'STATE.md'),
+      `# State\n\n**Current Phase:** 01\n**Status:** In progress\n**Current Plan:** 01-01\n**Last Activity:** 2025-01-01\n**Last Activity Description:** Working\n`,
+    );
+    const p1 = path.join(tmpDir, '.planning', 'phases', '01-foundation');
+    fs.mkdirSync(p1, { recursive: true });
+    fs.writeFileSync(path.join(p1, '01-01-PLAN.md'), '# Plan');
+    fs.writeFileSync(path.join(p1, '01-01-SUMMARY.md'), '# Summary');
+
+    const result = runVerifiedPhaseComplete('phase complete 1', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const lines = splitLines(fs.readFileSync(path.join(tmpDir, '.planning', 'ROADMAP.md'), 'utf-8'));
+    assert.ok(lines.includes(MENTION), 'a mid-line mention is not a bullet and stays untouched');
+    assert.ok(lines.includes(FENCED), 'a fenced example bullet stays untouched');
+    assert.ok(lines.includes('- [x] 01-01-PLAN.md real'), 'the real plan bullet is flipped');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -9627,7 +9671,7 @@ describe('phase uat-passed — basic pass/fail', () => {
   test('pending UAT → passed:false', () => {
     writeUatFile(phaseDir, 'feature-UAT.md', makePendingUat());
     const result = runGsdTools('phase uat-passed 1', tmpDir);
-    assert.ok(result.success, `Command failed: ${result.error}`);
+    assert.strictEqual(result.exitCode, 1, `failing uat-passed verdict exits 1 (verdict negative, #5170): ${result.error}`);
 
     const out = JSON.parse(result.output);
     assert.strictEqual(out.passed, false);
@@ -9638,7 +9682,7 @@ describe('phase uat-passed — basic pass/fail', () => {
   test('false-positive only (fenced block) → passed:false', () => {
     writeUatFile(phaseDir, 'feature-UAT.md', makeFencedFalsePositiveUat());
     const result = runGsdTools('phase uat-passed 1', tmpDir);
-    assert.ok(result.success, `Command failed: ${result.error}`);
+    assert.strictEqual(result.exitCode, 1, `failing uat-passed verdict exits 1 (verdict negative, #5170): ${result.error}`);
 
     const out = JSON.parse(result.output);
     assert.strictEqual(out.passed, false,
@@ -9648,7 +9692,7 @@ describe('phase uat-passed — basic pass/fail', () => {
   test('no UAT files → passed:false + no_uat_artifacts:true (fail-closed, no vacuous pass)', () => {
     // Phase directory exists but has no UAT files — fail-closed: absence is NOT a pass
     const result = runGsdTools('phase uat-passed 1', tmpDir);
-    assert.ok(result.success, `Command failed: ${result.error}`);
+    assert.strictEqual(result.exitCode, 1, `failing uat-passed verdict exits 1 (verdict negative, #5170): ${result.error}`);
 
     const out = JSON.parse(result.output);
     assert.strictEqual(out.passed, false,
@@ -9676,7 +9720,7 @@ describe('phase uat-passed — --require-verification flag', () => {
   test('--require-verification with no verification file → passed:false', () => {
     writeUatFile(phaseDir, 'feature-UAT.md', makePassingUat());
     const result = runGsdTools('phase uat-passed 1 --require-verification', tmpDir);
-    assert.ok(result.success, `Command failed: ${result.error}`);
+    assert.strictEqual(result.exitCode, 1, `failing uat-passed verdict exits 1 (verdict negative, #5170): ${result.error}`);
 
     const out = JSON.parse(result.output);
     assert.strictEqual(out.passed, false,
@@ -9708,7 +9752,7 @@ describe('phase uat-passed — --require-verification flag', () => {
     setMtime(summaryPath, now);
 
     const result = runGsdTools('phase uat-passed 1 --require-verification', tmpDir);
-    assert.ok(result.success, `Command failed: ${result.error}`);
+    assert.strictEqual(result.exitCode, 1, `failing uat-passed verdict exits 1 (verdict negative, #5170): ${result.error}`);
 
     const out = JSON.parse(result.output);
     assert.strictEqual(out.passed, false);

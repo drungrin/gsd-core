@@ -35,8 +35,8 @@
 // See docs/TESTING-SUITES.md for full grouping policy.
 'use strict';
 
-const { appendFileSync, readdirSync, readFileSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } = require('fs');
-const { join, basename } = require('path');
+const { appendFileSync, readdirSync, readFileSync, realpathSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } = require('fs');
+const { join, basename, resolve } = require('path');
 const { tmpdir } = require('os');
 const { pathToFileURL } = require('url');
 const { execFileSync, spawn } = require('child_process');
@@ -1251,6 +1251,187 @@ function analyzeChunkEvents(eventsPath) {
   };
 }
 
+// #4031: per-file test accounting for one chunk. `--test-force-exit` is forwarded
+// by node to every test-file child, which calls process.exit() the moment its root
+// test ends while results are still queued in its non-blocking stdout pipe
+// (nodejs/node#64833), so the parent's reporters (and this runner's own ndjson
+// events file) never see them and the run reports a smaller count with exit 0.
+// The loss is prevented at its source (registration-ledger-preload.cjs makes the
+// child's stdout blocking; measured 6000/6000 vs ~5070/6000 on Node 24.18, Linux) and
+// this accounting stays as the loud backstop for whatever else drops results.
+// The count of results the child REGISTERED with its reporter therefore comes
+// from the child, through a channel that does not share that pipe:
+// scripts/lib/registration-ledger-preload.cjs (loaded with `--require`) counts the
+// leaf `test:pass`/`test:fail` events the child hands to the serializer that
+// frames them onto the pipe, per `file` each event carries, and appends one
+// `{type:'registered', file, count}` line per file when the child exits. The
+// ndjson reporter records every leaf `test:pass`/`test:fail` the parent received,
+// under the same `file`. A file whose registered count exceeds its reported count
+// lost results.
+//
+// Both sides count the same events (leaf pass/fail, not suites) under the same `file` field, so a
+// skipped test, a skipped suite, a run-time subtest and a name/only filter (an excluded test emits no
+// event on either side) do not by themselves make registered exceed reported.
+//
+// What this does NOT catch (measured limits, not guarantees):
+//   - a child that emitted nothing (a crash before its first result, a file with no tests): count 0,
+//     nothing to compare;
+//   - a child killed by SIGKILL (a timeout): it writes its ledger line from an `exit` handler, which
+//     does not run, so the file has no line at all (a timed-out chunk is reported by its own path);
+//   - a file that was reported but never registered (a ledger line is missing for it): reported can
+//     exceed registered and is not flagged per file;
+//   - the count is taken at v8.DefaultSerializer.prototype.writeValue, which holds only while node:test's
+//     child reporter frames events through it. If a Node change moves that, every count is 0. The
+//     chunk-level guard below (ledger counted 0 while the reporter received results) fails that loudly,
+//     and tests/run-tests-accounting.test.cjs ('counts every leaf result') pins the hook directly.
+//
+// `available` is false when either file is missing/unreadable or the ledger
+// holds no `registered` line: the chunk could not be accounted. That is
+// UNREADABLE EVIDENCE (#5170, ADR-5057 §4), never "nothing was lost": the
+// caller FAILS a chunk that exited 0 without an accounting it can trust
+// (formatAccountingUnavailable), with `eventsRead` / `ledgerRead` /
+// `sawRegisteredLine` naming which input was missing. Truncated trailing
+// lines are skipped, as in analyzeChunkEvents. Paths are compared by their
+// real path (normalizeAccountedPath: realpath, case-folded on win32) on BOTH
+// sides — never by basename, which would attribute one file's results to
+// another of the same name in a different directory.
+function normalizeAccountedPath(p) {
+  let resolved = resolve(p);
+  try {
+    // The child's argv[1] and the runner's event `file` are the same file but
+    // not necessarily the same spelling (a symlinked temp root, 8.3 names).
+    resolved = realpathSync.native(resolved);
+  } catch {
+    // Not on disk (a synthetic path in a unit test): the resolved spelling stands.
+  }
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function analyzeChunkAccounting(eventsPath, ledgerPath) {
+  const reported = new Map(); // normalized file -> leaf pass+fail events received
+  const registered = new Map(); // normalized file -> registrations counted in the child
+  const display = new Map(); // normalized file -> path as first seen, for messages
+  let eventsRead = true;
+  let ledgerRead = true;
+  let sawRegisteredLine = false;
+  let eventsRaw = '';
+  let ledgerRaw = '';
+  try {
+    eventsRaw = readFileSync(eventsPath, 'utf8');
+  } catch {
+    eventsRead = false;
+  }
+  try {
+    ledgerRaw = readFileSync(ledgerPath, 'utf8');
+  } catch {
+    ledgerRead = false;
+  }
+  const parse = (raw, onEvent) => {
+    for (const line of raw.split('\n')) {
+      if (line.trim() === '') continue;
+      let evt;
+      try {
+        evt = JSON.parse(line);
+      } catch {
+        continue; // truncated trailing line
+      }
+      onEvent(evt);
+    }
+  };
+  parse(eventsRaw, (evt) => {
+    if ((evt.type !== 'test:pass' && evt.type !== 'test:fail') || typeof evt.file !== 'string') return;
+    if (evt.kind === 'suite') return;
+    const key = normalizeAccountedPath(evt.file);
+    display.set(key, display.get(key) || evt.file);
+    reported.set(key, (reported.get(key) || 0) + 1);
+  });
+  parse(ledgerRaw, (evt) => {
+    if (evt.type !== 'registered' || typeof evt.file !== 'string' || !Number.isInteger(evt.count)) return;
+    sawRegisteredLine = true;
+    const key = normalizeAccountedPath(evt.file);
+    display.set(key, display.get(key) || evt.file);
+    registered.set(key, (registered.get(key) || 0) + evt.count);
+  });
+  // A registered file is matched to its reported results by its real path ALONE.
+  // Both sides are normalized through realpath (normalizeAccountedPath), so a
+  // spelling the two sides disagree on (a symlinked temp root, 8.3 names, case on
+  // a case-insensitive filesystem) is the same key. There is no basename
+  // fallback: tests/a/x.test.cjs and tests/b/x.test.cjs share a basename, and
+  // crediting one file's results to the other would hide a loss. A registered
+  // file with no reported entry IS a shortfall.
+  const reportedFor = (key) => reported.get(key) || 0;
+  const shortfalls = [];
+  let registeredTotal = 0;
+  let reportedTotal = 0;
+  for (const [key, count] of registered) {
+    const got = reportedFor(key);
+    registeredTotal += count;
+    reportedTotal += Math.min(got, count);
+    if (count > got) shortfalls.push({ file: display.get(key), registered: count, reported: got });
+  }
+  // A dead count is positively established, not unavailability: the parent REPORTED results while the
+  // child ledger counted none at all, and a reported result was necessarily handed to the child's
+  // serializer first. The ledger lines exist (the preload ran) so the counting hook is what failed
+  // (the serializer no longer being the reporter's channel is the realistic cause). A chunk whose files
+  // legitimately report nothing has reportedAll === 0 and is not caught by this.
+  let reportedAll = 0;
+  for (const n of reported.values()) reportedAll += n;
+  const ledgerCountedNothing = sawRegisteredLine && registeredTotal === 0 && reportedAll > 0;
+  return {
+    available: eventsRead && ledgerRead && sawRegisteredLine,
+    eventsRead,
+    ledgerRead,
+    sawRegisteredLine,
+    shortfalls,
+    registeredTotal,
+    reportedTotal,
+    reportedAll,
+    ledgerCountedNothing,
+  };
+}
+
+// #5170: the loud failure for a chunk whose ledger counted no result while the reporter received some.
+function formatAccountingCountDead(chunkNumber, chunkCount, accounting) {
+  return (
+    `run-tests: chunk ${chunkNumber}/${chunkCount} FAILED test accounting — the registration ledger counted 0 ` +
+    `results but the reporter received ${accounting.reportedAll}. The preload's count (the serializer hook in ` +
+    `scripts/lib/registration-ledger-preload.cjs) is not seeing the child's results, so no loss in this chunk ` +
+    `could be detected; a Node change to how the child reports is the likely cause.`
+  );
+}
+
+// #4031: the loud failure for a chunk whose registered tests are not all
+// accounted for. Names the chunk and the counts, per file and in total.
+function formatAccountingFailure(chunkNumber, chunkCount, accounting) {
+  const lost = accounting.registeredTotal - accounting.reportedTotal;
+  const lines = accounting.shortfalls.map(
+    (s) => `  ${basename(s.file)}: ${s.registered} registered, ${s.reported} reported (${s.registered - s.reported} unaccounted)`,
+  );
+  return (
+    `run-tests: chunk ${chunkNumber}/${chunkCount} FAILED test accounting — ` +
+    `${accounting.registeredTotal} tests registered, ${accounting.reportedTotal} reported ` +
+    `(${lost} unaccounted). The runner exited 0, but results for tests that registered never ` +
+    `reached the report (--test-force-exit can end the runner before a test file's results ` +
+    `are read, nodejs/node#64833), so a green count here would be a lower bound.\n${lines.join('\n')}`
+  );
+}
+
+// #5170: the loud failure for a chunk that exited 0 whose accounting inputs are missing: the
+// registration ledger and/or the reporter events file could not be read, or the ledger holds no
+// registration at all. The chunk may have lost results and there is no way to know, so it is unreadable
+// evidence — the class this phase closes — and fails like any other failed chunk.
+function formatAccountingUnavailable(chunkNumber, chunkCount, accounting) {
+  const missing = [];
+  if (!accounting.ledgerRead) missing.push('the registration ledger could not be read');
+  else if (!accounting.sawRegisteredLine) missing.push('the registration ledger holds no registration (the preload never recorded a test file)');
+  if (!accounting.eventsRead) missing.push('the reporter events file could not be read');
+  return (
+    `run-tests: chunk ${chunkNumber}/${chunkCount} FAILED test accounting — it exited 0 but could ` +
+    `not be accounted (unreadable evidence): ${missing.join('; ')}. A dropped result would not be ` +
+    `detected for this chunk, so a green count here would be a lower bound.`
+  );
+}
+
 // #3889: ranks a killed chunk's files heaviest-first using the same weigher
 // the packer used to build the chunk, and flags any file the timings table
 // has no measurement for at all (as opposed to one that IS measured but
@@ -1964,7 +2145,15 @@ async function main() {
   ];
   const reporterOverhead = reporterArgs.reduce((sum, a) => sum + a.length + 1, 0);
 
-  const FIXED_OVERHEAD = process.execPath.length + '--test'.length + concurrency.length + (forceExit ? '--test-force-exit'.length + 1 : 0) + reporterOverhead + 8;
+  // #4031: the registration-ledger preload (see analyzeChunkAccounting). Its
+  // per-chunk output path travels via env (GSD_RUN_TESTS_LEDGER_FILE), like the
+  // events path, so only this fixed `--require <path>` counts toward argv.
+  const ledgerPreloadPath = join(__dirname, 'lib', 'registration-ledger-preload.cjs');
+  const ledgerArgs = ['--require', ledgerPreloadPath];
+  const ledgerOverhead = ledgerArgs.reduce((sum, a) => sum + a.length + 1, 0);
+  const ledgerPathFor = (i) => join(eventsDir, `chunk-${String(i).padStart(3, '0')}.ledger.ndjson`);
+
+  const FIXED_OVERHEAD = process.execPath.length + '--test'.length + concurrency.length + (forceExit ? '--test-force-exit'.length + 1 : 0) + reporterOverhead + ledgerOverhead + 8;
 
   // Convert the ms-denominated isolation bar into the packer's weight units
   // by dividing by the live table's own mean duration — see the comment
@@ -2047,6 +2236,7 @@ async function main() {
       console.error(`run-tests: chunk ${i + 1}/${chunks.length} — ${chunks[i].length} files`);
     }
     const chunkEventsPath = eventsPathFor(i);
+    const chunkLedgerPath = ledgerPathFor(i);
     const chunkStartedAt = process.hrtime.bigint();
     // #4936: the timeout diagnostic is printed from runChunk's own timer the
     // moment the bound is exceeded — not from the result, which only arrives
@@ -2128,10 +2318,15 @@ async function main() {
         ...(forceExit ? ['--test-force-exit'] : []),
         concurrency,
         ...reporterArgs,
+        ...ledgerArgs,
         ...chunks[i],
       ],
       {
-        env: { ...process.env, GSD_RUN_TESTS_EVENTS_FILE: chunkEventsPath },
+        env: {
+          ...process.env,
+          GSD_RUN_TESTS_EVENTS_FILE: chunkEventsPath,
+          GSD_RUN_TESTS_LEDGER_FILE: chunkLedgerPath,
+        },
         timeoutMs: chunkTimeoutMs,
         graceMs: chunkKillGraceMs,
         onTimeout: reportChunkTimeout,
@@ -2152,7 +2347,28 @@ async function main() {
         );
       }
     }
+    // #4031: a chunk that exited 0 must also ACCOUNT for every test its files
+    // registered. Run before the success path below, which deletes the events
+    // file this reads; a shortfall turns the chunk into an ordinary failure
+    // (non-timeout, so the remaining chunks still run and every failure is
+    // visible in one pass).
+    let accountingFailed = false;
     if (!result.timedOut && result.code === 0 && !result.signal && !result.error) {
+      const accounting = analyzeChunkAccounting(chunkEventsPath, chunkLedgerPath);
+      if (accounting.ledgerCountedNothing) {
+        accountingFailed = true;
+        console.error(formatAccountingCountDead(i + 1, chunks.length, accounting));
+      } else if (accounting.shortfalls.length > 0) {
+        accountingFailed = true;
+        console.error(formatAccountingFailure(i + 1, chunks.length, accounting));
+      } else if (!accounting.available) {
+        // Unreadable evidence is a FAILURE, not a warning (#5170): accounting that cannot be read
+        // cannot show that nothing was lost.
+        accountingFailed = true;
+        console.error(formatAccountingUnavailable(i + 1, chunks.length, accounting));
+      }
+    }
+    if (!accountingFailed && !result.timedOut && result.code === 0 && !result.signal && !result.error) {
       console.error(
         `run-tests: chunk ${i + 1}/${chunks.length} completed in ${elapsedMs.toFixed(0)}ms`,
       );
@@ -2294,6 +2510,12 @@ module.exports = {
   ISOLATION_BUDGET_FRACTION,
   partitionIsolatedFiles,
   analyzeChunkEvents,
+  // #4031: per-file registered-vs-reported accounting, exported so the
+  // shortfall and accounted arms are unit-testable on synthetic ledgers.
+  analyzeChunkAccounting,
+  formatAccountingFailure,
+  formatAccountingUnavailable,
+  formatAccountingCountDead,
   // #4936: the chunk watchdog, exported so its arms are unit-testable with
   // injected spawn/platform seams (a real wedged Windows child is not
   // reproducible on demand).

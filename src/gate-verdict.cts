@@ -15,8 +15,24 @@
  * Pure: no I/O, no imports.
  */
 
-/** How a gate's arm ended. `block` is carried separately: a gate can be advisory yet block, etc. */
-export type GateOutcome = 'pass' | 'block' | 'skip' | 'advisory';
+/**
+ * How a gate's arm ended. `block` is carried separately: a gate can be advisory yet block, etc.
+ * `empty` (#5170) is "the gate ran and the scope it evaluates is genuinely empty" (a plan with no
+ * `must_haves.artifacts` block): distinct from `unreadable` (could not look) and from `pass`.
+ */
+export type GateOutcome = 'pass' | 'block' | 'skip' | 'advisory' | 'unreadable' | 'empty';
+
+declare const unreadableBrand: unique symbol;
+
+/**
+ * A verdict whose evidence could not be read (#5170, ADR-5057 §4). Branded so the `unreadable` arm of
+ * `verdictFromEvidence` (src/gate-evidence.cts) can only return one: a passing `GateVerdict` is not
+ * assignable to this type, so "could not look" cannot be reported as a pass at compile time.
+ */
+export interface UnreadableVerdict extends GateVerdict {
+  readonly outcome: 'unreadable';
+  readonly [unreadableBrand]: true;
+}
 
 /** The gate reached an answer. */
 export interface GateVerdict {
@@ -38,11 +54,17 @@ export type GateResult = GateVerdict | GateUsageFailure;
  * The `GateUsageFailure.failure.code` values a gate module produces. A gate module may not import
  * `./io.cjs` (whose `ERROR_REASON` owns these wire strings), so it names them here; the router
  * hands the code straight to `error()`. Values are pinned equal to `ERROR_REASON.USAGE` /
- * `ERROR_REASON.SDK_MISSING_ARG` by the cutover-equivalence goldens.
+ * `ERROR_REASON.SDK_MISSING_ARG` / `ERROR_REASON.UNKNOWN` by the cutover-equivalence goldens and
+ * the parity test in tests/check-router-cutover-equivalence.test.cjs.
+ *
+ * `UNKNOWN` is the reason `error()` records when its caller names none: the drift verbs' usage
+ * failures never named one (#5219), and the JSON diagnostic's `reason` and the exit-contract v2
+ * status (UNKNOWN is FAIL, 1; SDK_MISSING_ARG is USAGE, 64) are observable, so they keep it.
  */
 export const GATE_FAILURE_CODE = Object.freeze({
   USAGE: 'usage',
   SDK_MISSING_ARG: 'sdk_missing_arg',
+  UNKNOWN: 'unknown',
 });
 
 /**
@@ -51,6 +73,14 @@ export const GATE_FAILURE_CODE = Object.freeze({
  */
 export function gateVerdict(outcome: GateOutcome, block: boolean, payload: Record<string, unknown>): GateVerdict {
   return { outcome, block, payload: Object.freeze({ ...payload }) };
+}
+
+/**
+ * Build the verdict for evidence that could not be read. `block` is the gate's own policy for that
+ * arm (unchanged by this outcome); the exit status is derived from the outcome, never from `block`.
+ */
+export function gateUnreadable(block: boolean, payload: Record<string, unknown>): UnreadableVerdict {
+  return gateVerdict('unreadable', block, payload) as UnreadableVerdict;
 }
 
 /** Build a usage failure: exactly `{ failure: { code, message } }`. */

@@ -1792,10 +1792,15 @@ describe('migrated exemptions behave identically (#3882 rows E1/E2)', () => {
     // the new cmdVerifyContextDrift) — same "call site no longer hand-rolls a
     // readdirSync" shape as the roadmap/init migrations above, so the exemption
     // moved with the call site rather than living at both names.
+    // #5219 (ADR-5057 §4 arm C): both drift checks and the helper moved into gate modules; the helper
+    // lives in gate-phase-context.cts beside resolvePhaseDir, and the exemption moved with it.
     const verifyExempt = driftGuard.FUNCTION_SCOPED_EXEMPTIONS.get(path.join('src', 'verify.cts'));
     assert.ok(!verifyExempt || !verifyExempt.has('cmdVerifySchemaDrift'),
       'cmdVerifySchemaDrift must no longer carry an exemption — its phasesDir readdirSync now lives in resolvePhaseDirByToken');
-    assert.ok(verifyExempt && verifyExempt.has('resolvePhaseDirByToken'),
+    assert.ok(!verifyExempt || !verifyExempt.has('resolvePhaseDirByToken'),
+      'resolvePhaseDirByToken left verify.cts, so its exemption must not stay behind');
+    const schemaGateExempt = driftGuard.FUNCTION_SCOPED_EXEMPTIONS.get(path.join('src', 'gate-phase-context.cts'));
+    assert.ok(schemaGateExempt && schemaGateExempt.has('resolvePhaseDirByToken'),
       'resolvePhaseDirByToken must carry the function-scoped exemption — it is the new owner of the extracted readdirSync');
   });
 });
