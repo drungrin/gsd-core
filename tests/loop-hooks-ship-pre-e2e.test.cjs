@@ -343,7 +343,6 @@ describe('real registry ship:pre — structural guards', () => {
 
 const SHIP_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'ship.md');
 const VERIFY_PHASE_GOAL_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-phase', 'steps', 'verify-phase-goal.md');
-const WAVE_POST_GATE_HOOKS_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-phase', 'steps', 'wave-post-gate-hooks.md');
 const PLAN_PHASE_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'plan-phase.md');
 
 // The repo's shared generic-gate-dispatch phrasing, used verbatim at execute:wave:post
@@ -353,34 +352,28 @@ const PLAN_PHASE_MD = path.join(__dirname, '..', 'gsd-core', 'workflows', 'plan-
 // or it is hand-rolling, which is precisely what references/loop-hook-dispatch.md forbids.
 const GENERIC_GATE_LOOP = /For each active entry where\s+`kind == "gate"`/;
 
-function predicateDispatchLine(workflowPath, point) {
+function predicateDispatchLine(workflowPath, marker) {
   // allow-test-rule: source-text-is-the-product (#4483)
   const lines = splitLines(fs.readFileSync(workflowPath, 'utf8'));
-  if (!point) return lines.find((line) => line.includes('gsd_run check predicate')) ?? '';
-  const pointLine = lines.findIndex((line) => (
-    line.toLowerCase().includes(point) && line.includes('gate') && line.includes('dispatch')
-  ));
-  if (pointLine === -1) return '';
-  return lines
-    .slice(pointLine, pointLine + 40)
-    .find((line) => line.includes('gsd_run check predicate')) ?? '';
+  const start = lines.findIndex((line) => line.includes(marker));
+  assert.notEqual(start, -1, `missing predicate dispatch marker: ${marker}`);
+  const following = lines.slice(start + 1);
+  const end = following.findIndex((line) => line.startsWith('## ') || line.startsWith('</step>'));
+  const region = [lines[start], ...following.slice(0, end === -1 ? following.length : end)];
+  const dispatch = region.filter((line) => line.includes('gsd_run check predicate'));
+  assert.equal(dispatch.length, 1, `expected one predicate dispatch at ${marker}`);
+  return dispatch[0];
 }
 
 describe('predicate gate phase-context forwarding (#4483)', () => {
-  test('execute:wave:post forwards both phase number and phase directory', () => {
-    const line = predicateDispatchLine(WAVE_POST_GATE_HOOKS_MD, '');
-    assert.match(line, /--phase-number "\$\{PHASE_NUMBER\}"/);
-    assert.match(line, /--phase-dir "\$\{PHASE_DIR\}"/);
-  });
-
   test('execute:post forwards both phase number and phase directory', () => {
-    const line = predicateDispatchLine(VERIFY_PHASE_GOAL_MD, 'execute:post');
+    const line = predicateDispatchLine(VERIFY_PHASE_GOAL_MD, '**Execute:post gate hook dispatch.**');
     assert.match(line, /--phase-number "\$\{PHASE_NUMBER\}"/);
     assert.match(line, /--phase-dir "\$\{PHASE_DIR\}"/);
   });
 
   test('plan:post forwards phase number, phase directory, and requirement ids', () => {
-    const line = predicateDispatchLine(PLAN_PHASE_MD, 'plan:post');
+    const line = predicateDispatchLine(PLAN_PHASE_MD, '(plan:post capability gate dispatch)');
     assert.match(line, /--phase-number "\$\{PHASE_NUMBER\}"/);
     assert.match(line, /--phase-dir "\$\{PHASE_DIR\}"/);
     assert.match(line, /--phase-req-ids "\$\{PHASE_REQ_IDS\}"/);
