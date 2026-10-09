@@ -1083,7 +1083,7 @@ When executor returns a checkpoint AND `AUTO_MODE` is `true`:
 5. User responds: "approved"/"done" | issue description | decision selection
 6. **Spawn continuation agent (NOT resume)** — build its prompt from
    `execute-phase/steps/checkpoint-continuation-prompt.md`, which carries the prompt itself and
-   the four values it substitutes. Do not look for a template file (#4783).
+   its five placeholders. Do not look for a template file (#4783).
 7. Continuation agent verifies previous commits, continues from resume point
 8. Repeat until plan completes or user stops
 

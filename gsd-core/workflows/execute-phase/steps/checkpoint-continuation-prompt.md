@@ -5,7 +5,7 @@ The prompt for step 6 of `checkpoint_handling` — spawning the continuation age
 answers a checkpoint. This is the authoritative form: build the prompt from it, do not look for a
 template file. (The template this step used to name was retired in January 2026 when the logic
 moved into the subagents; the reference to it survived the deletion and dangled until #4783. The
-four values it carried are contracted below.)
+five placeholders it carried, in four input groups, are contracted below.)
 
 Substitute each placeholder, keep the section order, and add nothing the fresh agent cannot verify
 from the repository:
@@ -34,6 +34,6 @@ Task {resume_task_number}: {resume_task_name}
 
 **Why the prompt lives here rather than being improvised per lane.** Step 6 spawns a fresh agent
 precisely so that state is explicit rather than serialized, and "explicit" is only worth anything
-if every lane makes it the same way. While the four values were listed with no prompt around them,
+if every lane makes it the same way. While the placeholders were listed with no prompt around them,
 each lane wrote its own framing — which is the part a fresh agent actually reads first.
 </step>

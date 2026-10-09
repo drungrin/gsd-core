@@ -16,6 +16,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const { scanFencedBlocks } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
+const { splitLines } = require('../gsd-core/bin/lib/text-lines.cjs');
 
 const COMMAND_PATH = path.join(__dirname, '..', 'commands', 'gsd', 'execute-phase.md');
 
@@ -681,7 +682,10 @@ describe('#3177: debug.md dispatches its session manager in the foreground', () 
     const ROOT = path.join(__dirname, '..');
     const WORKFLOW = path.join(ROOT, 'gsd-core', 'workflows', 'execute-phase.md');
 
-    /** The four values the retired template carried. A lane builds its prompt from these. */
+    /**
+     * The five placeholders (in four input groups) the retired template carried.
+     * A lane builds its prompt from these.
+     */
     const PLACEHOLDERS = [
       '{completed_tasks_table}',
       '{resume_task_number}',
@@ -697,7 +701,8 @@ describe('#3177: debug.md dispatches its session manager in the foreground', () 
     /**
      * Step 6 of checkpoint_handling plus the part it points at. The prompt lives
      * in the part because execute-phase.md sits under a frozen ADR-857 byte
-     * ceiling — the same reason `stale-reverification.md` is a part. What this
+     * ceiling, so the spine keeps a short pointer and the body lives in
+     * `execute-phase/steps/`, as it does for `threat-id-gate.md`. What this
      * guard cares about is that ONE authoritative prompt exists and that no
      * unshipped template is named; which of the two files carries it is a size
      * decision, not a contract one.
@@ -737,17 +742,30 @@ describe('#3177: debug.md dispatches its session manager in the foreground', () 
         `the continuation-agent step names template file(s) that do not ship: ${missing.join(', ')}`);
     });
 
-    __contTest('carries the prompt in the workflow part, with every contracted placeholder', () => {
-      // Criterion 3 of the issue: the four values stay supported exactly as
-      // named, so no lane reading them silently breaks. The fenced block is
-      // what makes the prompt authoritative rather than reconstructed per lane.
-      const step = spawnStep();
-      // scanFencedBlocks, not a local fence regex: same seam this file already
-      // imports, and what local/no-adhoc-markdown-parsing requires.
-      const fenced = scanFencedBlocks(step.split('\n')).filter((b) => b.closeLineIdx !== -1);
-      assert.ok(fenced.length >= 1, 'the workflow part must carry a closed prompt block');
+    /**
+     * The body of the part's closed prompt fence — the authoritative prompt.
+     * scanFencedBlocks, not a local fence regex: same seam this file already
+     * imports, and what local/no-adhoc-markdown-parsing requires. The part is
+     * read on its own, never concatenated with the spine, so a placeholder
+     * named only in the surrounding prose cannot satisfy the assertion.
+     */
+    function promptBlockBody() {
+      const lines = splitLines(fs.readFileSync(PART, 'utf8'));
+      const closed = scanFencedBlocks(lines).filter((b) => b.closeLineIdx !== -1);
+      assert.equal(closed.length, 1,
+        'the workflow part must carry exactly one closed prompt block');
+      return lines.slice(closed[0].openLineIdx + 1, closed[0].closeLineIdx).join('\n');
+    }
+
+    __contTest('carries every contracted placeholder inside the authoritative prompt block', () => {
+      // The issue requires the placeholders to stay supported exactly as named,
+      // so no lane reading them silently breaks. The fenced block is what makes
+      // the prompt authoritative rather than reconstructed per lane, so each
+      // token must appear in that block, not merely somewhere in the part.
+      const body = promptBlockBody();
       for (const placeholder of PLACEHOLDERS) {
-        assert.ok(step.includes(placeholder), `contracted placeholder missing: ${placeholder}`);
+        assert.ok(body.includes(placeholder),
+          `contracted placeholder missing from the prompt block: ${placeholder}`);
       }
     });
   });
