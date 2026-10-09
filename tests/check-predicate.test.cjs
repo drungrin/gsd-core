@@ -431,7 +431,6 @@ const PREDICATE_DISPATCH_SITES = [
 ];
 
 function readWorkflow(relPath) {
-  // allow-test-rule: source-text-is-the-product (#4483)
   return splitLines(fs.readFileSync(path.join(WORKFLOWS_DIR, ...relPath.split('/')), 'utf8'));
 }
 
