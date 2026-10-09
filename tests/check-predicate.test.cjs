@@ -21,6 +21,7 @@ const os = require('os');
 
 const { evaluatePredicate } = require('../gsd-core/bin/lib/gate-predicate-evaluator.cjs');
 const { buildPredicateDeps, parsePredicateFlags } = require('../gsd-core/bin/lib/check-command-router.cjs');
+const { splitLines } = require('../gsd-core/bin/lib/text-lines.cjs');
 const { runGsdTools, createTempProject, cleanup } = require('./helpers.cjs');
 const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
@@ -391,5 +392,101 @@ describe('check predicate --phase-dir — containment boundary (#4354)', () => {
     assert.ok(result.success, `Command failed: ${result.error}`);
     const parsed = JSON.parse(result.output);
     assert.strictEqual(parsed.block, false, 'cwd-fallback evaluation must still pass');
+  });
+});
+
+// ─── Call-site parity: every workflow dispatch of `check predicate` (#4483) ────
+//
+// `check predicate` interpolates ${PHASE_NUMBER}, ${PHASE_DIR} and ${PHASE_REQ_IDS}
+// into a capability-declared command, and a flag a caller leaves out interpolates to
+// the empty string without any error. Each workflow lists its flags by hand, so the
+// subsets drifted apart. This table is the expected flag set per dispatch site: the
+// per-site tests pin it, and the discovery test fails when a workflow gains a
+// `gsd_run check predicate` command that has no row here.
+//
+// The workflow prose is the product the agent runtime loads, so its text is the
+// object under test (`source-text-is-the-product`).
+
+const WORKFLOWS_DIR = path.join(__dirname, '..', 'gsd-core', 'workflows');
+const PREDICATE_COMMAND = 'gsd_run check predicate';
+const WAVE_POST_PART = 'execute-phase/steps/wave-post-gate-hooks.md';
+
+const PHASE_NUMBER = '--phase-number=PHASE_NUMBER';
+const PHASE_DIR = '--phase-dir=PHASE_DIR';
+const PHASE_REQ_IDS = '--phase-req-ids=PHASE_REQ_IDS';
+
+const PREDICATE_DISPATCH_SITES = [
+  { point: 'execute:post', file: 'execute-phase/steps/verify-phase-goal.md',
+    marker: '**Execute:post gate hook dispatch.**', context: [PHASE_NUMBER, PHASE_DIR] },
+  { point: 'plan:post', file: 'plan-phase.md',
+    marker: '(plan:post capability gate dispatch)', context: [PHASE_NUMBER, PHASE_DIR, PHASE_REQ_IDS] },
+  { point: 'ship:pre', file: 'ship.md',
+    marker: 'serialize `hook.check.predicate` to compact JSON', context: [PHASE_NUMBER, PHASE_DIR] },
+  // Known gap, split out of #4507 by the maintainer: `init.verify-work` returns
+  // `phase_number` and the workflow already holds it, but this dispatch forwards only
+  // the directory. It belongs to the arm-(b) omissions listed under #4483 in epic #4909.
+  // When it forwards PHASE_NUMBER this row fails on purpose: add PHASE_NUMBER to it.
+  { point: 'verify:pre', file: 'verify-work.md',
+    marker: '**Verify:pre capability dispatch.**', context: [PHASE_DIR] },
+];
+
+function readWorkflow(relPath) {
+  // allow-test-rule: source-text-is-the-product (#4483)
+  return splitLines(fs.readFileSync(path.join(WORKFLOWS_DIR, ...relPath.split('/')), 'utf8'));
+}
+
+/** The one dispatch command inside the region that starts at `marker` and ends at the step. */
+function predicateDispatchLine(relPath, marker) {
+  const lines = readWorkflow(relPath);
+  const start = lines.findIndex((line) => line.includes(marker));
+  assert.notEqual(start, -1, `missing predicate dispatch marker in ${relPath}: ${marker}`);
+  const following = lines.slice(start + 1);
+  const end = following.findIndex((line) => line.startsWith('## ') || line.startsWith('</step>'));
+  const region = [lines[start], ...following.slice(0, end === -1 ? following.length : end)];
+  const dispatch = region.filter((line) => line.includes(PREDICATE_COMMAND));
+  assert.equal(dispatch.length, 1, `expected exactly one predicate dispatch at ${marker} in ${relPath}`);
+  return dispatch[0];
+}
+
+/** The `--phase-* "${VAR}"` pairs a command line forwards, as sorted `--flag=VAR` strings. */
+function forwardedContext(line) {
+  return [...line.matchAll(/(--phase-[a-z-]+) "\$\{([A-Z_]+)\}"/g)]
+    .map((match) => `${match[1]}=${match[2]}`)
+    .sort();
+}
+
+describe('check predicate call sites forward their phase context (#4483)', () => {
+  for (const site of PREDICATE_DISPATCH_SITES) {
+    test(`${site.point} (${site.file}) forwards exactly ${site.context.join(' ')}`, () => {
+      const line = predicateDispatchLine(site.file, site.marker);
+      assert.deepEqual(forwardedContext(line), [...site.context].sort());
+    });
+  }
+
+  test('every workflow that dispatches `check predicate` has a row in the table', () => {
+    const dispatching = {};
+    for (const entry of fs.readdirSync(WORKFLOWS_DIR, { recursive: true })) {
+      const file = String(entry).split(path.sep).join('/');
+      if (!file.endsWith('.md')) continue;
+      const count = readWorkflow(file).filter((line) => line.includes(PREDICATE_COMMAND)).length;
+      if (count > 0) dispatching[file] = count;
+    }
+    const declared = {};
+    for (const { file } of PREDICATE_DISPATCH_SITES) declared[file] = (declared[file] ?? 0) + 1;
+    const sorted = (counts) => Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
+    assert.deepEqual(sorted(dispatching), sorted(declared));
+  });
+
+  // Known gap, split out of #4507 and listed with the other arm-(b) omissions under
+  // #4483 in epic #4909: the part promises a `predicate` form "shown in the block below",
+  // but its only command is the named-query form, so a predicate gate at this point has
+  // no explicit flags. When it gains a predicate command, move it into the table above.
+  test('execute:wave:post has no predicate command yet, only the named-query form', () => {
+    const lines = readWorkflow(WAVE_POST_PART);
+    assert.equal(lines.filter((line) => line.includes(PREDICATE_COMMAND)).length, 0,
+      'wave-post-gate-hooks.md gained a predicate dispatch: add a row for execute:wave:post');
+    const queryDispatch = lines.filter((line) => line.includes('gsd_run check ${hook.check.query}'));
+    assert.equal(queryDispatch.length, 1, 'expected exactly one named-query dispatch');
+    assert.deepEqual(forwardedContext(queryDispatch[0]), []);
   });
 });
