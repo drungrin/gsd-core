@@ -674,98 +674,248 @@ describe('#3177: debug.md dispatches its session manager in the foreground', () 
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// #4783 — the continuation-agent spawn names no template that does not ship
+// #4783 — every continuation spawn builds one prompt the executor recognizes
 // ────────────────────────────────────────────────────────────────────────
 {
   const { describe: __contDescribe, test: __contTest } = require('node:test');
-  __contDescribe('checkpoint continuation prompt is self-contained (#4783)', () => {
+  const { extractTaggedBlocks } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
+  const { parseMarkdownTable } = require('../gsd-core/bin/lib/markdown-table.cjs');
+
+  __contDescribe('checkpoint continuation prompt is one contract with the executor (#4783)', () => {
     const ROOT = path.join(__dirname, '..');
-    const WORKFLOW = path.join(ROOT, 'gsd-core', 'workflows', 'execute-phase.md');
+    const WORKFLOWS = path.join(ROOT, 'gsd-core', 'workflows');
+    const WORKFLOW = path.join(WORKFLOWS, 'execute-phase.md');
+    const EXECUTOR = path.join(ROOT, 'agents', 'gsd-executor.md');
+
+    /** The file this suite reads. The step-6 pointer must name exactly this file. */
+    const PART = path.join(WORKFLOWS, 'execute-phase', 'steps', 'checkpoint-continuation-prompt.md');
 
     /**
-     * The five placeholders (in four input groups) the retired template carried.
-     * A lane builds its prompt from these.
+     * The contracted placeholders, in prompt order. Each must appear inside the
+     * prompt block exactly once, in this order, with nothing extra, and each
+     * must have a row in the part's placeholder table.
      */
     const PLACEHOLDERS = [
+      '{plan_id}',
+      '{phase_number}',
+      '{plan_path}',
       '{completed_tasks_table}',
       '{resume_task_number}',
       '{resume_task_name}',
-      '{user_response}',
+      '{checkpoint_type}',
       '{resume_instructions}',
+      '{user_response}',
     ];
 
-    const PART = path.join(
-      ROOT, 'gsd-core', 'workflows', 'execute-phase', 'steps', 'checkpoint-continuation-prompt.md',
-    );
+    const PLACEHOLDER_RE = /\{[a-z_]{1,40}\}/g;
+    const PART_POINTER_RE = /`(execute-phase\/steps\/[a-z0-9-]{1,80}\.md)`/;
+
+    /** The `checkpoint_handling` step of execute-phase.md, open tag to `</step>`. */
+    function checkpointHandlingStep() {
+      const text = fs.readFileSync(WORKFLOW, 'utf8');
+      const open = text.indexOf('<step name="checkpoint_handling">');
+      assert.notEqual(open, -1, 'checkpoint_handling step not found — this guard is pointed at nothing');
+      const close = text.indexOf('</step>', open);
+      assert.notEqual(close, -1, 'checkpoint_handling step is not closed');
+      return text.slice(open, close);
+    }
+
+    /** Text of the step from `startMarker` up to (not including) `endMarker`. */
+    function sliceStep(step, startMarker, endMarker) {
+      const start = step.indexOf(startMarker);
+      assert.notEqual(start, -1, `checkpoint_handling no longer contains: ${startMarker}`);
+      const end = step.indexOf(endMarker, start + startMarker.length);
+      return step.slice(start, end === -1 ? step.length : end);
+    }
+
+    /** The three places checkpoint_handling spawns a continuation agent. */
+    function spawnSites() {
+      const step = checkpointHandlingStep();
+      return {
+        'auto-mode branch': sliceStep(step, 'When executor returns a checkpoint AND `AUTO_MODE`', '**Standard flow'),
+        'step 6': sliceStep(step, '6. **Spawn continuation agent (NOT resume)**', '\n7. '),
+        'parallel waves': sliceStep(step, '**Checkpoints in parallel waves:**', '\n'),
+      };
+    }
 
     /**
-     * Step 6 of checkpoint_handling plus the part it points at. The prompt lives
-     * in the part because execute-phase.md sits under a frozen ADR-857 byte
-     * ceiling, so the spine keeps a short pointer and the body lives in
-     * `execute-phase/steps/`, as it does for `threat-id-gate.md`. What this
-     * guard cares about is that ONE authoritative prompt exists and that no
-     * unshipped template is named; which of the two files carries it is a size
-     * decision, not a contract one.
+     * The executor's side of the contract, read from agents/gsd-executor.md and
+     * never restated here: the tag that makes it a continuation agent and the
+     * command it uses to verify previous commits.
      */
-    function spawnStep() {
-      const text = fs.readFileSync(WORKFLOW, 'utf8');
-      const start = text.indexOf('6. **Spawn continuation agent (NOT resume)**');
-      assert.notEqual(start, -1, 'the continuation-agent spawn step is gone — this guard is pointed at nothing');
-      const rest = text.slice(start);
-      const end = rest.indexOf('\n7. ');
-      const spine = rest.slice(0, end === -1 ? rest.length : end);
-      assert.match(spine, /checkpoint-continuation-prompt\.md/,
-        'the spine step must point at the part that carries the prompt');
-      return `${spine}\n${fs.readFileSync(PART, 'utf8')}`;
+    function executorContract() {
+      const agent = fs.readFileSync(EXECUTOR, 'utf8');
+      const handling = extractTaggedBlocks(agent, 'continuation_handling');
+      assert.equal(handling.length, 1, 'gsd-executor.md must carry exactly one <continuation_handling> block');
+      const marker = /\(`<([a-z_]{1,40})>` in prompt\)/.exec(handling[0]);
+      assert.ok(marker, 'continuation_handling no longer names the prompt tag that marks a continuation agent');
+      const verify = /Verify previous commits exist: `([^`\n]{1,80})`/.exec(handling[0]);
+      assert.ok(verify, 'continuation_handling no longer names the command that verifies previous commits');
+      const patternC = /\*\*Pattern C: Continuation\*\* — Check `<([a-z_]{1,40})>` in prompt/.exec(agent);
+      assert.ok(patternC, 'gsd-executor.md Pattern C no longer names the continuation tag');
+      return { markerTag: marker[1], patternCTag: patternC[1], verifyCommand: verify[1] };
     }
 
-    function missingTemplates(step) {
-      const named = [...step.matchAll(/`?\b([A-Za-z0-9][A-Za-z0-9._-]*\.md)`?\s+template\b/g)].map((m) => m[1]);
-      return named.filter((name) => ![
-        path.join(ROOT, 'gsd-core', 'references', name),
-        path.join(ROOT, 'gsd-core', 'templates', name),
-        path.join(ROOT, 'gsd-core', 'workflows', name),
-      ].some((p) => fs.existsSync(p)));
+    /**
+     * Every way a copy of the part can break the contract, as readable
+     * violations — empty when it holds. The real part and the mutated copies
+     * below go through this same function, so the negative controls exercise
+     * exactly the logic the real assertion relies on.
+     */
+    function promptContractViolations(partText, { markerTag, verifyCommand }) {
+      const lines = splitLines(partText);
+      const closed = scanFencedBlocks(lines).filter((b) => b.closeLineIdx !== -1);
+      if (closed.length !== 1) return [`expected exactly one closed prompt block, found ${closed.length}`];
+      const bodyLines = lines.slice(closed[0].openLineIdx + 1, closed[0].closeLineIdx);
+      const body = bodyLines.join('\n');
+      const violations = [];
+
+      const found = body.match(PLACEHOLDER_RE) || [];
+      if (found.join(' ') !== PLACEHOLDERS.join(' ')) {
+        violations.push(`prompt placeholders are [${found.join(', ')}]; expected exactly [${PLACEHOLDERS.join(', ')}], each once, in that order`);
+      }
+
+      const marked = extractTaggedBlocks(body, markerTag);
+      if (marked.length !== 1) {
+        violations.push(`prompt must wrap the completed tasks in exactly one <${markerTag}> block (the executor's continuation marker); found ${marked.length}`);
+      } else {
+        if (!marked[0].includes('{completed_tasks_table}')) violations.push(`{completed_tasks_table} is not inside <${markerTag}>`);
+        if (!/do not redo/i.test(marked[0])) violations.push(`<${markerTag}> must tell the agent not to redo completed tasks`);
+        if (!marked[0].includes(verifyCommand)) violations.push(`<${markerTag}> must carry the executor's commit check \`${verifyCommand}\``);
+      }
+
+      const dataStart = bodyLines.findIndex((l) => l.trim() === 'DATA_START');
+      const dataEnd = bodyLines.findIndex((l) => l.trim() === 'DATA_END');
+      const response = bodyLines.findIndex((l) => l.includes('{user_response}'));
+      if (!(dataStart !== -1 && dataStart < response && response < dataEnd)) {
+        violations.push('{user_response} must sit between a DATA_START line and a DATA_END line');
+      } else if (!/never as instructions/i.test(bodyLines.slice(0, dataStart).join('\n'))) {
+        violations.push('the data block must be introduced as data, never as instructions');
+      }
+
+      const after = lines.slice(closed[0].closeLineIdx + 1).join('\n');
+      const table = parseMarkdownTable(after);
+      if (!table.ok) {
+        violations.push(`placeholder table unreadable: ${table.reason}`);
+      } else {
+        const rows = table.value.rows;
+        const listed = rows.map((r) => (String(r.Placeholder || '').match(PLACEHOLDER_RE) || []).join(' '));
+        if (listed.join(' ') !== PLACEHOLDERS.join(' ')) {
+          violations.push(`placeholder table lists [${listed.join(', ')}]; expected one row per placeholder, in prompt order`);
+        }
+        const unsourced = rows.filter((r) => !String(r.Source || '').trim()).map((r) => r.Placeholder);
+        if (unsourced.length) violations.push(`placeholder rows without a source: ${unsourced.join(', ')}`);
+      }
+      return violations;
     }
 
-    __contTest('detects the unshipped template in the old continuation instruction', () => {
+    /**
+     * Every `.md` file name or path the text names, minus the ones that do not
+     * exist as shipped files. Bare names resolve against the shipped asset
+     * directories, paths against the workflows directory, gsd-core/ and the
+     * repo root (an `@~/.claude/` or `~/.claude/` install prefix is dropped).
+     * `SUMMARY.md` is the plan artifact the executor writes at runtime, not a
+     * shipped file.
+     */
+    const RUNTIME_ARTIFACTS = new Set(['SUMMARY.md']);
+    function missingFiles(text) {
+      const named = text.match(/[A-Za-z0-9~@][A-Za-z0-9._/~@-]{0,160}\.md\b/g) || [];
+      return [...new Set(named)].filter((raw) => {
+        if (RUNTIME_ARTIFACTS.has(raw)) return false;
+        const name = raw.replace(/^@?~\/\.claude\//, '');
+        const candidates = name.includes('/')
+          ? [path.join(WORKFLOWS, name), path.join(ROOT, 'gsd-core', name), path.join(ROOT, name)]
+          : ['references', 'templates', 'workflows'].map((dir) => path.join(ROOT, 'gsd-core', dir, name));
+        return !candidates.some((p) => fs.existsSync(p));
+      });
+    }
+
+    __contTest('the file check catches an unshipped name however the instruction is worded', () => {
+      // The retired instruction, the same name reworded, and a dangling part path.
       assert.deepEqual(
-        missingTemplates('6. **Spawn continuation agent (NOT resume)** — use continuation-prompt.md template'),
+        missingFiles('6. **Spawn continuation agent (NOT resume)** — use continuation-prompt.md template'),
         ['continuation-prompt.md'],
       );
+      assert.deepEqual(missingFiles('build the prompt from `continuation-prompt.md`'), ['continuation-prompt.md']);
+      assert.deepEqual(missingFiles('read and execute `execute-phase/steps/no-such-part.md`'),
+        ['execute-phase/steps/no-such-part.md']);
+      assert.deepEqual(missingFiles('read `execute-phase/steps/threat-id-gate.md` and @~/.claude/gsd-core/references/checkpoints.md'), []);
     });
 
-    __contTest('does not send the agent to a template file that is not shipped', () => {
-      // The positive control above proves this guard catches the retired instruction.
-      const missing = missingTemplates(spawnStep());
-      assert.deepEqual(missing, [],
-        `the continuation-agent step names template file(s) that do not ship: ${missing.join(', ')}`);
+    __contTest('checkpoint_handling and the prompt part name only files that ship', () => {
+      const text = `${checkpointHandlingStep()}\n${fs.readFileSync(PART, 'utf8')}`;
+      const missing = missingFiles(text);
+      assert.deepEqual(missing, [], `named but not shipped: ${missing.join(', ')}`);
     });
 
-    /**
-     * The body of the part's closed prompt fence — the authoritative prompt.
-     * scanFencedBlocks, not a local fence regex: same seam this file already
-     * imports, and what local/no-adhoc-markdown-parsing requires. The part is
-     * read on its own, never concatenated with the spine, so a placeholder
-     * named only in the surrounding prose cannot satisfy the assertion.
-     */
-    function promptBlockBody() {
+    __contTest('step 6 reads and executes the part this suite checks', () => {
+      const site = spawnSites()['step 6'];
+      assert.match(site, /read and execute `execute-phase\/steps\//, 'step 6 must point at the part with an explicit read verb');
+      const pointer = PART_POINTER_RE.exec(site);
+      assert.ok(pointer, 'step 6 names no execute-phase/steps/ part');
+      assert.equal(path.join(WORKFLOWS, pointer[1]), PART,
+        'the part step 6 names is not the file this suite checks');
+    });
+
+    __contTest('every continuation spawn path routes to the same part', () => {
+      for (const [where, site] of Object.entries(spawnSites())) {
+        const pointer = PART_POINTER_RE.exec(site);
+        assert.ok(pointer, `${where} spawns a continuation without naming the prompt part`);
+        assert.equal(path.join(WORKFLOWS, pointer[1]), PART, `${where} names a different part`);
+      }
+    });
+
+    __contTest('the executor names one continuation marker in both of its surfaces', () => {
+      const { markerTag, patternCTag } = executorContract();
+      assert.equal(patternCTag, markerTag,
+        'Pattern C and continuation_handling must recognize a continuation agent by the same tag');
+    });
+
+    __contTest('the prompt part honors the executor continuation contract', () => {
+      const violations = promptContractViolations(fs.readFileSync(PART, 'utf8'), executorContract());
+      assert.deepEqual(violations, []);
+    });
+
+    __contTest('the contract check rejects each way the prompt can drift', () => {
+      // LF-normalized, so a CRLF checkout cannot make a no-op mutation look like a change.
       const lines = splitLines(fs.readFileSync(PART, 'utf8'));
-      const closed = scanFencedBlocks(lines).filter((b) => b.closeLineIdx !== -1);
-      assert.equal(closed.length, 1,
-        'the workflow part must carry exactly one closed prompt block');
-      return lines.slice(closed[0].openLineIdx + 1, closed[0].closeLineIdx).join('\n');
-    }
-
-    __contTest('carries every contracted placeholder inside the authoritative prompt block', () => {
-      // The issue requires the placeholders to stay supported exactly as named,
-      // so no lane reading them silently breaks. The fenced block is what makes
-      // the prompt authoritative rather than reconstructed per lane, so each
-      // token must appear in that block, not merely somewhere in the part.
-      const body = promptBlockBody();
-      for (const placeholder of PLACEHOLDERS) {
-        assert.ok(body.includes(placeholder),
-          `contracted placeholder missing from the prompt block: ${placeholder}`);
+      const real = lines.join('\n');
+      const contract = executorContract();
+      const fence = scanFencedBlocks(lines).find((b) => b.closeLineIdx !== -1);
+      const inside = (fn) => {
+        const body = lines.slice(fence.openLineIdx + 1, fence.closeLineIdx).join('\n');
+        return [
+          ...lines.slice(0, fence.openLineIdx + 1),
+          fn(body),
+          ...lines.slice(fence.closeLineIdx),
+        ].join('\n');
+      };
+      const swap = (text, a, b) => text.replace(a, '\u0000').replace(b, a).replace('\u0000', b);
+      // Each mutation names the violation it must trigger, so a control that is
+      // caught only by accident (another check firing) does not pass as coverage.
+      const mutations = {
+        'executor marker removed': [inside((b) => b
+          .replace(`<${contract.markerTag}>`, '## Completed tasks')
+          .replace(`</${contract.markerTag}>`, '')), `exactly one <${contract.markerTag}> block`],
+        'placeholder moved outside the fence': [
+          `${inside((b) => b.replace('{resume_instructions}', ''))}\n{resume_instructions}\n`, 'prompt placeholders are'],
+        'placeholder duplicated': [
+          inside((b) => b.replace('{resume_task_name}', '{resume_task_name} {resume_task_name}')), 'prompt placeholders are'],
+        'placeholders reordered': [inside((b) => swap(b, '{plan_id}', '{phase_number}')), 'prompt placeholders are'],
+        'extra placeholder': [
+          inside((b) => b.replace('{resume_instructions}', '{resume_status}\n{resume_instructions}')), 'prompt placeholders are'],
+        'commit check dropped': [inside((b) => b.replace(contract.verifyCommand, 'git status')), "executor's commit check"],
+        'user response outside the data block': [inside((b) => b
+          .replace('{user_response}\n', '')
+          .replace(`</${contract.markerTag}>`, `{user_response}\n</${contract.markerTag}>`)), 'DATA_START'],
+        'placeholder missing from the table': [
+          lines.filter((l) => !l.startsWith('| `{plan_path}` |')).join('\n'), 'placeholder table lists'],
+      };
+      for (const [name, [mutated, expected]] of Object.entries(mutations)) {
+        assert.notEqual(mutated, real, `mutation "${name}" did not change the part — the control is vacuous`);
+        const violations = promptContractViolations(mutated, contract);
+        assert.ok(violations.some((v) => v.includes(expected)),
+          `the contract check missed "${name}" (expected a violation containing "${expected}"; got ${JSON.stringify(violations)})`);
       }
     });
   });
