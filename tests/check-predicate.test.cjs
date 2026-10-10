@@ -410,7 +410,7 @@ describe('check predicate --phase-dir — containment boundary (#4354)', () => {
 // (`source-text-is-the-product`).
 
 const REPO_ROOT = path.join(__dirname, '..');
-// The markdown roots package.json ships to a runtime; `docs/` is reference, not a prompt.
+// The markdown roots package.json ships to a runtime; reference documentation is not a prompt.
 const SHIPPED_MARKDOWN_ROOTS = ['gsd-core', 'commands', 'agents', 'skills'];
 // A dispatch is a line that invokes the subcommand (via the gsd_run shim, the gsd-tools(.cjs)
 // file or "$GSD_TOOLS", with any whitespace between the words) AND passes `--predicate`; prose
