@@ -19,7 +19,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { evaluatePredicate } = require('../gsd-core/bin/lib/gate-predicate-evaluator.cjs');
+const { evaluatePredicate, INTERPOLATION_VAR_NAMES } = require('../gsd-core/bin/lib/gate-predicate-evaluator.cjs');
+const { evaluateCheckPredicate } = require('../gsd-core/bin/lib/gate-predicate.cjs');
 const { buildPredicateDeps, parsePredicateFlags } = require('../gsd-core/bin/lib/check-command-router.cjs');
 const { splitLines } = require('../gsd-core/bin/lib/text-lines.cjs');
 const { runGsdTools, createTempProject, cleanup } = require('./helpers.cjs');
@@ -395,79 +396,128 @@ describe('check predicate --phase-dir — containment boundary (#4354)', () => {
   });
 });
 
-// ─── Call-site parity: every workflow dispatch of `check predicate` (#4483) ────
+// ─── Call-site parity: every shipped dispatch of `check predicate` (#4483) ────
 //
-// `check predicate` interpolates ${PHASE_NUMBER}, ${PHASE_DIR} and ${PHASE_REQ_IDS}
-// into a capability-declared command, and a flag a caller leaves out interpolates to
-// the empty string without any error. Each workflow lists its flags by hand, so the
-// subsets drifted apart. This table is the expected flag set per dispatch site: the
-// per-site tests pin it, and the discovery test fails when a workflow gains a
-// `gsd_run check predicate` command that has no row here.
+// `check predicate` interpolates each name in the evaluator's INTERPOLATION_VAR_NAMES into a
+// capability-declared command, and a name the caller does not pass as a flag becomes the empty
+// string without any error. Each workflow writes its flags by hand, so the call sites drifted
+// apart. The flags a site owes are therefore derived from the evaluator, not listed here: every
+// placeholder must be forwarded unless the site's row excludes it with a reason. A placeholder
+// added to the evaluator fails every site until it is forwarded or excluded, and an exclusion
+// the site no longer needs fails as stale.
 //
-// The workflow prose is the product the agent runtime loads, so its text is the
-// object under test (`source-text-is-the-product`).
+// The shipped prompt text is the product the agent runtime loads, so it is the object under test
+// (`source-text-is-the-product`).
 
-const WORKFLOWS_DIR = path.join(__dirname, '..', 'gsd-core', 'workflows');
-const PREDICATE_COMMAND = 'gsd_run check predicate';
-const WAVE_POST_PART = 'execute-phase/steps/wave-post-gate-hooks.md';
+const REPO_ROOT = path.join(__dirname, '..');
+// The markdown roots package.json ships to a runtime; `docs/` is reference, not a prompt.
+const SHIPPED_MARKDOWN_ROOTS = ['gsd-core', 'commands', 'agents', 'skills'];
+// A dispatch is a line that invokes the subcommand (via the gsd_run shim, the gsd-tools(.cjs)
+// file or "$GSD_TOOLS", with any whitespace between the words) AND passes `--predicate`; prose
+// that only names the subcommand is not one. Out of reach: a command wrapped across lines, whose
+// flags sit on lines this per-line scan does not join.
+const PREDICATE_INVOCATION = /(?:\bgsd_run|\bgsd-tools(?:\.cjs)?"?|\$\{?GSD_TOOLS\}?"?)\s+check\s+predicate\b/;
+// Forwarded context is read only as `--flag "${VAR}"` or `--flag "$VAR"` on the dispatch line
+// itself: the CLI parser takes no `--flag=value`, and an unquoted value word-splits (the
+// requirement IDs hold ", "), so neither spelling forwards anything.
+const FORWARDED_FLAG = /(--[a-z][a-z0-9-]*) "\$(?:\{([A-Z][A-Z0-9_]*)\}|([A-Z][A-Z0-9_]*))"/g;
 
-const PHASE_NUMBER = '--phase-number=PHASE_NUMBER';
-const PHASE_DIR = '--phase-dir=PHASE_DIR';
-const PHASE_REQ_IDS = '--phase-req-ids=PHASE_REQ_IDS';
+/** The `check predicate` flag a placeholder is read from (PHASE_REQ_IDS -> --phase-req-ids). */
+const flagFor = (name) => `--${name.toLowerCase().replaceAll('_', '-')}`;
+const contextPair = (name) => `${flagFor(name)}=${name}`;
 
+// Rows are keyed by file, not by a heading: the discovery scan is the one locator for both, and
+// each file holds exactly one dispatch, so rewording prose cannot break a row.
 const PREDICATE_DISPATCH_SITES = [
-  { point: 'execute:post', file: 'execute-phase/steps/verify-phase-goal.md',
-    marker: '**Execute:post gate hook dispatch.**', context: [PHASE_NUMBER, PHASE_DIR] },
-  { point: 'plan:post', file: 'plan-phase.md',
-    marker: '(plan:post capability gate dispatch)', context: [PHASE_NUMBER, PHASE_DIR, PHASE_REQ_IDS] },
-  { point: 'ship:pre', file: 'ship.md',
-    marker: 'serialize `hook.check.predicate` to compact JSON', context: [PHASE_NUMBER, PHASE_DIR] },
-  // Known gap, split out of #4507 by the maintainer: `init.verify-work` returns
-  // `phase_number` and the workflow already holds it, but this dispatch forwards only
-  // the directory. It belongs to the arm-(b) omissions listed under #4483 in epic #4909.
-  // When it forwards PHASE_NUMBER this row fails on purpose: add PHASE_NUMBER to it.
-  { point: 'verify:pre', file: 'verify-work.md',
-    marker: '**Verify:pre capability dispatch.**', context: [PHASE_DIR] },
+  { point: 'execute:post', file: 'gsd-core/workflows/execute-phase/steps/verify-phase-goal.md', excluded: {} },
+  { point: 'plan:post', file: 'gsd-core/workflows/plan-phase.md', excluded: {} },
+  { point: 'ship:pre', file: 'gsd-core/workflows/ship.md', excluded: {
+    PHASE_REQ_IDS: 'ship.md loads only init.phase-op, which emits no phase_req_ids',
+  } },
+  { point: 'verify:pre', file: 'gsd-core/workflows/verify-work.md', excluded: {
+    // Known gap #5289, split out of #4507 by the maintainer. When verify:pre forwards the
+    // phase number, this exclusion turns stale and the row fails on purpose: delete it then.
+    PHASE_NUMBER: 'known gap #5289: init.verify-work returns phase_number, the dispatch omits it',
+    PHASE_REQ_IDS: 'verify:pre loads only init.verify-work, which emits no phase_req_ids',
+  } },
 ];
+const WAVE_POST_PART = 'gsd-core/workflows/execute-phase/steps/wave-post-gate-hooks.md';
 
-function readWorkflow(relPath) {
-  return splitLines(fs.readFileSync(path.join(WORKFLOWS_DIR, ...relPath.split('/')), 'utf8'));
+function readShipped(relPath) {
+  return splitLines(fs.readFileSync(path.join(REPO_ROOT, ...relPath.split('/')), 'utf8'));
 }
 
-/** The one dispatch command inside the region that starts at `marker` and ends at the step. */
-function predicateDispatchLine(relPath, marker) {
-  const lines = readWorkflow(relPath);
-  const start = lines.findIndex((line) => line.includes(marker));
-  assert.notEqual(start, -1, `missing predicate dispatch marker in ${relPath}: ${marker}`);
-  const following = lines.slice(start + 1);
-  const end = following.findIndex((line) => line.startsWith('## ') || line.startsWith('</step>'));
-  const region = [lines[start], ...following.slice(0, end === -1 ? following.length : end)];
-  const dispatch = region.filter((line) => line.includes(PREDICATE_COMMAND));
-  assert.equal(dispatch.length, 1, `expected exactly one predicate dispatch at ${marker} in ${relPath}`);
-  return dispatch[0];
+function shippedMarkdownFiles() {
+  const files = [];
+  for (const root of SHIPPED_MARKDOWN_ROOTS) {
+    for (const entry of fs.readdirSync(path.join(REPO_ROOT, root), { recursive: true })) {
+      const file = `${root}/${String(entry).split(path.sep).join('/')}`;
+      if (file.endsWith('.md')) files.push(file);
+    }
+  }
+  return files;
 }
 
-/** The `--phase-* "${VAR}"` pairs a command line forwards, as sorted `--flag=VAR` strings. */
+const isPredicateDispatch = (line) => PREDICATE_INVOCATION.test(line) && line.includes('--predicate');
+
+function predicateDispatchLines(relPath) {
+  return readShipped(relPath).filter(isPredicateDispatch);
+}
+
+function soleDispatchLine(relPath) {
+  const lines = predicateDispatchLines(relPath);
+  assert.equal(lines.length, 1, `expected exactly one predicate dispatch in ${relPath}`);
+  return lines[0];
+}
+
+/** The `--flag "${VAR}"` pairs a command line forwards, as sorted `--flag=VAR` strings. */
 function forwardedContext(line) {
-  return [...line.matchAll(/(--phase-[a-z-]+) "\$\{([A-Z_]+)\}"/g)]
-    .map((match) => `${match[1]}=${match[2]}`)
-    .sort();
+  return [...line.matchAll(FORWARDED_FLAG)].map((m) => `${m[1]}=${m[2] ?? m[3]}`).sort();
+}
+
+/** Placeholders a dispatch neither forwards nor excludes, and exclusions it no longer needs. */
+function contextGaps(line, excluded, names = INTERPOLATION_VAR_NAMES) {
+  const forwarded = forwardedContext(line);
+  return {
+    missing: names.filter((name) => !Object.hasOwn(excluded, name) && !forwarded.includes(contextPair(name))),
+    stale: Object.keys(excluded).filter((name) => !names.includes(name) || forwarded.includes(contextPair(name))),
+  };
 }
 
 describe('check predicate call sites forward their phase context (#4483)', () => {
   for (const site of PREDICATE_DISPATCH_SITES) {
-    test(`${site.point} (${site.file}) forwards exactly ${site.context.join(' ')}`, () => {
-      const line = predicateDispatchLine(site.file, site.marker);
-      assert.deepEqual(forwardedContext(line), [...site.context].sort());
+    test(`${site.point} (${site.file}) forwards every placeholder it does not exclude`, () => {
+      for (const [name, reason] of Object.entries(site.excluded)) {
+        assert.ok(typeof reason === 'string' && reason.trim() !== '', `${site.point}: exclusion ${name} needs a reason`);
+      }
+      assert.deepEqual(contextGaps(soleDispatchLine(site.file), site.excluded), { missing: [], stale: [] });
     });
   }
 
-  test('every workflow that dispatches `check predicate` has a row in the table', () => {
+  test('negative controls: a dropped flag, a stale exclusion and a new placeholder are each reported', () => {
+    const line = soleDispatchLine('gsd-core/workflows/plan-phase.md');
+    const dropped = line.replace(/ --phase-dir "\$\{PHASE_DIR\}"/, '');
+    assert.notEqual(dropped, line, 'the control must actually drop the flag');
+    assert.deepEqual(contextGaps(dropped, {}), { missing: ['PHASE_DIR'], stale: [] });
+    assert.deepEqual(contextGaps(line, { PHASE_DIR: 'control' }), { missing: [], stale: ['PHASE_DIR'] });
+    assert.deepEqual(contextGaps(line, {}, [...INTERPOLATION_VAR_NAMES, 'PHASE_SLUG']), { missing: ['PHASE_SLUG'], stale: [] });
+  });
+
+  test('the dispatch matcher takes every invocation spelling and skips prose that only names it', () => {
+    const spellings = [
+      'GATE_RESULT=$(gsd_run  check\tpredicate --predicate \'{}\' --raw)',
+      'node "$GSD_DIR/bin/gsd-tools.cjs" check predicate --predicate \'{}\'',
+      'gsd-tools check predicate --predicate \'{}\'',
+      '"$GSD_TOOLS" check predicate --predicate \'{}\'',
+    ];
+    for (const line of spellings) assert.ok(isPredicateDispatch(line), `not matched: ${line}`);
+    assert.equal(isPredicateDispatch('the `gsd_run check predicate` subcommand evaluates a gate'), false);
+  });
+
+  test('every shipped predicate dispatch has a row, and every row a dispatch', () => {
     const dispatching = {};
-    for (const entry of fs.readdirSync(WORKFLOWS_DIR, { recursive: true })) {
-      const file = String(entry).split(path.sep).join('/');
-      if (!file.endsWith('.md')) continue;
-      const count = readWorkflow(file).filter((line) => line.includes(PREDICATE_COMMAND)).length;
+    for (const file of shippedMarkdownFiles()) {
+      const count = predicateDispatchLines(file).length;
       if (count > 0) dispatching[file] = count;
     }
     const declared = {};
@@ -476,16 +526,52 @@ describe('check predicate call sites forward their phase context (#4483)', () =>
     assert.deepEqual(sorted(dispatching), sorted(declared));
   });
 
-  // Known gap, split out of #4507 and listed with the other arm-(b) omissions under
-  // #4483 in epic #4909: the part promises a `predicate` form "shown in the block below",
-  // but its only command is the named-query form, so a predicate gate at this point has
-  // no explicit flags. When it gains a predicate command, move it into the table above.
-  test('execute:wave:post has no predicate command yet, only the named-query form', () => {
-    const lines = readWorkflow(WAVE_POST_PART);
-    assert.equal(lines.filter((line) => line.includes(PREDICATE_COMMAND)).length, 0,
+  // Known gap #5290, split out of #4507: the part runs only the named-query form and has no
+  // predicate dispatch of its own. Fixing #5290 adds one, which fails this test and the discovery
+  // test on purpose: then add an execute:wave:post row to the table and delete this test.
+  test('execute:wave:post has no predicate dispatch yet, only the named-query form (#5290)', () => {
+    assert.deepEqual(predicateDispatchLines(WAVE_POST_PART), [],
       'wave-post-gate-hooks.md gained a predicate dispatch: add a row for execute:wave:post');
-    const queryDispatch = lines.filter((line) => line.includes('gsd_run check ${hook.check.query}'));
+    const queryDispatch = readShipped(WAVE_POST_PART).filter((line) => line.includes('gsd_run check ${hook.check.query}'));
     assert.equal(queryDispatch.length, 1, 'expected exactly one named-query dispatch');
     assert.deepEqual(forwardedContext(queryDispatch[0]), []);
   });
+});
+
+// The same dispatch lines, run through the real flag parsing and evaluator in-process: each
+// placeholder a site forwards must reach the command non-empty, and each one it excludes stays
+// empty. This also proves flagFor() names the flag `check predicate` actually reads.
+describe('check predicate call sites resolve their placeholders through the real CLI (#4483)', () => {
+  const SENTINELS = {
+    PHASE_NUMBER: '07',
+    PHASE_DIR: path.join('.planning', 'phases', '07-sentinel'),
+    PHASE_REQ_IDS: 'REQ-01, REQ-02',
+  };
+  let projDir;
+
+  beforeEach(() => {
+    projDir = createTempProject();
+    fs.mkdirSync(path.join(projDir, SENTINELS.PHASE_DIR), { recursive: true });
+  });
+
+  afterEach(() => {
+    cleanup(projDir);
+  });
+
+  for (const site of PREDICATE_DISPATCH_SITES) {
+    test(`${site.point}: forwarded placeholders resolve non-empty, excluded ones stay empty`, () => {
+      const flagArgs = forwardedContext(soleDispatchLine(site.file)).flatMap((pair) => {
+        const [flag, name] = pair.split('=');
+        return [flag, SENTINELS[name]];
+      });
+      for (const name of INTERPOLATION_VAR_NAMES) {
+        assert.ok(Object.hasOwn(SENTINELS, name), `no sentinel value for placeholder ${name}`);
+        const predicate = JSON.stringify({ kind: 'command-exit-zero', command: `test -n "\${${name}}"` });
+        const verdict = evaluateCheckPredicate({ projectDir: projDir, args: ['--predicate', predicate, ...flagArgs, '--raw'] });
+        assert.equal(verdict.failure, undefined, `${site.point}: check predicate failed: ${JSON.stringify(verdict.failure)}`);
+        assert.equal(verdict.block, Object.hasOwn(site.excluded, name),
+          `${site.point}: \${${name}} must be ${Object.hasOwn(site.excluded, name) ? 'empty (excluded)' : 'non-empty'}`);
+      }
+    });
+  }
 });
