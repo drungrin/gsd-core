@@ -888,6 +888,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     const execGit = (args, opts) => {
       const actual = [...args];
       if (args[0] === 'clone') {
+        assert.equal(actual[actual.indexOf('--') + 1], parseSpec(spec).target);
         actual[actual.indexOf('--') + 1] = repo;
         clones.push(actual.at(-1));
       }
@@ -914,7 +915,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     }
     assert.equal(consent.bundleContentHash(promoted.stagedDir), stagedHash, 'same checkout content has a stable hash across real clones');
     assert.equal(promoted.source, f.spec);
-    assert.equal(promoted.integrity, null, 'Git sources remain commit-pinned rather than byte-SRI pinned');
+    assert.equal(promoted.integrity, null, 'Git sources keep their existing null byte-SRI result');
     cleanup(staged.stagedDir);
 
     const consentHome = path.join(f.root, 'consent-home');
