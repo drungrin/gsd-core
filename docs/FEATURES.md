@@ -1296,7 +1296,7 @@ fix(03-01): correct auth token expiry
 - Codex emits `service_tier: flex` for light-tier agents; GSD skills appear in the Codex `/skills` picker via `SKILL.md` (no `agents/openai.yaml` sidecar is emitted — doing so caused duplicate autocomplete entries, #1326)
 
 **Native packaging:**
-- **Claude Code:** GSD Core ships a `.claude-plugin/plugin.json` manifest, enabling installation and lifecycle management via `claude plugin install|enable|disable|update gsd-core`. Commands load under the `/gsd-core:` namespace (e.g. `/gsd-core:plan-phase`), avoiding slash-command collisions with the classic npm installer which uses `/gsd:`. Always-on guard and update hooks are wired automatically via `hooks/hooks.json`. The plugin path is additive — the npm installer (`npx @opengsd/gsd-core`) remains fully supported.
+- **Claude Code:** GSD Core ships a `.claude-plugin/plugin.json` manifest, enabling installation and lifecycle management via `claude plugin install|enable|disable|update gsd-core`. Workflows load as skills under the `/gsd-core:` namespace (e.g. `/gsd-core:gsd-plan-phase`), avoiding slash-command collisions with the classic npm installer which uses `/gsd:`. Each workflow is registered once, as its `gsd-<name>` skill — the same name workflows use to invoke one another — so the always-on listing carries no duplicate entries (#4860). Always-on guard and update hooks are wired automatically via `hooks/hooks.json`. The plugin path is additive — the npm installer (`npx @opengsd/gsd-core`) remains fully supported.
 
 ---
 
@@ -2301,6 +2301,8 @@ Test suite that scans all agent, workflow, and command files for embedded inject
 - REQ-COMMUNITY-02: `gsd-validate-commit.sh` MUST enforce Conventional Commits format on git commit messages
 - REQ-COMMUNITY-03: `gsd-session-state.sh` MUST track session state transitions
 - REQ-COMMUNITY-04: `gsd-phase-boundary.sh` MUST enforce phase boundary checks
+
+**Hosts:** Claude Code and the other settings-file runtimes register these hooks natively. On OpenCode (1.x and 2.x) the GSD plugin runs `gsd-validate-commit.sh` (before `bash`/`shell` calls), `gsd-phase-boundary.sh` (after `write`/`edit`) and `gsd-session-state.sh` (once per session, handed to the model with its first request); `gsd-graphify-update.sh` runs after `bash`/`shell` calls when `graphify.auto_update` is on. Kilo does not run them.
 
 **Config:**
 | Setting | Type | Default | Description |
