@@ -45,6 +45,7 @@ const { execGit: realExecGit } = require('../gsd-core/bin/lib/shell-command-proj
 const { splitLines } = require('../gsd-core/bin/lib/text-lines.cjs');
 const consent = require('../gsd-core/bin/lib/capability-consent.cjs');
 const { git, put } = require('./helpers/gate-positive-control.cjs');
+const { GIT_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
 /** Build a `git ls-remote --tags` style stdout line for a tag. */
 function lsRemoteLine(tag) {
@@ -926,7 +927,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
       contentHash: consent.bundleContentHash(promoted.stagedDir) }), false, 'checkout content remains consent-bound');
     put(promoted.stagedDir, 'skills/git-metadata-skill/SKILL.md', f.files['skills/git-metadata-skill/SKILL.md']);
 
-    const add = realExecGit(['-C', project, 'add', '-A'], { timeout: 15_000 });
+    const add = realExecGit(['-C', project, 'add', '-A'], { timeout: GIT_TIMEOUT_MS });
     assert.equal(add.exitCode, 0, add.stderr);
     assert.doesNotMatch(add.stderr, /embedded git repository/i);
     const entries = splitLines(git(project, 'ls-files', '--stage')).filter(Boolean);
