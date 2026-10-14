@@ -206,6 +206,7 @@ describe('#5297 git adapter — exact pinned target', {
   let env;
   let commits;
   let calls;
+  let retrieved;
   const sourceUrl = 'https://example.com/pinned-cap.git';
 
   function fixtureGit(args) {
@@ -233,9 +234,19 @@ describe('#5297 git adapter — exact pinned target', {
   function localGit(args, opts) {
     calls.push({ args: [...args], timeout: opts?.timeout });
     const localArgs = args.map((arg) => arg === sourceUrl ? pathToFileURL(repo).href : arg);
-    return execGit(localArgs, { ...opts, env: {
+    const result = execGit(localArgs, { ...opts, env: {
       ...env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '.githooks',
     } });
+    if (result.exitCode === 0 && (args.includes('clone') || args.includes('checkout'))) {
+      const cloneDir = args.includes('clone') ? args.at(-1) : args[args.indexOf('-C') + 1];
+      // Inspect the retrieved repository before staging. Staging may strip Git
+      // metadata independently (#5298); the requested worktree is the contract.
+      retrieved = {
+        commit: gitOrThrow(['rev-parse', 'HEAD'], { cwd: cloneDir, env }).trim(),
+        shallow: gitOrThrow(['rev-parse', '--is-shallow-repository'], { cwd: cloneDir, env }).trim(),
+      };
+    }
+    return result;
   }
 
   beforeEach(() => {
@@ -249,6 +260,7 @@ describe('#5297 git adapter — exact pinned target', {
     fs.writeFileSync(config, '');
     env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: config, GIT_TEMPLATE_DIR: template };
     calls = [];
+    retrieved = null;
     fixtureGit(['init', '-b', 'main']);
     fixtureGit(['config', 'user.name', 'Capability fixture']);
     fixtureGit(['config', 'user.email', 'fixture@example.com']);
@@ -280,8 +292,7 @@ describe('#5297 git adapter — exact pinned target', {
       assert.strictEqual(result.integrity, null);
       assert.strictEqual(JSON.parse(fs.readFileSync(path.join(result.stagedDir, 'capability.json'), 'utf8')).version, version);
       assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(result.stagedDir, 'payload.json'), 'utf8')), { payload });
-      assert.strictEqual(gitOrThrow(['rev-parse', 'HEAD'], { cwd: result.stagedDir, env }).trim(), commit);
-      assert.strictEqual(gitOrThrow(['rev-parse', '--is-shallow-repository'], { cwd: result.stagedDir, env }).trim(), 'true');
+      assert.deepStrictEqual(retrieved, { commit, shallow: 'true' });
       assert.strictEqual(fs.existsSync(path.join(result.stagedDir, 'lifecycle-ran')), false);
       assert.strictEqual(fs.existsSync(path.join(result.stagedDir, 'hook-ran')), false, 'inherited relative Git hooks must not execute capability code');
       assert.ok(calls.every(({ timeout }) => timeout > 0 && timeout <= 60_000), 'every retrieval subprocess is bounded');
@@ -313,8 +324,13 @@ describe('#5297 git adapter — exact pinned target', {
   });
 
   test('CONTROL: the tracked hook executes when Git is allowed to use the inherited hook path', () => {
-    fixtureGit(['-c', 'core.hooksPath=.githooks', 'checkout', '--detach', commits.tag]);
-    assert.strictEqual(fs.existsSync(path.join(repo, 'hook-ran')), true, 'the hook suppression fixture must be live');
+    const controlDir = path.join(root, 'control');
+    const result = execGit(['clone', '--depth', '1', '--', pathToFileURL(repo).href, controlDir], {
+      timeout: GIT_FIXTURE_TIMEOUT_MS,
+      env: { ...env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '.githooks' },
+    });
+    assert.strictEqual(result.exitCode, 0, result.stderr);
+    assert.strictEqual(fs.existsSync(path.join(controlDir, 'hook-ran')), true, 'the hook suppression fixture must be live');
   });
 
   test('an unavailable ref rejects without staging the default tip', async () => {
