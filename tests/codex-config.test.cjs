@@ -2131,6 +2131,35 @@ describe('stripGsdFromCodexConfig', () => {
     assert.strictEqual(stripGsdFromCodexConfig(cleaned), cleaned);
   });
 
+  test('#5199: marker and legacy feature text inside user values are preserved', () => {
+    const user = [
+      `literal_marker = ${JSON.stringify(GSD_CODEX_MARKER)}`,
+      'notes = """',
+      GSD_CODEX_MARKER,
+      '# GSD codex_hooks ownership: section',
+      'multi_agent = true',
+      'default_mode_request_user_input = true',
+      '[features]',
+      '[agents.gsd-literal]',
+      '"""',
+      '',
+    ].join('\n');
+    const userTable = '[mcp_servers.user]\nmulti_agent = true\ndefault_mode_request_user_input = true\n';
+    const expected = parseTomlToObject(user + userTable);
+    const content = user + 'features.hooks = true\n' + [
+      GSD_CODEX_MARKER,
+      '# GSD codex_hooks ownership: root_dotted',
+      '[agents]',
+      'max_depth = 1',
+      userTable,
+    ].join('\n');
+    const cleaned = stripGsdFromCodexConfig(content);
+    assert.deepStrictEqual(parseTomlToObject(cleaned), expected, 'only the real managed marker and injected features are removed');
+    assert.ok(cleaned.includes(user), 'literal marker and multiline bytes survive');
+    assert.strictEqual(stripGsdFromCodexConfig(cleaned), cleaned);
+    assert.strictEqual(stripGsdFromCodexConfig(user + userTable), user + userTable, 'literal marker text alone does not create a managed block');
+  });
+
   test('#5199: property: cleanup conserves arbitrary user tables, tuning and line endings', async () => {
     const userText = fc.array(fc.constantFrom('a', 'b', ' ', '-', '_', '0'), { maxLength: 25 }).map((chars) => chars.join(''));
     await fc.assert(fc.property(
@@ -2145,9 +2174,15 @@ describe('stripGsdFromCodexConfig', () => {
           `value = ${JSON.stringify(value)}`,
           `count = ${count}`,
           `enabled = ${enabled}`,
+          'multi_agent = true',
+          'default_mode_request_user_input = true',
           'notes = """',
           '[agents.gsd-literal]',
           'max_depth = 42',
+          'multi_agent = true',
+          'default_mode_request_user_input = true',
+          '[features]',
+          '[user.literal]',
           '"""',
           '',
         ].join(eol));
