@@ -4584,23 +4584,39 @@ function stripCodexGsdAgentSections(content) {
  */
 function stripGsdFromCodexConfig(content) {
   const eol = detectLineEnding(content);
-  const markerIndex = content.indexOf(GSD_CODEX_MARKER);
-  const codexHooksOwnership = getManagedCodexHooksOwnership(content);
+  const lineRecords = getTomlLineRecords(content);
+  const markerRecord = lineRecords.find((record) =>
+    !record.startsInMultilineString && record.text.trim() === GSD_CODEX_MARKER
+  );
+  const codexHooksOwnership = getManagedCodexHooksOwnership(content, markerRecord);
   let cleaned = content;
 
-  if (markerIndex !== -1) {
+  if (markerRecord) {
     // #5199: the marker identifies GSD's block, not ownership of every byte
     // after it. Preserve both sides and let the uninstall section parser remove
     // only managed agents, including legacy entries, below.
-    const after = content.slice(markerIndex)
-      .replace(GSD_CODEX_MARKER, '')
-      .replace(/^\r?\n# GSD codex_hooks ownership: (?:section|root_dotted)\r?\n/, '');
-    cleaned = content.slice(0, markerIndex) + after;
+    const removalRanges = [{ start: markerRecord.start, end: markerRecord.end + markerRecord.eol.length }];
+    if (codexHooksOwnership) {
+      const ownershipRecord = lineRecords[lineRecords.indexOf(markerRecord) + 1];
+      removalRanges.push({ start: ownershipRecord.start, end: ownershipRecord.end + ownershipRecord.eol.length });
+    }
+    cleaned = removeContentRanges(content, removalRanges);
   }
 
   cleaned = stripCodexHooksFeatureAssignments(cleaned, codexHooksOwnership);
-  cleaned = cleaned.replace(/^multi_agent\s*=\s*true\s*(?:\r?\n)?/m, '');
-  cleaned = cleaned.replace(/^default_mode_request_user_input\s*=\s*true\s*(?:\r?\n)?/m, '');
+  // These legacy injected keys belong only to [features]. Identically named
+  // user-table keys and text inside multiline values must survive cleanup.
+  const injectedFeatureRecords = getTomlLineRecords(cleaned).filter((record) => {
+    if (record.startsInMultilineString || record.tableHeader || record.tablePath !== 'features') return false;
+    if (record.keySegments?.length !== 1 ||
+        !['multi_agent', 'default_mode_request_user_input'].includes(record.keySegments[0])) return false;
+    const equalsIndex = findTomlAssignmentEquals(record.text);
+    const commentStart = findTomlCommentStart(record.text);
+    return record.text.slice(equalsIndex + 1, commentStart === -1 ? record.text.length : commentStart).trim() === 'true';
+  });
+  cleaned = removeContentRanges(cleaned, injectedFeatureRecords.map((record) => ({
+    start: record.start, end: findTomlAssignmentBlockEnd(cleaned, record),
+  })));
 
   // #2088: recover user AgentsToml scalars only when the section parser will
   // strip their table. A table with unknown user keys survives in place, so
@@ -4609,7 +4625,7 @@ function stripGsdFromCodexConfig(content) {
   const stripsAgentsTable = agentsSection && codexBareAgentsHasOnlyKnownScalars(cleaned.slice(agentsSection.headerEnd, agentsSection.end));
   const preservedScalars = stripsAgentsTable ? extractCodexUserAgentsScalars(cleaned) : [];
 
-  if (markerIndex !== -1 && agentsSection && !stripsAgentsTable) {
+  if (markerRecord && agentsSection && !stripsAgentsTable) {
     // The managed max_depth can coexist with future user tuning keys. Drop only
     // that assignment, retaining the table and all unknown keys in place.
     const depthRecords = getTomlLineRecords(cleaned).filter((record) =>
@@ -4625,11 +4641,12 @@ function stripGsdFromCodexConfig(content) {
   // Remove [agents.gsd-*] sections + the managed known-scalar [agents] table.
   cleaned = stripCodexGsdAgentSections(cleaned);
 
-  // Remove [features] section if now empty (only header, no keys before next section)
-  cleaned = cleaned.replace(/^\[features\]\s*\n(?=\[|$)/m, '');
-
-  // Remove [agents] section if now empty
-  cleaned = cleaned.replace(/^\[agents\]\s*\n(?=\[|$)/m, '');
+  // Remove truly empty managed tables, never look-alike headers in user strings.
+  const emptySections = getTomlTableSections(cleaned).filter((section) =>
+    !section.array && ['features', 'agents'].includes(section.path) &&
+    cleaned.slice(section.headerEnd, section.end).trim() === ''
+  );
+  cleaned = removeContentRanges(cleaned, emptySections.map(({ start, end }) => ({ start, end })));
 
   cleaned = cleaned.replace(/^(?:\r?\n)+/, '').trimEnd();
 
@@ -5230,14 +5247,13 @@ function stripCodexHooksFeatureAssignments(content, ownership = null) {
   return removeContentRanges(content, removalRanges);
 }
 
-function getManagedCodexHooksOwnership(content) {
-  const markerIndex = content.indexOf(GSD_CODEX_MARKER);
-  if (markerIndex === -1) {
+function getManagedCodexHooksOwnership(content, markerRecord) {
+  if (!markerRecord) {
     return null;
   }
 
-  const afterMarker = content.slice(markerIndex + GSD_CODEX_MARKER.length);
-  const match = afterMarker.match(/^\r?\n# GSD codex_hooks ownership: (section|root_dotted)\r?\n/);
+  const afterMarker = content.slice(markerRecord.end + markerRecord.eol.length);
+  const match = afterMarker.match(/^# GSD codex_hooks ownership: (section|root_dotted)(?:\r?\n|$)/);
   return match ? match[1] : null;
 }
 
