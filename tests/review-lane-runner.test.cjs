@@ -16,6 +16,7 @@ const { execFile } = require('node:child_process');
 const fc = require('fast-check');
 const { createTempDir, cleanup, installSpawnEnv, readFileNormalized, TOOLS_PATH } = require('./helpers.cjs');
 const { GSD_TOOLS_CLI_MODERATE_TIMEOUT_MS, PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+const { runNode, OUTCOME } = require('./helpers/process-seam.cjs');
 
 // The test backstop includes fixture setup and server cleanup beyond the bounded CLI invocation.
 const HTTP_CLI_TEST_TIMEOUT_MS = GSD_TOOLS_CLI_MODERATE_TIMEOUT_MS + PROBE_TIMEOUT_MS;
@@ -813,6 +814,52 @@ describe('#5288 reviewer HTTP redirects', () => {
       assert.equal(r.rawBody, '{}');
     }
   });
+
+  for (const method of ['GET', 'POST']) {
+    test(`real HTTP seam: ${method} redirect remains a failure if body cancellation rejects`, (t) => {
+      const project = createTempDir('review-http-cancel-');
+      t.after(() => cleanup(project));
+      const runDir = path.join(project, 'run');
+      fs.mkdirSync(runDir);
+      fs.writeFileSync(path.join(runDir, 'gsd-review-prompt.md'), 'SYNTHETIC PROMPT');
+      // Inject only fetch's response stream fault in a child; dispatch still builds the real
+      // RunnerDeps and invokes the actual lane. No global mock can leak into neighboring tests.
+      const child = runNode(['-e', `
+        const [toolsPath, project, runDir, redirectMethod] = process.argv.slice(1);
+        let gets = 0;
+        let cancellations = 0;
+        const calls = [];
+        globalThis.fetch = async (url, opts) => {
+          calls.push(opts.method);
+          const redirect = opts.method === redirectMethod && (redirectMethod !== 'GET' || ++gets > 1);
+          return { ok: !redirect, status: redirect ? 307 : 200,
+            body: { cancel: async () => { cancellations++; throw new Error('stream cancellation failed'); } },
+            text: async () => JSON.stringify(opts.method === 'GET'
+              ? { data: [{ id: 'model' }] }
+              : { choices: [{ message: { content: 'NORMAL REVIEW' } }] }) };
+        };
+        const tools = require(toolsPath);
+        const { captureStdoutSyncWrites } = require(require('node:path').join(require('node:path').dirname(toolsPath), 'lib/io.cjs'));
+        captureStdoutSyncWrites(() => tools.dispatchHostCommand({ command: 'review-lane',
+          args: ['review-lane', 'invoke', '--slug', 'ollama', '--run-dir', runDir, '--repo-root', project],
+          cwd: project, raw: true, error: (message) => { throw new Error(message); },
+        })).then((output) => process.stdout.write(JSON.stringify({ result: JSON.parse(output), cancellations, calls })))
+          .catch((error) => { process.stderr.write(error.stack); process.exitCode = 1; });
+      `, TOOLS_PATH, project, runDir, method], {
+        cwd: project, env: installSpawnEnv(), timeoutMs: GSD_TOOLS_CLI_MODERATE_TIMEOUT_MS,
+      });
+      assert.equal(child.outcome, OUTCOME.EXITED, child.stderr);
+      assert.equal(child.exitCode, 0, child.stderr);
+      const observed = JSON.parse(child.stdout);
+      const result = observed.result;
+      assert.equal(observed.cancellations, 1, 'the response cancellation fault must be exercised');
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, 'http_redirect');
+      assert.equal(result.stubbed, true);
+      assert.ok(result.detail.includes('HTTP redirect 307'));
+      assert.deepStrictEqual(observed.calls, method === 'GET' ? ['GET', 'GET'] : ['GET', 'GET', 'POST']);
+    });
+  }
 
   // Async execFile is necessary here: the sync process seam would block the loopback servers'
   // event loop while the child waits for their replies. The real child remains timeout-bounded.
