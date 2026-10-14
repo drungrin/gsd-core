@@ -1312,8 +1312,10 @@ describe('regressions: installed-runtime capability surface (#1160)', () => {
   });
 
   test('_resolveManifest: falls back to installed skills when commandsGsdDir absent', () => {
-    const nonExistentDir = path.join(os.tmpdir(), 'cap-rm-nonexistent-' + Date.now());
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-rm-installed-'));
+    // Keep both source branches inside the fixture. A path directly under
+    // os.tmpdir() lets unrelated gsd-*.md scratch files claim the flat branch.
+    const nonExistentDir = path.join(tmpDir, 'commands', 'gsd');
     try {
       // Create installed skill layout under tmpDir
       const secureDir = path.join(tmpDir, 'skills', 'gsd-secure-phase');
