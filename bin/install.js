@@ -4555,8 +4555,7 @@ function stripCodexGsdAgentSections(content) {
     // GSD's managed `[agents]` scalar block (ADR-1239 upgrade 2 / #2088 — the
     // `max_depth` dispatch-tuning table). Install purges any pre-existing bare
     // `[agents]` and writes its own, so a known-scalar-only bare `[agents]` is
-    // GSD-owned; strip it on uninstall. (The marker path already removes it via
-    // the marker-to-EOF cut; this covers the no-marker fallback.)
+    // GSD-owned; strip it on uninstall, with or without the managed marker.
     if (!section.array && section.path === 'agents') {
       const body = content.slice(section.headerEnd, section.end);
       return codexBareAgentsHasOnlyKnownScalars(body);
@@ -4587,37 +4586,41 @@ function stripGsdFromCodexConfig(content) {
   const eol = detectLineEnding(content);
   const markerIndex = content.indexOf(GSD_CODEX_MARKER);
   const codexHooksOwnership = getManagedCodexHooksOwnership(content);
+  let cleaned = content;
 
   if (markerIndex !== -1) {
-    // Has GSD marker — remove everything from marker to EOF. First recover the
-    // user's own AgentsToml scalars (max_threads etc.) that install folded into
-    // the managed [agents] block (#2088), so a full install→uninstall cycle
-    // round-trips the user's tuning. GSD-managed max_depth is dropped.
-    const preservedScalars = extractCodexUserAgentsScalars(content.slice(markerIndex));
-    let before = content.substring(0, markerIndex);
-    before = stripCodexHooksFeatureAssignments(before, codexHooksOwnership);
-    // Also strip GSD-injected feature keys above the marker (Case 3 inject)
-    before = before.replace(/^multi_agent\s*=\s*true\s*(?:\r?\n)?/m, '');
-    before = before.replace(/^default_mode_request_user_input\s*=\s*true\s*(?:\r?\n)?/m, '');
-    before = before.replace(/^\[features\]\s*\n(?=\[|$)/m, '');
-    before = before.replace(/^\[agents\]\s*\n(?=\[|$)/m, '');
-    before = before.replace(/^(?:\r?\n)+/, '').trimEnd();
-    if (preservedScalars.length > 0) {
-      before = (before ? before + eol + eol : '') + '[agents]' + eol + preservedScalars.join(eol);
-    }
-    if (!before) return null;
-    return before + eol;
+    // #5199: the marker identifies GSD's block, not ownership of every byte
+    // after it. Preserve both sides and let the uninstall section parser remove
+    // only managed agents, including legacy entries, below.
+    const after = content.slice(markerIndex)
+      .replace(GSD_CODEX_MARKER, '')
+      .replace(/^\r?\n# GSD codex_hooks ownership: (?:section|root_dotted)\r?\n/, '');
+    cleaned = content.slice(0, markerIndex) + after;
   }
 
-  // No marker but may have GSD-injected feature keys
-  let cleaned = content;
   cleaned = stripCodexHooksFeatureAssignments(cleaned, codexHooksOwnership);
   cleaned = cleaned.replace(/^multi_agent\s*=\s*true\s*(?:\r?\n)?/m, '');
   cleaned = cleaned.replace(/^default_mode_request_user_input\s*=\s*true\s*(?:\r?\n)?/m, '');
 
-  // #2088: recover the user's own AgentsToml scalars before the [agents] table is
-  // stripped, so they survive uninstall even in the no-marker fallback path.
-  const preservedScalars = extractCodexUserAgentsScalars(cleaned);
+  // #2088: recover user AgentsToml scalars only when the section parser will
+  // strip their table. A table with unknown user keys survives in place, so
+  // restoring its known scalars would create a second [agents] (#5199).
+  const agentsSection = getTomlTableSections(cleaned).find((section) => !section.array && section.path === 'agents');
+  const stripsAgentsTable = agentsSection && codexBareAgentsHasOnlyKnownScalars(cleaned.slice(agentsSection.headerEnd, agentsSection.end));
+  const preservedScalars = stripsAgentsTable ? extractCodexUserAgentsScalars(cleaned) : [];
+
+  if (markerIndex !== -1 && agentsSection && !stripsAgentsTable) {
+    // The managed max_depth can coexist with future user tuning keys. Drop only
+    // that assignment, retaining the table and all unknown keys in place.
+    const depthRecords = getTomlLineRecords(cleaned).filter((record) =>
+      !record.startsInMultilineString && !record.tableHeader &&
+      record.start >= agentsSection.headerEnd && record.start < agentsSection.end &&
+      record.keySegments?.length === 1 && record.keySegments[0] === 'max_depth'
+    );
+    cleaned = removeContentRanges(cleaned, depthRecords.map((record) => ({
+      start: record.start, end: findTomlAssignmentBlockEnd(cleaned, record),
+    })));
+  }
 
   // Remove [agents.gsd-*] sections + the managed known-scalar [agents] table.
   cleaned = stripCodexGsdAgentSections(cleaned);
@@ -5682,9 +5685,8 @@ function migrateCodexHooksMapFormat(content) {
     }
   }
 
-  // Insert flat-AoT conversions before the GSD managed marker (if present) so
-  // the migrated user hooks stay in the "user" portion of the file and are not
-  // swept away when stripGsdFromCodexConfig strips from the marker to EOF.
+  // Insert flat-AoT conversions before the GSD managed marker (if present) to
+  // keep migrated user hooks grouped ahead of the managed config block.
   // If no marker exists, append at the end of the file.
   if (flatAotBlocks.length > 0) {
     const insertionText = flatAotBlocks.join('');
