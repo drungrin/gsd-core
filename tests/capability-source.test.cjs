@@ -307,6 +307,11 @@ describe('#5297 git adapter — exact pinned target', {
     });
   }
 
+  test('#tag: selects the tag when a same-named branch has different content', async () => {
+    fixtureGit(['branch', 'v0.3.0', commits.branch]);
+    await assertTarget('#tag:v0.3.0', '0.3.0', 'annotated tag behind default tip', commits.tag);
+  });
+
   test('#sha:<commit> installs an old commit that is not a remote ref tip', async () => {
     await assertTarget(`#sha:${commits.old}`, '0.1.0', 'old unadvertised commit', commits.old);
   });
