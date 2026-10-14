@@ -1705,7 +1705,12 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
             headers: opts.body ? { 'Content-Type': 'application/json' } : undefined,
             body: opts.body,
             signal: AbortSignal.timeout(opts.timeoutMs),
+            redirect: opts.redirect,
           });
+          if (opts.redirect === 'manual' && res.status >= 300 && res.status < 400) {
+            await res.body?.cancel();
+            return { ok: false, status: res.status, body: '', error: `HTTP redirect ${res.status} refused` };
+          }
           return { ok: res.ok, status: res.status, body: await res.text() };
         } catch (e) {
           return { ok: false, status: 0, body: '', error: e && e.message ? e.message : String(e) };

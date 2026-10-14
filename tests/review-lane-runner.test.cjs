@@ -15,6 +15,10 @@ const http = require('node:http');
 const { execFile } = require('node:child_process');
 const fc = require('fast-check');
 const { createTempDir, cleanup, installSpawnEnv, readFileNormalized, TOOLS_PATH } = require('./helpers.cjs');
+const { GSD_TOOLS_CLI_MODERATE_TIMEOUT_MS, PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+
+// The test backstop includes fixture setup and server cleanup beyond the bounded CLI invocation.
+const HTTP_CLI_TEST_TIMEOUT_MS = GSD_TOOLS_CLI_MODERATE_TIMEOUT_MS + PROBE_TIMEOUT_MS;
 
 const { REVIEWER_LANES } = require('../gsd-core/bin/lib/review-lane-descriptor.cjs');
 const { resolveLanePlan, resolveLaneEffort, LANE_UNAVAILABLE } = require('../gsd-core/bin/lib/review-lane-invocation.cjs');
@@ -776,7 +780,7 @@ describe('#5288 reviewer HTTP redirects', () => {
           assert.equal(r.ok, false, `${method} ${status} must fail`);
           assert.equal(r.reason, 'http_redirect');
           assert.equal(r.stubbed, true);
-          assert.match(r.detail, new RegExp(`HTTP redirect ${status}`));
+          assert.ok(r.detail.includes(`HTTP redirect ${status}`));
           assert.ok(!d.files[p.reviewPath].includes('REDIRECT REVIEW'));
           if (method === 'GET') assert.equal(calls.some((opts) => opts.method === 'POST'), false);
         }
@@ -794,9 +798,20 @@ describe('#5288 reviewer HTTP redirects', () => {
         }));
         assert.equal(r.review, '');
         assert.equal(r.redirected, true);
-        assert.match(r.rawBody, new RegExp(`HTTP redirect ${status}`));
+        assert.ok(r.rawBody.includes(`HTTP redirect ${status}`));
       },
     ), { seed: 42, numRuns: 100 });
+  });
+
+  test('299 and 400 retain the ordinary non-redirect response contract', async () => {
+    const p = plan('ollama', { 'review.models.ollama': 'pinned' });
+    for (const status of [299, 400]) {
+      const r = await runOpenAiCompatible(p, 'SYNTHETIC PROMPT', deps({
+        httpJson: async () => ({ ok: false, status, body: '{}' }),
+      }));
+      assert.equal(r.redirected, undefined);
+      assert.equal(r.rawBody, '{}');
+    }
   });
 
   // Async execFile is necessary here: the sync process seam would block the loopback servers'
@@ -805,7 +820,7 @@ describe('#5288 reviewer HTTP redirects', () => {
     return new Promise((resolve, reject) => {
       execFile(process.execPath, [TOOLS_PATH, 'review-lane', 'invoke', '--slug', 'ollama',
         '--run-dir', runDir, '--repo-root', project, '--raw'], {
-        cwd: project, env: installSpawnEnv(), encoding: 'utf8', timeout: 30_000,
+        cwd: project, env: installSpawnEnv(), encoding: 'utf8', timeout: GSD_TOOLS_CLI_MODERATE_TIMEOUT_MS,
       }, (error, stdout, stderr) => {
         if (error) { reject(new Error(`review-lane invoke failed: ${stderr}`, { cause: error })); return; }
         resolve(JSON.parse(stdout));
@@ -863,13 +878,13 @@ describe('#5288 reviewer HTTP redirects', () => {
 
   for (const method of ['GET', 'POST']) {
     for (const status of [307, 308]) {
-      test(`real CLI: ${method} ${status} never reaches the redirect target`, { timeout: 60_000 }, async (t) => {
+      test(`real CLI: ${method} ${status} never reaches the redirect target`, { timeout: HTTP_CLI_TEST_TIMEOUT_MS }, async (t) => {
         const f = await loopbackFixture(t, { method, status });
         assert.deepStrictEqual(f.targetRequests, []);
         assert.equal(f.result.ok, false);
         assert.equal(f.result.reason, 'http_redirect');
         assert.equal(f.result.stubbed, true);
-        assert.match(f.result.detail, new RegExp(`HTTP redirect ${status}`));
+        assert.ok(f.result.detail.includes(`HTTP redirect ${status}`));
         assert.ok(!f.review.includes('REDIRECT REVIEW'));
         const posts = f.hostRequests.filter((r) => r.method === 'POST');
         if (method === 'GET') assert.deepStrictEqual(posts, []);
@@ -881,7 +896,7 @@ describe('#5288 reviewer HTTP redirects', () => {
     }
   }
 
-  test('real CLI: a non-redirecting host still receives the prompt and returns a review', { timeout: 60_000 }, async (t) => {
+  test('real CLI: a non-redirecting host still receives the prompt and returns a review', { timeout: HTTP_CLI_TEST_TIMEOUT_MS }, async (t) => {
     const f = await loopbackFixture(t);
     assert.deepStrictEqual(f.targetRequests, []);
     assert.equal(f.result.ok, true);
