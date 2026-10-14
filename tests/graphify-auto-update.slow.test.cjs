@@ -804,6 +804,24 @@ describe('auto-update', () => {
       }
     }
 
+    for (const command of [
+      'gsd_run query\ncommit "docs: plan" --files .planning/STATE.md',
+      'gsd_run\nquery commit "docs: plan" --files .planning/STATE.md',
+      'not_gsd_run query commit "docs: plan" --files .planning/STATE.md',
+      'other-gsd-tools.cjs query commit "docs: plan" --files .planning/STATE.md',
+      'gsd-toolsXcjs query commit "docs: plan" --files .planning/STATE.md',
+    ]) {
+      test(`does not dispatch for a split command or different executable: ${JSON.stringify(command)}`, (t) => {
+        const tmpDir = createTempGitRepo({ config: { graphify: { enabled: true, auto_update: true } } });
+        t.after(() => cleanupHookRepo(tmpDir));
+        const mockBin = makeMockGraphifyBin(tmpDir);
+        const result = runHook(tmpDir, { tool_name: 'Bash', tool_input: { command } }, { pathPrepend: mockBin });
+        assert.strictEqual(result.status, 0);
+        assert.ok(!fs.existsSync(path.join(tmpDir, '.planning/graphs/.last-build-status.json')),
+          'only a complete invocation of an accepted executable may dispatch');
+      });
+    }
+
     test('commit-like suffixes never dispatch across runtime spellings (property)', async (t) => {
       const tmpDir = createTempGitRepo({ config: { graphify: { enabled: true, auto_update: true } } });
       t.after(() => cleanupHookRepo(tmpDir));
