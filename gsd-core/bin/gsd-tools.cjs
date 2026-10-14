@@ -1708,7 +1708,8 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
             redirect: opts.redirect,
           });
           if (opts.redirect === 'manual' && res.status >= 300 && res.status < 400) {
-            await res.body?.cancel();
+            // Cleanup is best-effort; a stream fault must not erase the known redirect status.
+            try { await res.body?.cancel(); } catch { /* retain the redirect refusal */ }
             return { ok: false, status: res.status, body: '', error: `HTTP redirect ${res.status} refused` };
           }
           return { ok: res.ok, status: res.status, body: await res.text() };
