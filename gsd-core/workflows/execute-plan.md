@@ -460,7 +460,7 @@ if [ "$IS_WORKTREE" != "true" ]; then
   TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
   DURATION=$(tail -n 1 "$TIMING_FILE.result") || exit 1
   gsd_run query state.record-metric \
-    --phase "${PHASE}" --plan "${PLAN}" --duration "${DURATION}" \
+    --phase "{phase}" --plan "{plan}" --duration "${DURATION}" \
     --tasks "${TASK_COUNT}" --files "${FILE_COUNT}"
 fi
 ```
