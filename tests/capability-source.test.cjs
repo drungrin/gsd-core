@@ -887,7 +887,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     const clones = [];
     const execGit = (args, opts) => {
       const actual = [...args];
-      if (args[0] === 'clone') {
+      if (args.includes('clone')) {
         assert.equal(actual[actual.indexOf('--') + 1], parseSpec(spec).target);
         actual[actual.indexOf('--') + 1] = repo;
         clones.push(actual.at(-1));
