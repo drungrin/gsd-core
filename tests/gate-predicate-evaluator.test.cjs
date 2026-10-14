@@ -13,12 +13,22 @@
  *
  * Per RULESET.TESTS.boundary-coverage: exit code boundary (0/1/2), timedOut
  * true/false, message-trim boundary (MAX / MAX+1), timeout pass-through.
- * Per RULESET.TESTS.property-based: interpolation bijection property (fast-check).
+ * Per RULESET.TESTS.property-based-testing: command identity and environment round-trip properties (fast-check).
  */
 
 const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
 const fc = require('fast-check');
+const fs = require('node:fs');
+const path = require('node:path');
+const { createTempProject, cleanup, runGsdTools } = require('./helpers.cjs');
+const { runHook } = require('./helpers/process-seam.cjs');
+const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+const { buildPredicateDeps } = require('../gsd-core/bin/lib/gate-predicate.cjs');
+
+const NO_SH = process.platform === 'win32' || runHook('-c', ['exit 0'], {
+  interpreter: 'sh', timeoutMs: PROBE_TIMEOUT_MS,
+}).exitCode !== 0;
 
 const {
   evaluatePredicate,
@@ -160,41 +170,57 @@ describe('evaluatePredicate — command-exit-zero timeout', () => {
   });
 });
 
-// ─── interpolation ────────────────────────────────────────────────────────────
+// ─── phase context transport ──────────────────────────────────────────────────
 
-describe('evaluatePredicate — interpolation', () => {
-  test('${PHASE_DIR}, ${PHASE_NUMBER}, ${PHASE_REQ_IDS} are substituted', () => {
+describe('evaluatePredicate — phase context environment', () => {
+  test('phase values are environment data and command text is unchanged', () => {
     const shell = fakeShell({ exitCode: 0 });
+    const command = 'check "$GSD_GATE_PHASE_DIR" "$GSD_GATE_PHASE_NUMBER" "$GSD_GATE_PHASE_REQ_IDS" ${HOME} $PHASE_DIR';
     evaluatePredicate(
-      { kind: 'command-exit-zero', command: 'check ${PHASE_DIR} ${PHASE_NUMBER} ${PHASE_REQ_IDS}' },
+      { kind: 'command-exit-zero', command },
       baseCtx,
       { runBoundedShell: shell.run },
     );
-    assert.equal(
-      shell.calls[0].command,
-      'check /proj/.planning/phases/03-x 03 R-1',
-    );
+    assert.equal(shell.calls[0].command, command);
+    assert.deepEqual(shell.calls[0].env, {
+      GSD_GATE_PHASE_NUMBER: baseCtx.phaseNumber,
+      GSD_GATE_PHASE_DIR: baseCtx.phaseDir,
+      GSD_GATE_PHASE_REQ_IDS: baseCtx.phaseReqIds,
+    });
   });
 
-  test('undefined context var => empty string (no leftover placeholder)', () => {
+  test('missing phase values are explicit empty environment values', () => {
     const shell = fakeShell({ exitCode: 0 });
     evaluatePredicate(
-      { kind: 'command-exit-zero', command: 'check ${PHASE_REQ_IDS}' },
+      { kind: 'command-exit-zero', command: 'check "$GSD_GATE_PHASE_REQ_IDS"' },
       { cwd: '/proj' },
       { runBoundedShell: shell.run },
     );
-    assert.equal(shell.calls[0].command, 'check ');
+    assert.deepEqual(shell.calls[0].env, {
+      GSD_GATE_PHASE_NUMBER: '', GSD_GATE_PHASE_DIR: '', GSD_GATE_PHASE_REQ_IDS: '',
+    });
   });
 
-  test('foreign ${HOME} placeholder left untouched (shell interprets)', () => {
-    const shell = fakeShell({ exitCode: 0 });
-    evaluatePredicate(
-      { kind: 'command-exit-zero', command: 'echo ${HOME}' },
-      baseCtx,
-      { runBoundedShell: shell.run },
-    );
-    assert.equal(shell.calls[0].command, 'echo ${HOME}');
-  });
+  for (const name of ['PHASE_NUMBER', 'PHASE_DIR', 'PHASE_REQ_IDS']) {
+    for (const quote of ['', "'", '"']) {
+      test(`legacy \${${name}} in ${quote || 'unquoted'} command is rejected before execution`, () => {
+        const shell = fakeShell({ exitCode: 0 });
+        assert.throws(
+          () => evaluatePredicate(
+            { kind: 'command-exit-zero', command: 'check ' + quote + '${' + name + '}' + quote },
+            baseCtx,
+            { runBoundedShell: shell.run },
+          ),
+          (err) => {
+            assert.ok(err.message.includes('${' + name + '}'));
+            assert.ok(err.message.includes('$GSD_GATE_' + name));
+            return true;
+          },
+        );
+        assert.deepEqual(shell.calls, []);
+      });
+    }
+  }
 });
 
 // ─── output trimming ──────────────────────────────────────────────────────────
@@ -313,40 +339,127 @@ describe('evaluatePredicate — exported contract surface', () => {
   });
 });
 
-// ─── property-based: interpolation bijection on non-placeholder strings ───────
+// ─── properties: command identity and context round-trip ───────────────────────
 
-describe('evaluatePredicate — interpolation property (fast-check)', () => {
-  test('strings without the 3 placeholders pass through unchanged', () => {
-    fc.assert(
-      fc.property(
-        fc.string({ maxLength: 40 }).filter((s) => s.trim().length > 0 && !/\$\{(PHASE_NUMBER|PHASE_DIR|PHASE_REQ_IDS)\}/.test(s)),
-        (cmd) => {
+describe('evaluatePredicate — phase transport properties (fast-check)', () => {
+  test('accepted commands are byte-for-byte identical regardless of context', () => {
+    fc.assert(fc.property(
+      fc.string({ minLength: 1, maxLength: 80 }).filter((s) => s.trim().length > 0 && !/\$\{(PHASE_NUMBER|PHASE_DIR|PHASE_REQ_IDS)\}/.test(s)),
+      fc.option(fc.string({ maxLength: 80 }), { nil: undefined }),
+      fc.option(fc.string({ maxLength: 80 }), { nil: undefined }),
+      fc.option(fc.string({ maxLength: 80 }), { nil: undefined }),
+      (command, phaseNumber, phaseDir, phaseReqIds) => {
         const shell = fakeShell({ exitCode: 0 });
         evaluatePredicate(
-          { kind: 'command-exit-zero', command: cmd },
-          baseCtx,
+          { kind: 'command-exit-zero', command },
+          { cwd: '/proj', phaseNumber, phaseDir, phaseReqIds },
           { runBoundedShell: shell.run },
         );
-        // sh -c receives exactly the input; only the 3 known placeholders would have been rewritten.
-        assert.equal(shell.calls[0].command, cmd);
-      }),
-      { numRuns: 100 },
-    );
+        assert.equal(shell.calls[0].command, command);
+        assert.deepEqual(shell.calls[0].env, {
+          GSD_GATE_PHASE_NUMBER: phaseNumber ?? '',
+          GSD_GATE_PHASE_DIR: phaseDir ?? '',
+          GSD_GATE_PHASE_REQ_IDS: phaseReqIds ?? '',
+        });
+      },
+    ), { numRuns: 100 });
+  });
+});
+
+// ─── published CLI and actual bounded shell ────────────────────────────────────
+
+describe('check predicate — literal phase data through the CLI', { skip: NO_SH ? 'requires a POSIX host with sh on PATH' : false }, () => {
+  for (const name of ['11-$(touch PWNED)-x', '11-`touch PWNED2`-x', "11-o'brien", '11-double"quote', '11-$(touch PWNED)-`touch PWNED2`-\'"']) {
+    test(`phase directory ${name} reaches argv literally without substitution side effects`, () => {
+      const dir = createTempProject('gate-phase-env-');
+      try {
+        const phaseDir = path.join(dir, '.planning', 'phases', name);
+        fs.mkdirSync(phaseDir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'check.cjs'), `
+          const fs = require('node:fs');
+          const expected = [process.env.EXPECTED_DIR, process.env.EXPECTED_NUMBER, process.env.EXPECTED_IDS];
+          const actual = process.argv.slice(2);
+          process.exitCode = JSON.stringify(actual) === JSON.stringify(expected)
+            && fs.statSync(actual[0]).isDirectory()
+            && process.env.INHERITED_GATE_SENTINEL === 'inherited' ? 0 : 8;
+        `);
+        const phaseNumber = '11-$(touch NUMBER_PWNED)-\'"';
+        const phaseReqIds = 'R-1 `touch IDS_PWNED` $(touch IDS_PWNED2) \'"';
+        const command = 'node check.cjs "$GSD_GATE_PHASE_DIR" "$GSD_GATE_PHASE_NUMBER" "$GSD_GATE_PHASE_REQ_IDS"';
+        const result = runGsdTools([
+          'check', 'predicate', '--predicate', JSON.stringify({ kind: 'command-exit-zero', command }),
+          '--phase-dir', path.relative(dir, phaseDir), '--phase-number', phaseNumber, '--phase-req-ids', phaseReqIds,
+        ], dir, {
+          EXPECTED_DIR: fs.realpathSync(phaseDir), EXPECTED_NUMBER: phaseNumber, EXPECTED_IDS: phaseReqIds,
+          INHERITED_GATE_SENTINEL: 'inherited', GSD_GATE_PHASE_DIR: 'ambient-wrong-value',
+        });
+        assert.equal(result.exitCode, 0, result.output);
+        const payload = JSON.parse(result.output);
+        assert.equal(payload.block, false, JSON.stringify(payload));
+        assert.equal(payload.details.exitCode, 0);
+        for (const marker of ['PWNED', 'PWNED2', 'NUMBER_PWNED', 'IDS_PWNED', 'IDS_PWNED2']) {
+          assert.equal(fs.existsSync(path.join(dir, marker)), false, marker);
+        }
+      } finally { cleanup(dir); }
+    });
+  }
+
+  test('absent context overwrites inherited gate values with empty data', () => {
+    const dir = createTempProject('gate-phase-empty-');
+    try {
+      const result = runGsdTools(['check', 'predicate', '--predicate', JSON.stringify({
+        kind: 'command-exit-zero', command: 'test "$GSD_GATE_PHASE_DIR$GSD_GATE_PHASE_NUMBER$GSD_GATE_PHASE_REQ_IDS" = ""',
+      })], dir, { GSD_GATE_PHASE_DIR: 'old-dir', GSD_GATE_PHASE_NUMBER: 'old-number', GSD_GATE_PHASE_REQ_IDS: 'old-ids' });
+      assert.equal(result.exitCode, 0);
+      assert.equal(JSON.parse(result.output).block, false);
+    } finally { cleanup(dir); }
   });
 
-  test('every placeholder is fully replaced (no leftover ${PHASE_*})', () => {
-    fc.assert(
-      fc.property(fc.string({ maxLength: 20 }), (noise) => {
-        const cmd = `${noise} ${noise}`;
-        const shell = fakeShell({ exitCode: 0 });
-        evaluatePredicate(
-          { kind: 'command-exit-zero', command: `\${PHASE_DIR}${cmd}\${PHASE_NUMBER}` },
-          baseCtx,
-          { runBoundedShell: shell.run },
-        );
-        assert.doesNotMatch(shell.calls[0].command, /\$\{PHASE_(DIR|NUMBER|REQ_IDS)\}/);
-      }),
-      { numRuns: 100 },
-    );
+  test('real command failures and shell spawn errors remain blocking predicate results', () => {
+    const dir = createTempProject('gate-phase-outcome-');
+    try {
+      const predicate = JSON.stringify({ kind: 'command-exit-zero', command: 'exit 3' });
+      const failed = runGsdTools(['check', 'predicate', '--predicate', predicate], dir);
+      assert.equal(failed.exitCode, 0, 'a negative verdict is a successful check dispatch');
+      assert.equal(JSON.parse(failed.output).block, true);
+      assert.equal(JSON.parse(failed.output).details.exitCode, 3);
+      const missing = runGsdTools(['check', 'predicate', '--predicate', predicate], dir, { PATH: '' });
+      assert.equal(missing.exitCode, 0);
+      assert.equal(JSON.parse(missing.output).block, true);
+      assert.equal(JSON.parse(missing.output).details.exitCode, 127);
+    } finally { cleanup(dir); }
   });
+
+  test('actual timeout is distinguished from a command terminating itself', () => {
+    const dir = createTempProject('gate-phase-timeout-');
+    try {
+      const deps = buildPredicateDeps();
+      // Fixture timeout: a busy shell has no background descendants; the tiny budget forces its own timeout.
+      const EXPIRING_TIMEOUT_SECONDS = 0.025;
+      const timedOut = evaluatePredicate({ kind: 'command-exit-zero', command: 'while :; do :; done', timeout: EXPIRING_TIMEOUT_SECONDS }, { cwd: dir }, deps);
+      assert.equal(timedOut.block, true);
+      assert.equal(timedOut.details.timedOut, true);
+      const terminated = evaluatePredicate({ kind: 'command-exit-zero', command: 'kill -TERM $$' }, { cwd: dir }, deps);
+      assert.equal(terminated.block, true);
+      assert.equal(terminated.details.exitCode, 1, 'execTool maps a signal-only termination to exit 1');
+      assert.equal(terminated.details.signal, 'SIGTERM');
+      assert.equal(terminated.details.timedOut, undefined);
+    } finally { cleanup(dir); }
+  });
+});
+
+test('check predicate rejects old context spellings as usage errors before shell side effects', () => {
+  const dir = createTempProject('gate-phase-legacy-');
+  try {
+    for (const name of ['PHASE_DIR', 'PHASE_NUMBER', 'PHASE_REQ_IDS']) {
+      const result = runGsdTools(['check', 'predicate', '--predicate', JSON.stringify({
+        kind: 'command-exit-zero', command: 'touch SHOULD_NOT_RUN; echo "${' + name + '}"',
+      })], dir, { GSD_JSON_ERRORS: '1', GSD_EXIT_CONTRACT: 'v2' });
+      assert.equal(result.exitCode, 64);
+      const diagnostic = JSON.parse(result.error);
+      assert.equal(diagnostic.reason, 'usage');
+      assert.ok(diagnostic.message.includes('$GSD_GATE_' + name));
+      assert.equal(fs.existsSync(path.join(dir, 'SHOULD_NOT_RUN')), false);
+    }
+  } finally { cleanup(dir); }
 });
