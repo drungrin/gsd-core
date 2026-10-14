@@ -11,6 +11,10 @@ const path = require('node:path');
 const { runGsdTools, createTempDir, cleanup } = require('./helpers.cjs');
 const fc = require('./helpers/fast-check-setup.cjs');
 const { MODEL_ALIAS_MAP, RUNTIME_PROFILE_MAP } = require('../gsd-core/bin/lib/model-catalog.cjs');
+const { PROJECT_MODEL_OMIT_WARNING } = require('../gsd-core/bin/lib/model-resolver.cjs');
+const { runNode, OUTCOME } = require('./helpers/process-seam.cjs');
+const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+const { TOOLS_PATH, TEST_ENV_BASE } = require('./helpers.cjs');
 
 describe('#2840 — runtime from defaults.json must not poison project config', () => {
   let tmpDir;
@@ -147,6 +151,27 @@ describe('#5329 — shared omit must not become explicit project model intent', 
       assert.equal(resolve('gsd-executor', runtime).model, RUNTIME_PROFILE_MAP[runtime].sonnet.model);
     });
   }
+
+  test('existing project CLI resolution warns without either creation command rewriting its config', () => {
+    fs.mkdirSync(path.join(project, '.planning'));
+    const configPath = path.join(project, '.planning', 'config.json');
+    const bytes = Buffer.from('{\n    "resolve_model_ids": "omit",\n    "model_profile": "balanced"\n}\n');
+    fs.writeFileSync(configPath, bytes);
+    for (const args of [['config-new-project', '{"resolve_model_ids":false}'], ['config-ensure-section']]) {
+      const result = runGsdTools(args, project, env);
+      assert.equal(result.exitCode, 0, result.error);
+      assert.equal(JSON.parse(result.output).created, false);
+      assert.deepEqual(fs.readFileSync(configPath), bytes);
+    }
+    const result = runNode([TOOLS_PATH, 'query', 'resolve-model', 'gsd-executor'], {
+      cwd: project, env: { ...process.env, ...TEST_ENV_BASE, ...env }, timeoutMs: PROBE_TIMEOUT_MS,
+    });
+    assert.equal(result.outcome, OUTCOME.EXITED);
+    assert.equal(result.exitCode, 0);
+    assert.equal(JSON.parse(result.stdout).model, '');
+    assert.equal(result.stderr, PROJECT_MODEL_OMIT_WARNING.message + '\n');
+    assert.deepEqual(fs.readFileSync(configPath), bytes);
+  });
 
   test('seeding preserves every explicit JSON choice and excludes only exact shared omit', async () => {
     await fc.assert(fc.property(
