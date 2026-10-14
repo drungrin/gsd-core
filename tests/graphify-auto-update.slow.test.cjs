@@ -1,5 +1,4 @@
 'use strict';
-// allow-test-rule: source-text-is-the-product — feed the shipped launcher to the hook as a Bash payload.
 
 // Tests for graphify.cjs — auto-update describe block.
 // Split from the consolidated 2336-LOC file. Refs #3761.
