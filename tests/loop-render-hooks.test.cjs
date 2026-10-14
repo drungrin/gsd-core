@@ -878,7 +878,7 @@ describe('renderLoopHooks', () => {
     };
     const rendered = renderLoopHooks(resolved);
     assert.match(rendered, /Step 1/);
-    assert.match(rendered, /skill:ui-phase/);
+    assert.match(rendered, /skill:gsd-ui-phase/);
     assert.match(rendered, /\(ui\)/);
     assert.match(rendered, /UI-SPEC\.md/);
     assert.match(rendered, /CONTEXT\.md/);
