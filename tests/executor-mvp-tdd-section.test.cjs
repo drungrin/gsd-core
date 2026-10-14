@@ -62,7 +62,7 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
       // Intercept only the state mutation to inspect the actual named arguments.
       'gsd_run() { if [ "$2" = state.record-metric ]; then node -e \'const a=process.argv.slice(1);process.stdout.write(JSON.stringify({duration:a[a.indexOf("--duration")+1]})+"\\n")\' "$@"; fi; }',
       code.replaceAll('"{phase}"', shellQuote(phase)).replaceAll('"{plan}"', shellQuote(plan)),
-      ...(expose ? ['node -e \'process.stdout.write(JSON.stringify({file:process.argv[1]})+"\\n")\' "${PLAN_TIMING_FILE:-}"'] : []),
+      ...(expose ? ['node -e \'process.stdout.write(JSON.stringify({file:process.argv[1]})+"\\n")\' "${TIMING_FILE:-}"'] : []),
     ].join('\n');
     const result = runHook('-c', [script], {
       interpreter: 'bash', cwd: dir, timeoutMs: PROBE_TIMEOUT_MS,
@@ -88,8 +88,10 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
           try {
             runFresh(dir, start(), 1000);
             const measured = runFresh(dir, finish(), 1000 + minutes * 60);
-            assert.equal(measured.duration, duration);
-            assert.equal(measured.started, '1970-01-01T00:16:40Z');
+            assert.deepEqual(measured, {
+              duration, started: '1970-01-01T00:16:40Z',
+              completed: new Date((1000 + minutes * 60) * 1000).toISOString().replace('.000Z', 'Z'),
+            });
           } finally { cleanup(dir); }
         });
       }
@@ -100,17 +102,17 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
           runFresh(dir, start(), 1000);
           runFresh(dir, start(), 1000 + 30 * 60);
           const summary = runFresh(dir, finish(), 1000 + 59 * 60 + 59);
-          assert.equal(summary.duration, '59 min');
+          assert.deepEqual(summary, { duration: '59 min', started: '1970-01-01T00:16:40Z', completed: '1970-01-01T01:16:39Z' });
           const metric = runFresh(dir, timingFence(surface.file, surface.metric, surface.step), 1000 + 61 * 60);
-          assert.equal(metric.duration, summary.duration);
+          assert.deepEqual(metric, { duration: summary.duration });
           // More work after an unsuccessful close-out must refresh completion,
           // while the original start remains the same on a continuation.
           runFresh(dir, start(), 1000 + 62 * 60);
           const resumed = runFresh(dir, finish(), 1000 + 63 * 60);
-          assert.equal(resumed.duration, '1h 3m');
+          assert.deepEqual(resumed, { duration: '1h 3m', started: '1970-01-01T00:16:40Z', completed: '1970-01-01T01:19:40Z' });
           assert.equal(resumed.started, summary.started);
           const resumedMetric = runFresh(dir, timingFence(surface.file, surface.metric, surface.step), 1000 + 64 * 60);
-          assert.equal(resumedMetric.duration, resumed.duration);
+          assert.deepEqual(resumedMetric, { duration: resumed.duration });
         } finally { cleanup(dir); }
       });
 
@@ -118,12 +120,11 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
         const dir = fixture();
         try {
           runFresh(dir, start(), 1000);
-          assert.equal(runFresh(dir, finish(), 1000 + 61 * 60).duration, '1h 1m');
+          assert.deepEqual(runFresh(dir, finish(), 1000 + 61 * 60), { duration: '1h 1m', started: '1970-01-01T00:16:40Z', completed: '1970-01-01T01:17:40Z' });
           runFresh(dir, timingFence(surface.file, surface.clear, surface.step), 1000 + 62 * 60);
           runFresh(dir, start(), 10000);
           const rerun = runFresh(dir, finish(), 10000 + 60);
-          assert.equal(rerun.duration, '1 min');
-          assert.equal(rerun.started, '1970-01-01T02:46:40Z');
+          assert.deepEqual(rerun, { duration: '1 min', started: '1970-01-01T02:46:40Z', completed: '1970-01-01T02:47:40Z' });
         } finally { cleanup(dir); }
       });
 
@@ -143,8 +144,8 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
           const linked = path.join(dir, 'linked');
           gitOrThrow(['worktree', 'add', '-qb', 'linked', linked], { cwd: dir, timeoutMs: GIT_FIXTURE_TIMEOUT_MS });
           runFresh(linked, start(), 10000, identities[0]);
-          assert.equal(runFresh(linked, finish(), 10060, identities[0]).duration, '1 min');
-          assert.equal(runFresh(dir, finish(), 4660, identities[0]).duration, '1h 1m');
+          assert.deepEqual(runFresh(linked, finish(), 10060, identities[0]), { duration: '1 min', started: '1970-01-01T02:46:40Z', completed: '1970-01-01T02:47:40Z' });
+          assert.deepEqual(runFresh(dir, finish(), 4660, identities[0]), { duration: '1h 1m', started: '1970-01-01T00:16:40Z', completed: '1970-01-01T01:17:40Z' });
         } finally { cleanup(dir); }
       });
 
@@ -153,12 +154,27 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
           const dir = fixture();
           try {
             runFresh(dir, start(), 1000);
-            const { duration } = runFresh(dir, finish(), 1000 + seconds);
+            const measured = runFresh(dir, finish(), 1000 + seconds);
             const minutes = Math.floor(seconds / 60);
             const expected = minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-            assert.equal(duration, expected);
+            assert.deepEqual(measured, {
+              duration: expected, started: '1970-01-01T00:16:40Z',
+              completed: new Date((1000 + seconds) * 1000).toISOString().replace('.000Z', 'Z'),
+            });
           } finally { cleanup(dir); }
         }), { numRuns: 20, seed: 5212 });
+      });
+
+      test('Git lookup failures and missing starts stop without creating timing files', () => {
+        const dir = fixture();
+        try {
+          const initial = fs.readdirSync(dir);
+          assert.throws(() => runFresh(dir, 'git() { if [ "$1" = rev-parse ]; then return 23; fi; command git "$@"; }\n' + start(), 1000), (error) => error.exitCode === 1);
+          assert.throws(() => runFresh(dir, 'git() { if [ "$1" = hash-object ]; then return 23; fi; command git "$@"; }\n' + start(), 1000), (error) => error.exitCode === 1);
+          assert.throws(() => runFresh(dir, finish(), 1000), (error) => error.exitCode === 1);
+          assert.deepEqual(fs.readdirSync(dir), initial);
+          assert.equal(fs.readdirSync(path.join(dir, '.git')).filter((entry) => entry.startsWith('gsd-plan-timing-')).length, 0);
+        } finally { cleanup(dir); }
       });
     });
   }
