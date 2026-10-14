@@ -876,6 +876,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
       'tests/dev.cjs': 'throw new Error("install must not execute this file");\n',
       'hooks/dev.cjs': 'throw new Error("install must not execute this file");\n',
       '.github/workflows/dev.yml': 'name: development\n',
+      '.gitattributes': '* -text\n',
       '.gitignore': '*.tmp\n',
     };
     for (const [rel, bytes] of Object.entries(files)) put(repo, rel, bytes);
@@ -917,7 +918,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
 
     const consentHome = path.join(f.root, 'consent-home');
     consent.recordProjectConsent({ gsdHome: consentHome, projectRoot: project, id: f.cap.id,
-      integrity: null, disclosureSignature: 'fixture-disclosure', contentHash: stagedHash });
+      integrity: promoted.integrity ?? '', disclosureSignature: 'fixture-disclosure', contentHash: stagedHash });
     assert.ok(consent.hasProjectConsent({ gsdHome: consentHome, projectRoot: project, id: f.cap.id,
       contentHash: consent.bundleContentHash(promoted.stagedDir) }));
     put(promoted.stagedDir, 'skills/git-metadata-skill/SKILL.md', 'Changed instructions\n');
