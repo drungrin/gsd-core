@@ -116,7 +116,7 @@ function makeTempProject(prefix = 'gsd-model-resolver-test-') {
 
     for (const runtime of ['codex', 'opencode']) {
       test(`${runtime} preserves its model path and does not emit the Claude omit diagnostic`, () => {
-        withConfig({ runtime: 'claude', resolve_model_ids: 'omit' }, runtime, writes => {
+        withConfig({ resolve_model_ids: 'omit' }, runtime, writes => {
           assert.equal(resolver.resolveModelInternal(project, 'gsd-executor'), RUNTIME_PROFILE_MAP[runtime].sonnet.model);
           assert.deepEqual(writes, []);
         });

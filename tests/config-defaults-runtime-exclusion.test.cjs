@@ -150,7 +150,7 @@ describe('#5329 — shared omit must not become explicit project model intent', 
 
   test('seeding preserves every explicit JSON choice and excludes only exact shared omit', async () => {
     await fc.assert(fc.property(
-      fc.jsonValue(), fc.jsonValue(), fc.boolean(),
+      fc.oneof(fc.constant('omit'), fc.jsonValue()), fc.jsonValue(), fc.boolean(),
       (sharedValue, choiceValue, explicit) => {
         const cwd = path.join(root, `property-${iteration++}`);
         fs.mkdirSync(cwd);
