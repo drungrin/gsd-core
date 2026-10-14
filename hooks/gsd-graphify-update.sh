@@ -74,8 +74,9 @@ if [ "$TOOL_NAME" = "Shell" ]; then TOOL_NAME="Bash"; fi
 
 # Gate 2 — shell-direct git op or the runtime's exact `query commit` verb.
 # Match quoted .cjs paths as well as the launcher, anywhere in a multiline
-# payload. The verb boundary excludes commit-to-subrepo and other suffixes.
-QUERY_COMMIT_PATTERN="(^|[[:space:]/\"'])(gsd_run|gsd-tools(\.cjs)?)[\"']?[[:space:]]+query[[:space:]]+commit([[:space:];&|]|$)"
+# payload. Blank separators keep tokens on one command line; the verb boundary
+# excludes commit-to-subrepo and other suffixes.
+QUERY_COMMIT_PATTERN="(^|[[:space:]/\"'])(gsd_run|gsd-tools(\.cjs)?)[\"']?[[:blank:]]+query[[:blank:]]+commit([[:space:];&|]|$)"
 case "$COMMAND" in
   *"git commit"*|*"git merge"*|*"git pull"*|*"git rebase --continue"*|*"git cherry-pick"*) ;;
   *) [[ "$COMMAND" =~ $QUERY_COMMIT_PATTERN ]] || exit 0 ;;
