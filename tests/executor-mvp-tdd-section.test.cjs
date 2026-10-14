@@ -15,13 +15,15 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
 // executor continuations and the inline execute-plan workflow actually do.
 {
   const fc = require('fast-check');
-  const { scanFencedBlocks } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
+  const { scanFencedBlocks, collectSection } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
+  const { parseMarkdownTable } = require('../gsd-core/bin/lib/markdown-table.cjs');
   const { splitLines } = require('../gsd-core/bin/lib/text-lines.cjs');
   const { runHook, OUTCOME } = require('./helpers/process-seam.cjs');
   const { gitOrThrow, throwIfFailed } = require('./helpers/git-fixture.cjs');
   const { PROBE_TIMEOUT_MS, GIT_FIXTURE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
   const { createTempDir, cleanup } = require('./helpers.cjs');
   const WORKFLOW = path.join(__dirname, '..', 'gsd-core', 'workflows', 'execute-plan.md');
+  const TOOLS = path.join(__dirname, '..', 'gsd-core', 'bin', 'gsd-tools.cjs');
   const NO_BASH = process.platform === 'win32' || runHook('-c', ['exit 0'], {
     interpreter: 'bash', timeoutMs: PROBE_TIMEOUT_MS,
   }).outcome === OUTCOME.SPAWN_FAILED;
@@ -52,21 +54,26 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
     return dir;
   }
 
-  function runFresh(dir, code, epoch, identity = ['03', '01'], expose = false) {
+  function runFresh(dir, code, epoch, identity = ['03', '01'], expose = false, realCli = false) {
     const [phase, plan] = identity;
     const script = [
       'set -e',
-      `PHASE=${shellQuote(phase)}; PLAN=${shellQuote(plan)}; TASK_COUNT=2; FILE_COUNT=3`,
+      'unset PHASE PLAN; TASK_COUNT=2; FILE_COUNT=3',
       // Pin date at the shell boundary; parent mock.timers cannot reach Bash.
       'date() { if [ "$*" = +%s ]; then printf "%s\\n" "$FIXTURE_EPOCH"; else printf "%s\\n" "$FIXTURE_ISO"; fi; }',
       // Intercept only the state mutation to inspect the actual named arguments.
-      'gsd_run() { if [ "$2" = state.record-metric ]; then node -e \'const a=process.argv.slice(1);process.stdout.write(JSON.stringify({duration:a[a.indexOf("--duration")+1]})+"\\n")\' "$@"; fi; }',
+      realCli ? 'gsd_run() { node "$FIXTURE_TOOLS" "$@"; }' :
+        'gsd_run() { if [ "$2" = state.record-metric ]; then node -e \'const a=process.argv.slice(1);process.stdout.write(JSON.stringify({duration:a[a.indexOf("--duration")+1]})+"\\n")\' "$@"; fi; }',
       code.replaceAll('"{phase}"', shellQuote(phase)).replaceAll('"{plan}"', shellQuote(plan)),
       ...(expose ? ['node -e \'process.stdout.write(JSON.stringify({file:process.argv[1]})+"\\n")\' "${TIMING_FILE:-}"'] : []),
     ].join('\n');
     const result = runHook('-c', [script], {
       interpreter: 'bash', cwd: dir, timeoutMs: PROBE_TIMEOUT_MS,
-      env: { ...process.env, FIXTURE_EPOCH: String(epoch), FIXTURE_ISO: new Date(epoch * 1000).toISOString().replace('.000Z', 'Z') },
+      env: {
+        ...process.env, FIXTURE_TOOLS: TOOLS,
+        FIXTURE_EPOCH: String(epoch), FIXTURE_ISO: new Date(epoch * 1000).toISOString().replace('.000Z', 'Z'),
+        GSD_TEST_MODE: '1', GSD_NOW_MS: String(epoch * 1000),
+      },
     });
     throwIfFailed(result, 'fresh timing shell');
     const stdout = result.stdout;
@@ -174,6 +181,35 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
           assert.throws(() => runFresh(dir, finish(), 1000), (error) => error.exitCode === 1);
           assert.deepEqual(fs.readdirSync(dir), initial);
           assert.equal(fs.readdirSync(path.join(dir, '.git')).filter((entry) => entry.startsWith('gsd-plan-timing-')).length, 0);
+        } finally { cleanup(dir); }
+      });
+
+      test('the real metric CLI records the measured result without PHASE or PLAN in its fresh shell', () => {
+        const dir = fixture();
+        const identity = ['[GSD/M3]P2', '01'];
+        try {
+          fs.mkdirSync(path.join(dir, '.planning'));
+          const statePath = path.join(dir, '.planning', 'STATE.md');
+          fs.writeFileSync(statePath, [
+            '# Project State', '', '## Performance Metrics', '',
+            '| Plan | Duration | Tasks | Files |', '|------|----------|-------|-------|', '',
+          ].join('\n'));
+          runFresh(dir, start(), 1000, identity);
+          const summary = runFresh(dir, finish(), 1000 + 59 * 60 + 59, identity);
+          const lines = splitLines(timingFence(surface.file, surface.metric, surface.step));
+          const begin = lines.findIndex((line) => line.trimStart().startsWith('TIMING_KEY='));
+          const call = lines.findIndex((line) => line.trimStart().startsWith('gsd_run query state.record-metric'));
+          assert.ok(begin !== -1 && call > begin, 'metric shell must restore its cached duration before the real CLI call');
+          let end = call;
+          while (lines[end].trimEnd().endsWith('\\')) end++;
+          const metricCode = lines.slice(begin, end + 1).join('\n');
+          const metric = runFresh(dir, metricCode, 1000 + 61 * 60, identity, false, true);
+          assert.deepEqual(metric, { recorded: true, phase: identity[0], plan: identity[1], duration: summary.duration });
+          const section = collectSection(fs.readFileSync(statePath, 'utf8'), (heading) => heading.text === 'Performance Metrics');
+          assert.ok(section, 'real CLI must preserve the metrics section');
+          const table = parseMarkdownTable(section.body);
+          assert.equal(table.ok, true);
+          assert.deepEqual(table.value.rows, [{ Plan: 'Phase [GSD/M3]P2 P01', Duration: summary.duration, Tasks: '2 tasks', Files: '3 files' }]);
         } finally { cleanup(dir); }
       });
     });
