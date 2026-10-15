@@ -6,7 +6,7 @@
  * Spec: docs/superpowers/specs/2026-06-27-gsd-smart-entry-design.md
  *
  * Covers: all 11 situations, priority ordering (paused beats blocked), JSON
- * shape invariants (exactly one recommended, commands are /gsd:* slash forms),
+ * shape invariants (exactly one recommended, commands are /gsd-* slash forms),
  * and the --json / human output modes.
  */
 
@@ -224,7 +224,7 @@ describe('smart-entry: idle-stranded (git-dependent)', () => {
     const actions = smartEntry.actionsFor(situation, forced);
     assert.equal(actions[0].id, 'ship');
     assert.equal(actions[0].recommended, true);
-    assert.equal(actions[0].command, '/gsd:ship');
+    assert.equal(actions[0].command, '/gsd-ship');
   });
 });
 
@@ -387,7 +387,7 @@ describe('smart-entry: in-project advancement delegates to the gated engine', ()
   // is what got the old flat /gsd-next removed (#3054). The specific command
   // (execute-phase / plan-phase / verify-work) stays as an explicit secondary.
   for (const situation of ['planning', 'executing', 'verify-pending']) {
-    test(`${situation}: recommended action is /gsd:progress --next`, () => {
+    test(`${situation}: recommended action is /gsd-progress --next`, () => {
       const signals = {
         current_phase: 2, total_phases: 5, status: situation, progress: 40,
         has_planning: true, has_roadmap: true, git_dirty: false, git_unpushed: false,
@@ -396,19 +396,19 @@ describe('smart-entry: in-project advancement delegates to the gated engine', ()
       const actions = smartEntry.actionsFor(situation, signals);
       const recommended = actions.filter((a) => a.recommended);
       assert.equal(recommended.length, 1, 'exactly one recommended action');
-      assert.equal(recommended[0].command, '/gsd:progress --next');
+      assert.equal(recommended[0].command, '/gsd-progress --next');
     });
   }
 
   // Remediation / lifecycle situations are OFF the linear advance path — they
   // keep direct specific recommendations (their distinct value over --next).
   const DIRECT = {
-    'no-project': '/gsd:new-project',
-    paused: '/gsd:resume-work',
-    blocked: '/gsd:debug',
-    'verify-failed': '/gsd:verify-work',
-    'idle-stranded': '/gsd:ship',
-    complete: '/gsd:new-milestone',
+    'no-project': '/gsd-new-project',
+    paused: '/gsd-resume-work',
+    blocked: '/gsd-debug',
+    'verify-failed': '/gsd-verify-work',
+    'idle-stranded': '/gsd-ship',
+    complete: '/gsd-new-milestone',
   };
   for (const [situation, command] of Object.entries(DIRECT)) {
     test(`${situation}: keeps its direct recommendation (${command})`, () => {
@@ -435,14 +435,14 @@ describe('smart-entry: per-situation action invariants (all 11)', () => {
     paused: false, blockers: [], has_git: true, verify_failed: false, stale_activity: false,
   };
   for (const situation of SITUATIONS) {
-    test(`${situation}: exactly one recommended, 1-4 unique-id /gsd:* actions`, () => {
+    test(`${situation}: exactly one recommended, 1-4 unique-id /gsd-* actions`, () => {
       const actions = smartEntry.actionsFor(situation, sampleSignals);
       assert.ok(actions.length >= 1 && actions.length <= 4, `${situation}: 1-4 actions (got ${actions.length})`);
       assert.equal(actions.filter((a) => a.recommended).length, 1, `${situation}: exactly one recommended`);
       const ids = actions.map((a) => a.id);
       assert.equal(new Set(ids).size, ids.length, `${situation}: action ids are unique`);
       for (const a of actions) {
-        assert.ok(a.command.startsWith('/gsd:'), `${situation}/${a.id}: command is a /gsd: slash form`);
+        assert.ok(a.command.startsWith('/gsd-'), `${situation}/${a.id}: command is a /gsd- slash form`);
       }
     });
   }
@@ -451,7 +451,7 @@ describe('smart-entry: per-situation action invariants (all 11)', () => {
 describe('smart-entry: JSON shape invariants', () => {
   afterEach(removeAll);
 
-  test('every situation yields exactly one recommended action and /gsd:* commands', () => {
+  test('every situation yields exactly one recommended action and /gsd-* commands', () => {
     const dirs = [
       track(makeProject()),                                            // no-project
       track(makeProject({ state: state({ status: 'planning', paused_at: '2026-06-01T00:00:00Z' }), roadmap: true })), // paused
@@ -466,7 +466,7 @@ describe('smart-entry: JSON shape invariants', () => {
       assert.equal(recommended.length, 1, `${result.situation}: exactly one recommended`);
       assert.equal(recommended[0].id, result.recommended, `${result.situation}: recommended id matches`);
       for (const a of result.actions) {
-        assert.ok(a.command.startsWith('/gsd:'), `${result.situation}/${a.id}: command is a slash form`);
+        assert.ok(a.command.startsWith('/gsd-'), `${result.situation}/${a.id}: command is a slash form`);
       }
       assert.ok(result.summary.length > 0, `${result.situation}: summary non-empty`);
       assert.ok(result.actions.length >= 1 && result.actions.length <= 4, `${result.situation}: 1-4 actions`);
@@ -499,7 +499,7 @@ describe('smart-entry: CLI dispatch (gsd-tools smart-entry)', () => {
     const j = JSON.parse(r.stdout);
     assert.equal(j.situation, 'no-project');
     assert.equal(j.recommended, 'new-project');
-    assert.equal(j.actions[0].command, '/gsd:new-project');
+    assert.equal(j.actions[0].command, '/gsd-new-project');
   });
 
   test('default (human) mode prints a plain summary line, not JSON', () => {
@@ -1243,5 +1243,70 @@ describe('#3099: unusable last_activity emits a diagnostic', () => {
     detectSignals(dir);
     assert.equal(_unusableInputEmissionCountForTests(), 1,
       'dedup: second call on the same source must not re-emit');
+  });
+});
+
+// #5228: a milestone that continues the numbering of an earlier one (phases 9-17) printed the raw
+// phase number as the ordinal ("Phase 9 of 9") and, without a Progress table, reached "complete"
+// as soon as the phase NUMBER reached the phase COUNT.
+describe('smart-entry: continued milestone numbering (#5228)', () => {
+  afterEach(removeAll);
+
+  const phaseHeadings = (ids) => ids.map((id) => `### Phase ${id}: Work ${id}\n\nGoal.\n`).join('\n');
+  const roadmapFor = (ids) => `# Roadmap\n\n## Milestone v2.0\n\n${phaseHeadings(ids)}`;
+  const range = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+  const project = (ids, stateOpts) =>
+    track(makeProject({ state: state(stateOpts), roadmap: roadmapFor(ids) }));
+
+  test('planning at the first of phases 9-17 reads "Phase 1 of 9"', () => {
+    const dir = project(range(9, 17), { status: 'planning', current_phase: 9, total_phases: 9 });
+    const out = classifyProject(dir);
+    assert.equal(out.situation, 'planning');
+    assert.equal(out.summary, 'Phase 1 of 9 — needs a plan');
+  });
+
+  test('executing and ready-to-verify lines use the same ordinal', () => {
+    const exec = classifyProject(project(range(9, 17), { status: 'executing', current_phase: 11, total_phases: 9, progress: 40 }));
+    assert.equal(exec.summary, 'Phase 3 of 9 · 40% · executing');
+    const verify = classifyProject(project(range(9, 17), { status: 'needs-review', current_phase: 17, total_phases: 9 }));
+    assert.equal(verify.summary, 'Phase 9 of 9 · ready to verify');
+  });
+
+  test('phase 9 complete with 1 of 9 done is not classified complete', () => {
+    const dir = project(range(9, 17), { status: 'phase complete', current_phase: 9, total_phases: 9, completed_phases: 1 });
+    assert.notEqual(classifyProject(dir).situation, 'complete');
+  });
+
+  test('boundary: phase 16 complete is not complete, phase 17 complete is', () => {
+    const at16 = project(range(9, 17), { status: 'complete', current_phase: 16, total_phases: 9 });
+    assert.notEqual(classifyProject(at16).situation, 'complete');
+    const at17 = project(range(9, 17), { status: 'complete', current_phase: 17, total_phases: 9 });
+    assert.equal(classifyProject(at17).situation, 'complete');
+  });
+
+  test('a plain milestone numbered from 1 is unchanged', () => {
+    const dir = project(range(1, 5), { status: 'planning', current_phase: 2, total_phases: 5 });
+    assert.equal(classifyProject(dir).summary, 'Phase 2 of 5 — needs a plan');
+  });
+
+  test('zero-based numbering keeps its ordinal position', () => {
+    const dir = project([0, 1, 2], { status: 'planning', current_phase: 1, total_phases: 3 });
+    assert.equal(classifyProject(dir).summary, 'Phase 2 of 3 — needs a plan');
+  });
+
+  test('dotted decimal phase ids sort into their position', () => {
+    const dir = project(['9', '9.1', '10'], { status: 'planning', current_phase: '9.1', total_phases: 3 });
+    assert.equal(classifyProject(dir).summary, 'Phase 2 of 3 — needs a plan');
+  });
+
+  test('a current phase missing from the roadmap falls back to the STATE.md figures', () => {
+    const dir = project(range(9, 17), { status: 'planning', current_phase: 40, total_phases: 9 });
+    assert.equal(classifyProject(dir).summary, 'Phase 40 of 9 — needs a plan');
+  });
+
+  test('a roadmap that lists no phases keeps the raw STATE.md figures', () => {
+    const dir = track(makeProject({ state: state({ status: 'planning', current_phase: 2, total_phases: 5 }), roadmap: true }));
+    assert.equal(classifyProject(dir).summary, 'Phase 2 of 5 — needs a plan');
   });
 });
