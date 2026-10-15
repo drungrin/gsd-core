@@ -32,7 +32,7 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
     return "'" + value.replaceAll("'", "'\\''") + "'";
   }
 
-  function timingFence(file, tag, step = false) {
+  function timingFence(file, tag, step = false, followPart = true) {
     // allow-test-rule: source-text-is-the-product (#5212)
     // The agent/workflow is the deployed timing program; execute its real fence.
     const source = fs.readFileSync(file, 'utf8');
@@ -44,6 +44,12 @@ const REF = path.join(__dirname, '..', 'gsd-core', 'references', 'execute-mvp-td
     assert.ok(end > start, `${tag} must close`);
     const lines = splitLines(source.slice(start + opening.length, end));
     const fence = scanFencedBlocks(lines).find((block) => block.infoString === 'bash');
+    if (!fence && followPart) {
+      // A spine step may delegate to a workflow part; execute the part it names.
+      const part = /`(gsd-core\/workflows\/[^`]+\.md)`/.exec(lines.join('\n'));
+      assert.ok(part, `${tag} must have a Bash fence or name the workflow part that carries it`);
+      return timingFence(path.join(__dirname, '..', part[1]), tag, step, false);
+    }
     assert.ok(fence && fence.closeLineIdx !== -1, `${tag} must have a complete Bash fence`);
     return lines.slice(fence.openLineIdx + 1, fence.closeLineIdx).join('\n');
   }
