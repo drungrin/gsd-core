@@ -28,6 +28,14 @@ breadcrumb bookkeeping.
 | WARNING | <= 35% | Wrap up current task, avoid starting new complex work |
 | CRITICAL | <= 25% | Stop immediately, save state (`/gsd-pause-work`) |
 
+"Remaining" is measured to the point where Claude Code auto-compacts, not to the
+end of the model window — the same scale as the statusline's context bar (#4985).
+That point is the auto-compact window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else the
+`autoCompactWindow` setting `/autocompact` saves, per model under `modelSettings` or
+top-level, else the model window) minus the 33k auto-compact buffer `/context` shows,
+lowered further when `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` sets an earlier point. With
+auto-compact off, it is the model window.
+
 ### Tuning the fire-points
 
 35 and 25 are defaults, not fixed points. How much runway "35% remaining" buys
@@ -49,7 +57,7 @@ file is in the managed-hooks registry, so the next install re-stages the
 vendored body and the edit is gone without a conflict or a warning. A config key
 survives by construction.
 
-Both keys are optional and both are percentages of context window **remaining**,
+Both keys are optional and both are percentages of context **remaining** before auto-compaction,
 so a *larger* number fires *earlier*. Absent keys resolve to the defaults above,
 which is what every existing project gets.
 
@@ -164,11 +172,21 @@ The bridge file is a simple JSON object:
 ```json
 {
   "session_id": "abc123",
-  "remaining_percentage": 28.5,
+  "remaining_percentage": 29,
   "used_pct": 71,
+  "used_tokens": 438070,
+  "threshold_tokens": 617000,
   "timestamp": 1708200000
 }
 ```
+
+`used_pct` and `remaining_percentage` add to 100 and are percentages of
+`threshold_tokens`: the auto-compact threshold, or the model window when
+auto-compact is off. `used_tokens` is the count `/context` shows, taken from the
+payload's `current_usage`; before the first response, when the payload has no
+`current_usage`, it is estimated from Claude Code's percentage. The two token
+fields are absent when the statusline payload has no `context_window_size`; the
+percentages are then Claude Code's own, against the model window.
 
 ## Integration with GSD
 
@@ -186,6 +204,30 @@ As a brief reference: the statusline hook registers as `statusLine` in `settings
 - It never blocks tool execution — a broken monitor should not break the agent's workflow
 - Stale metrics (older than 60s) are ignored
 - Missing bridge files are handled gracefully (subagents, fresh sessions)
+
+### Supported hosts (#4840)
+
+The monitor only works on a host that also installs the statusline hook, because
+the statusline is the sole writer of the bridge file. GSD wires that writer for
+Claude Code alone, so Claude Code is the only host that registers the monitor
+on the tool-completion event (`PostToolUse` / `AfterTool`), the registration
+that emits warnings. The extended lifecycle events some hosts declare
+(`SubagentStop`, `Stop`, `PreCompact`, `SubagentStart`) keep their existing
+wiring. Every other host declares `context-warnings` unsupported in its capability
+descriptor (`hostBehaviors.unsupportedFeatures`) — Codex, Antigravity, Augment,
+CodeBuddy, Hermes, Qwen, Kimi and Kimi Code — and the installer does not register
+the tool-event monitor there: a registered monitor with no writer would fire on every tool
+event, find no file and exit silently, with nothing to tell the user it can never
+warn. Reinstalling on such a host removes a monitor registration left by an
+earlier install and leaves any hook you wrote yourself in place. The install log
+says so in one line. A host with its own statusline can gain support by wiring a
+bridge writer and dropping the declaration.
+
+The debounce counter (`callsSinceWarn`, written on `PreCompact`) is a
+read-modify-write that assumes one session's hooks run one at a time. That is
+verified for Claude Code, the only host the tool-event monitor is registered on; it is the
+reason the assumption does not need to hold for other hosts, and a host that
+later gains the monitor must verify it first.
 - A compaction is never blocked by this hook: if the per-session state cannot be
   removed (a held file handle on Windows, for instance) the hook *attempts* to
   truncate the file to empty in place — which later reads treat exactly like an

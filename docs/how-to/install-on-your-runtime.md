@@ -86,7 +86,7 @@ claude plugin install gsd-core
 
 **Command namespace**
 
-Plugin commands are namespaced as `/gsd-core:<command>` — for example, `/gsd-core:plan-phase`. This is distinct from the classic npm/file-copy installer, which exposes commands as `/gsd:<command>`. Use whichever namespace corresponds to your install method.
+Plugin workflows are skills, namespaced as `/gsd-core:gsd-<command>` — for example, `/gsd-core:gsd-plan-phase`. Each workflow is registered once, so `claude plugin details gsd-core` lists 72 skills with no duplicates (#4860). This is distinct from the classic npm/file-copy installer, which exposes commands as `/gsd:<command>`. Use whichever namespace corresponds to your install method. If you used the earlier `/gsd-core:<command>` spelling (for example `/gsd-core:plan-phase`), switch to `/gsd-core:gsd-<command>`.
 
 **Lifecycle**
 
@@ -178,6 +178,8 @@ GSD registers the following Codex hook event automatically on install (requires 
 | `SessionStart` | `gsd-check-update.js` | Update check at session open; Windows installs also emit a `commandWindows` field pointing to the `.cmd` shim so Codex picks the correct executor on Windows without requiring per-OS config regeneration |
 
 **Context warnings are not supported on Codex (#2586).** Earlier revisions of GSD also registered `SubagentStart`/`Stop`/`PostToolUse` (plus, briefly, six more events) against `gsd-context-monitor.js` for context-headroom tracking. That hook only produces a warning by reading a remaining-context-percentage bridge file that `gsd-statusline.js` — Claude Code's own statusline mechanism — writes; Codex never installs a statusline writer, so every one of those registrations fired as a guaranteed silent no-op, every invocation, with no exceptions. GSD no longer copies or registers `gsd-context-monitor.js` on a fresh Codex install; a reinstall over an older GSD install removes the stale registrations and the now-unreferenced script automatically. Agent-facing context warnings and GSD phase/lifecycle display remain unsupported capabilities on Codex (see `capabilities/codex/capability.json`) until a real metrics producer exists for this runtime — native Codex `/statusline` configuration is a separate, not-yet-implemented surface.
+
+**Codex on Windows finds Node when the hook runs (#4838).** The `.cmd` shim does not depend on the install-time `node.exe` path alone: a Node upgrade that removes that versioned directory (WinGet does) no longer breaks the hook until you re-run the installer. The shim uses the first of these that exists: `GSD_NODE_PATH` (set it to an absolute `node.exe` to override), the path the installer found, then `node.exe` on `PATH`. The `PATH` lookup never searches the current directory. If none exists the hook fails as it did before.
 
 All registered hooks are managed by GSD and are removed cleanly on `--uninstall`.
 
