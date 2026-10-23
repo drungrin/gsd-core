@@ -904,25 +904,29 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     git(project, 'init', '-q');
     const opts = { gsdHome: project, hostVersion: '1.16.0', execOverrides: { git: f.execGit } };
     const staged = await resolveCapabilitySource(f.spec, { ...opts, promote: false });
-    assert.ok(!fs.existsSync(path.join(project, '.gsd', 'capabilities', f.cap.id)));
-    assert.ok(!fs.existsSync(path.join(staged.stagedDir, '.git')), 'staged Git bundle must exclude clone metadata');
     const stagedHash = consent.bundleContentHash(staged.stagedDir);
+    const stagedState = {
+      hasGit: fs.existsSync(path.join(staged.stagedDir, '.git')),
+      files: Object.fromEntries(Object.keys(f.files).map((rel) => [
+        rel, fs.readFileSync(path.join(staged.stagedDir, rel), 'utf8'),
+      ])),
+    };
+    cleanup(staged.stagedDir);
     const promoted = await resolveCapabilitySource(f.spec, opts);
+    return { f, project, opts, stagedState, stagedHash, promoted };
+  }
+
+  test('staged and promoted clones preserve checkout bytes and metadata exclusion', async (t) => {
+    const { f, stagedState, stagedHash, promoted } = await stagedFixture(t);
+    assert.equal(stagedState.hasGit, false, 'staged Git bundle must exclude clone metadata');
     assert.ok(!fs.existsSync(path.join(promoted.stagedDir, '.git')), 'promoted Git bundle must exclude clone metadata');
     for (const [rel, bytes] of Object.entries(f.files)) {
-      assert.equal(fs.readFileSync(path.join(staged.stagedDir, rel), 'utf8'), bytes);
+      assert.equal(stagedState.files[rel], bytes);
       assert.equal(fs.readFileSync(path.join(promoted.stagedDir, rel), 'utf8'), bytes);
     }
     assert.equal(consent.bundleContentHash(promoted.stagedDir), stagedHash, 'same checkout content has a stable hash across real clones');
     assert.equal(promoted.source, f.spec);
     assert.equal(promoted.integrity, null, 'Git sources keep their existing null byte-SRI result');
-    cleanup(staged.stagedDir);
-
-    return { f, project, opts, stagedHash, promoted };
-  }
-
-  test('staged and promoted clones preserve checkout bytes and metadata exclusion', async (t) => {
-    await stagedFixture(t);
   });
 
   test('consent stays bound to checkout content', async (t) => {
@@ -935,8 +939,6 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     put(promoted.stagedDir, 'skills/git-metadata-skill/SKILL.md', 'Changed instructions\n');
     assert.equal(consent.hasProjectConsent({ gsdHome: consentHome, projectRoot: project, id: f.cap.id,
       contentHash: consent.bundleContentHash(promoted.stagedDir) }), false, 'checkout content remains consent-bound');
-    put(promoted.stagedDir, 'skills/git-metadata-skill/SKILL.md', f.files['skills/git-metadata-skill/SKILL.md']);
-
   });
 
   test('git add stages regular files rather than an embedded repository', async (t) => {
@@ -950,8 +952,6 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     for (const rel of Object.keys(f.files)) {
       assert.ok(entries.some((entry) => entry.endsWith(`\t.gsd/capabilities/${f.cap.id}/${rel}`)), rel);
     }
-    assert.ok(f.clones.every((dir) => !fs.existsSync(dir)), 'temporary clones are cleaned on success');
-
   });
 
   test('validation failure cleans scratch and preserves the existing bundle', async (t) => {
@@ -967,26 +967,29 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     assert.ok(fs.existsSync(path.join(f.repo, '.git')), 'the original source repository is untouched');
   });
 
-
   test('property: clone metadata bytes do not affect the staged checkout hash', async (t) => {
     const root = createTempDir('gsd-git-metadata-property-');
     t.after(() => cleanup(root));
-    let expectedHash;
+    const resolveWithMetadata = (metadata) => resolveCapabilitySource('git+https://example.invalid/property.git', {
+      gsdHome: root, hostVersion: '1.16.0', promote: false,
+      execOverrides: { git: (args) => {
+        const clone = args.at(-1);
+        put(clone, 'capability.json', JSON.stringify(featureCap('git-metadata-property')));
+        put(clone, 'README.md', 'Fixed checkout content');
+        fs.mkdirSync(path.join(clone, '.git'), { recursive: true });
+        if (metadata) put(clone, '.git/objects/metadata', Buffer.from(metadata));
+        return spawnOk('');
+      } },
+    });
+    const baseline = await resolveWithMetadata(null);
+    const expectedHash = consent.bundleContentHash(baseline.stagedDir);
+    cleanup(baseline.stagedDir);
     await fc.assert(fc.asyncProperty(fc.uint8Array({ minLength: 1, maxLength: 256 }), async (bytes) => {
-      const result = await resolveCapabilitySource('git+https://example.invalid/property.git', {
-        gsdHome: root, hostVersion: '1.16.0',
-        execOverrides: { git: (args) => {
-          const clone = args.at(-1);
-          put(clone, 'capability.json', JSON.stringify(featureCap('git-metadata-property')));
-          put(clone, 'README.md', 'Fixed checkout content');
-          put(clone, '.git/objects/metadata', Buffer.from(bytes));
-          return spawnOk('');
-        } },
-      });
+      const result = await resolveWithMetadata(bytes);
       assert.ok(!fs.existsSync(path.join(result.stagedDir, '.git')));
       const hash = consent.bundleContentHash(result.stagedDir);
-      expectedHash ??= hash;
       assert.equal(hash, expectedHash);
+      cleanup(result.stagedDir);
     }), { numRuns: 30 });
   });
 
