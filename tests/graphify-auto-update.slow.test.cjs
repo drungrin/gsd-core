@@ -740,6 +740,12 @@ describe('auto-update', () => {
       ['quoted node entrypoint', () => 'node "$HOME/.claude/gsd-core/bin/gsd-tools.cjs" query commit "docs: complete plan" --files .planning/STATE.md'],
       ['single-quoted node entrypoint', () => "node '/tmp/GSD install/gsd-tools.cjs' query commit 'docs: complete plan' --files .planning/STATE.md"],
       ['commit at end of command', () => 'gsd_run query commit'],
+      ...[';', '&&', '|', '(', '$(', '`', '\\'].map((prefix) => [
+        `left shell boundary ${prefix}`, () => `${prefix}gsd_run query commit`,
+      ]),
+      ...[')', '}', '>', '"', "'"].map((suffix) => [
+        `right shell boundary ${suffix}`, () => `gsd_run query commit${suffix}`,
+      ]),
     ];
 
     for (const [name, command] of runtimeCommands) {
@@ -789,7 +795,7 @@ describe('auto-update', () => {
     }
 
     for (const launcher of ['gsd_run', 'gsd-tools', 'node "$HOME/.claude/gsd-core/bin/gsd-tools.cjs"']) {
-      for (const verb of ['config-get graphify.enabled', 'phase.complete 1', 'commit-to-subrepo "docs: plan" --files packages/foo']) {
+      for (const verb of ['commi', 'commits', 'config-get graphify.enabled', 'phase.complete 1', 'commit-to-subrepo "docs: plan" --files packages/foo']) {
         test(`does not dispatch for ${launcher} query ${verb}`, (t) => {
           const tmpDir = createTempGitRepo({ config: { graphify: { enabled: true, auto_update: true } } });
           t.after(() => cleanupHookRepo(tmpDir));
