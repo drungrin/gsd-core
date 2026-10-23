@@ -8,13 +8,12 @@ const { describe, test, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { runGsdTools, createTempDir, cleanup } = require('./helpers.cjs');
+const { runGsdTools, createTempDir, cleanup, TOOLS_PATH, TEST_ENV_BASE } = require('./helpers.cjs');
 const fc = require('./helpers/fast-check-setup.cjs');
 const { MODEL_ALIAS_MAP, RUNTIME_PROFILE_MAP } = require('../gsd-core/bin/lib/model-catalog.cjs');
 const { PROJECT_MODEL_OMIT_WARNING } = require('../gsd-core/bin/lib/model-resolver.cjs');
 const { runNode, OUTCOME } = require('./helpers/process-seam.cjs');
 const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
-const { TOOLS_PATH, TEST_ENV_BASE } = require('./helpers.cjs');
 
 describe('#2840 — runtime from defaults.json must not poison project config', () => {
   let tmpDir;
@@ -100,10 +99,14 @@ describe('#5329 — shared omit must not become explicit project model intent', 
 
   function seed(defaults, command, choices = {}, cwd = project) {
     fs.writeFileSync(path.join(store, '.gsd', 'defaults.json'), JSON.stringify(defaults));
-    const args = command === 'config-new-project' ? [command, JSON.stringify(choices)] : [command];
+    const args = command === 'config-new-project'
+      ? [command, JSON.stringify(choices)]
+      : command === 'config-set-model-profile' ? [command, 'balanced'] : [command];
     const result = runGsdTools(args, cwd, env);
     assert.equal(result.exitCode, 0, result.error);
-    assert.equal(JSON.parse(result.output).created, true);
+    const response = JSON.parse(result.output);
+    if (command === 'config-set-model-profile') assert.equal(response.updated, true);
+    else assert.equal(response.created, true);
     return JSON.parse(fs.readFileSync(path.join(cwd, '.planning', 'config.json'), 'utf8'));
   }
 
@@ -113,7 +116,7 @@ describe('#5329 — shared omit must not become explicit project model intent', 
     return JSON.parse(result.output);
   }
 
-  for (const command of ['config-new-project', 'config-ensure-section']) {
+  for (const command of ['config-new-project', 'config-ensure-section', 'config-set-model-profile']) {
     for (const runtime of [undefined, 'codex', 'opencode']) {
       test(`${command} excludes shared omit with runtime=${runtime ?? 'absent'} and resolves Claude tiers`, () => {
         const defaults = { resolve_model_ids: 'omit', model_profile: 'balanced' };
@@ -169,7 +172,7 @@ describe('#5329 — shared omit must not become explicit project model intent', 
     assert.equal(result.outcome, OUTCOME.EXITED);
     assert.equal(result.exitCode, 0);
     assert.equal(JSON.parse(result.stdout).model, '');
-    assert.equal(result.stderr, PROJECT_MODEL_OMIT_WARNING.message + '\n');
+    assert.equal(result.stderr, PROJECT_MODEL_OMIT_WARNING + '\n');
     assert.deepEqual(fs.readFileSync(configPath), bytes);
   });
 
@@ -191,6 +194,9 @@ describe('#5329 — shared omit must not become explicit project model intent', 
         assert.equal(Object.hasOwn(config, 'runtime'), false);
         assert.deepEqual(JSON.parse(fs.readFileSync(path.join(store, '.gsd', 'defaults.json'), 'utf8')), defaults);
       },
+    // Fixed cases above own the sentinel matrix. Forty isolated CLI runs retain
+    // seeded arbitrary-JSON coverage without multiplying every platform lane by
+    // fast-check's default 100 subprocesses.
     ), { numRuns: 40 });
   });
 });

@@ -245,25 +245,21 @@ const CLAUDE_POLICY_ID_TO_ALIAS: Record<string, string> = {
 // Dedupe stderr warnings so repeated agent resolutions don't spam (#1133).
 const _modelPolicyUnmappableWarned = new Set<string>();
 const _projectModelOmitWarned = new Set<string>();
-// Structured diagnostic contract; existing omit may be authored or copied from
-// shared defaults by an older version. Neither origin can be inferred here.
-const PROJECT_MODEL_OMIT_WARNING = Object.freeze({
-  code: 'project_model_omit',
-  key: 'resolve_model_ids',
-  value: 'omit',
-  message: 'gsd: warning — project config sets resolve_model_ids:"omit", so Claude agents ' +
+// Existing omit may be authored or copied from shared defaults by an older
+// version. Neither origin can be inferred here. Export only the bytes consumed
+// by production and CLI-boundary tests.
+const PROJECT_MODEL_OMIT_WARNING = 'gsd: warning — project config sets resolve_model_ids:"omit", so Claude agents ' +
     'inherit the session model instead of model_profile tiers. This value may have been ' +
     'copied from shared defaults by an older GSD version. If tier routing is intended, ' +
     'remove resolve_model_ids or set it to false in the project config. Explicit omit ' +
-    'is still honored; the config is unchanged. (#5329)',
-});
+    'is still honored; the config is unchanged. (#5329)';
 
 function warnProjectModelOmit(cwd: string): void {
   const key = path.resolve(planningDir(cwd));
   if (_projectModelOmitWarned.has(key)) return;
   _projectModelOmitWarned.add(key);
   try {
-    process.stderr.write(PROJECT_MODEL_OMIT_WARNING.message + '\n');
+    process.stderr.write(PROJECT_MODEL_OMIT_WARNING + '\n');
   } catch { /* stderr might be closed in a test harness */ }
 }
 
@@ -672,7 +668,7 @@ function resolveModelInternal(cwd: string, agentType: string): string {
   if (omitApplies) {
     // Only the Claude omission path loses profile routing. A non-Claude runtime,
     // an explicit model pin, or an inherit tier needs no migration breadcrumb.
-    if (activeRuntime === 'claude' && tier !== 'inherit') warnProjectModelOmit(cwd);
+    if (activeRuntime === 'claude' && tier && tier !== 'inherit') warnProjectModelOmit(cwd);
     return '';
   }
 
