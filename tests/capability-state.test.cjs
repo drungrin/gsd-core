@@ -1170,15 +1170,16 @@ describe('installed-runtime agent manifest parity (#5356)', () => {
     ), { seed: 5356, numRuns: 30 });
   });
 
-  test('#5356: installed capability enable preserves applicable agents and prunes disabled-only agents', (t) => {
+  for (const runtime of ['claude', 'opencode']) {
+  test(`#5356: ${runtime} installed capability enable preserves applicable agents and prunes disabled-only agents`, (t) => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-agent-materialize-'));
     t.after(() => cleanup(home));
-    const configDir = path.join(home, 'custom', 'claude-config');
+    const configDir = path.join(home, 'custom', `${runtime}-config`);
     const cwd = path.join(home, 'project');
     fs.mkdirSync(path.join(cwd, '.planning'), { recursive: true });
     fs.writeFileSync(path.join(cwd, '.planning', 'config.json'), '{}');
     const env = installSpawnEnv({ HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: configDir, GSD_HOME: home });
-    const install = runNode([path.join(repoRoot, 'bin', 'install.js'), '--claude', '--global', '--config-dir', configDir], {
+    const install = runNode([path.join(repoRoot, 'bin', 'install.js'), `--${runtime}`, '--global', '--config-dir', configDir], {
       cwd, env, timeoutMs: INSTALL_TIMEOUT_MS,
     });
     assert.equal(install.exitCode, 0, `scratch install failed: ${install.stderr}\n${install.stdout}`);
@@ -1195,7 +1196,7 @@ describe('installed-runtime agent manifest parity (#5356)', () => {
     for (const disabledClusters of [['ns_meta'], ['ai_eval']]) {
       const surface = { ...state, disabledClusters };
       fs.writeFileSync(path.join(configDir, '.gsd-surface.json'), JSON.stringify(surface));
-      const enabled = runNode([installedCli, 'capability', 'enable', 'live-dom-uat', '--runtime', 'claude', '--config-dir', configDir, '--cwd', cwd, '--raw'], {
+      const enabled = runNode([installedCli, 'capability', 'enable', 'live-dom-uat', '--runtime', runtime, '--config-dir', configDir, '--cwd', cwd, '--raw'], {
         cwd, env, timeoutMs: INSTALL_TIMEOUT_MS,
       });
       assert.equal(enabled.exitCode, 0, `capability enable failed: ${enabled.stderr}\n${enabled.stdout}`);
@@ -1206,6 +1207,7 @@ describe('installed-runtime agent manifest parity (#5356)', () => {
     assert.ok(disabledOnly.length > 0, 'the disabled-cluster control must remove real agents');
     assert.ok(disabledOnly.every((agent) => !installedAgents().includes(agent)), 'disabled-only agents must still be pruned');
   });
+  }
 });
 
 describe('regressions: installed-runtime capability surface (#1160)', () => {
