@@ -192,7 +192,7 @@ function _assertNoCodexBareGsdToolsInvocation(content, label) {
   }
 }
 
-// ─── getCodexSkillAdapterHeader ─────────────────────────────────────────────────
+// ─── Full install config cleanup (#5199) ───────────────────────────────────────
 
 describe('#5199: full Codex install followed by config cleanup', () => {
   function runInstaller(home, args) {

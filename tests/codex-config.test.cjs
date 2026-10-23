@@ -2160,8 +2160,17 @@ describe('stripGsdFromCodexConfig', () => {
     assert.strictEqual(stripGsdFromCodexConfig(user + userTable), user + userTable, 'literal marker text alone does not create a managed block');
   });
 
+  test('#5199: markerless feature cleanup preserves root and other-table lookalikes', () => {
+    const input = ['multi_agent = true', '[features]', 'multi_agent = true',
+      'default_mode_request_user_input = true', '[user]', 'multi_agent = true',
+      'default_mode_request_user_input = true', ''].join('\n');
+    const output = stripGsdFromCodexConfig(input);
+    assert.deepEqual(parseTomlToObject(output), { multi_agent: true,
+      user: { multi_agent: true, default_mode_request_user_input: true } });
+  });
+
   test('#5199: property: cleanup conserves arbitrary user tables, tuning and line endings', async () => {
-    const userText = fc.array(fc.constantFrom('a', 'b', ' ', '-', '_', '0'), { maxLength: 25 }).map((chars) => chars.join(''));
+    const userText = fc.array(fc.constantFrom('a', 'b', ' ', '-', '_', '0', '[', '#', '"', '=', '\\'), { maxLength: 25 }).map((chars) => chars.join(''));
     await fc.assert(fc.property(
       fc.constantFrom('\n', '\r\n'),
       userText,
