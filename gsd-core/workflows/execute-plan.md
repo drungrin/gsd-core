@@ -87,13 +87,14 @@ Present plan identification, wait for confirmation.
 </step>
 
 <step name="record_start_time">
-Persist once per plan in this worktree; a continuation keeps its original start (#5212).
+This step starts a fresh workflow invocation: overwrite any abandoned marker from an
+earlier attempt and discard its cached result. Checkpoint continuation inside this invocation
+resumes after this step and therefore keeps the original start (#5212).
 ```bash
 TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
 TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-if [ ! -f "$TIMING_FILE" ]; then
-  printf '%s\n' "$(date +%s)" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$TIMING_FILE"
-fi
+rm -f -- "$TIMING_FILE.result"
+printf '%s\n' "$(date +%s)" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$TIMING_FILE"
 ```
 </step>
 
@@ -407,7 +408,7 @@ execute-phase.md step 5.5).
 
 Create `{phase}-{plan}-SUMMARY.md` at `.planning/phases/XX-name/`. Use the template at `~/.claude/gsd-core/templates/summary.md` (or `summary.compact.md` — same `compact-content-gate.md` resolution as the USER-SETUP template above).
 
-**Frontmatter:** phase, plan, subsystem, tags | requires/provides/affects | tech-stack.added/patterns | key-files.created/modified | key-decisions | requirements-completed (**MUST** copy `requirements` array from PLAN.md frontmatter verbatim) | duration ($DURATION), completed ($PLAN_END_TIME date).
+**Frontmatter:** phase, plan, subsystem, tags | requires/provides/affects | tech-stack.added/patterns | key-files.created/modified | key-decisions | requirements-completed (**MUST** copy `requirements` array from PLAN.md frontmatter verbatim) | duration and completion timestamp printed by `record_completion_time`.
 
 Use `record_completion_time`'s printed `duration` verbatim in SUMMARY and the completion report; never estimate (`~` or free text). Its cached result supplies the identical state metric in a fresh shell.
 
@@ -438,6 +439,12 @@ IS_WORKTREE=$([ -f .git ] && echo "true" || echo "false")
 
 # Skip in parallel mode — orchestrator handles STATE.md centrally
 if [ "$IS_WORKTREE" != "true" ]; then
+  # Resolve the metric before the first STATE mutation. A missing/corrupt
+  # result must not leave STATE.md half-updated.
+  TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
+  TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
+  DURATION=$(tail -n 1 "$TIMING_FILE.result") || exit 1
+
   # Advance plan counter (handles last-plan edge case)
   gsd_run query state.advance-plan
 
@@ -445,9 +452,6 @@ if [ "$IS_WORKTREE" != "true" ]; then
   gsd_run query state.update-progress
 
   # Record execution metrics
-  TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
-  TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-  DURATION=$(tail -n 1 "$TIMING_FILE.result") || exit 1
   gsd_run query state.record-metric \
     --phase "{phase}" --plan "{plan}" --duration "${DURATION}" \
     --tasks "${TASK_COUNT}" --files "${FILE_COUNT}"

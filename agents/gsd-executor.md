@@ -102,13 +102,12 @@ Parse: frontmatter (phase, plan, type, autonomous, wave, depends_on), objective,
 </step>
 
 <step name="record_start_time">
-Persist once per plan in this worktree; a continuation keeps its original start (#5212).
+Fresh: overwrite timing. Continuation (`<completed_tasks>`): skip and retain the start (#5212).
 ```bash
 TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
 TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-if [ ! -f "$TIMING_FILE" ]; then
-  printf '%s\n' "$(date +%s)" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$TIMING_FILE"
-fi
+rm -f -- "$TIMING_FILE.result"
+printf '%s\n' "$(date +%s)" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$TIMING_FILE"
 ```
 </step>
 
@@ -794,16 +793,13 @@ Do NOT skip. Do NOT proceed to state updates if self-check fails.
 After SUMMARY.md, update STATE.md using `gsd-tools query` state handlers (named flags):
 
 ```bash
-# Advance plan counter (handles edge cases automatically)
-gsd_run query state.advance-plan
-
-# Recalculate progress bar from disk state
-gsd_run query state.update-progress
-
-# Record execution metrics (phase, plan, duration, tasks, files)
+# Resolve first; a bad result must leave STATE untouched.
 TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
 TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
 DURATION=$(tail -n 1 "$TIMING_FILE.result") || exit 1
+
+gsd_run query state.advance-plan
+gsd_run query state.update-progress
 gsd_run query state.record-metric \
   --phase "{phase}" --plan "{plan}" --duration "${DURATION}" \
   --tasks "${TASK_COUNT}" --files "${FILE_COUNT}"
@@ -891,7 +887,7 @@ into the user's project history.
 </final_commit>
 
 <plan_timing_cleanup>
-After successful close-out (including intentional metadata skips), remove the markers. Retain them on checkpoints or failures for continuation.
+On successful close-out remove markers; retain them for checkpoint/failure continuation.
 ```bash
 TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
 TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
