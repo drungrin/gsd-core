@@ -341,11 +341,13 @@ describe('#5297 git adapter — exact pinned target', {
   test('an unavailable ref rejects without staging the default tip', async () => {
     await assert.rejects(() => resolveCapabilitySource(`${sourceUrl}#missing-release`, {
       gsdHome, hostVersion: '1.5.0', execOverrides: { git: localGit },
-    }));
+    }), /git fetch \"missing-release\" failed/);
     assert.strictEqual(fs.existsSync(path.join(gsdHome, '.gsd', 'capabilities', 'pinned-cap')), false);
   });
 
   test('PROPERTY (fc): bare and typed tag spellings stage the same exact tagged tree', async () => {
+    fixtureGit(['tag', '--force', 'v1.0.0+build', commits.tag]);
+    await assertTarget('#tag:v1.0.0+build', '0.3.0', 'annotated tag behind default tip', commits.tag);
     const tagName = fc.array(fc.constantFrom('a', 'b', 'c', '0', '1', '-'), { minLength: 1, maxLength: 12 })
       .map((suffix) => `release-${suffix.join('')}`);
     await fc.assert(fc.asyncProperty(tagName, async (tag) => {
@@ -358,21 +360,22 @@ describe('#5297 git adapter — exact pinned target', {
 });
 
 describe('#5297 git adapter — normalized ref safety', () => {
-  test('typed leading-dash refs and empty typed refs reject before Git runs', async () => {
+  test('normalized unsafe refs and empty typed refs reject before Git runs', async () => {
     const gsdHome = createTempDir('gsd-ref-safety-');
     const calls = [];
     const fakeGit = (args) => {
       calls.push([...args]);
       if (args.includes('clone')) {
+        fs.mkdirSync(args.at(-1), { recursive: true });
         fs.writeFileSync(path.join(args.at(-1), 'capability.json'), JSON.stringify(featureCap('default-cap')));
       }
       return spawnOk('');
     };
     try {
-      for (const fragment of ['tag:--foo', 'sha:--foo', 'TAG:-foo', 'tag:', 'sha:', 'SHA:']) {
+      for (const fragment of ['tag:--foo', 'sha:--foo', 'TAG:-foo', 'tag:', 'sha:', 'SHA:', 'a:refs/tags/x', '+a:b', 'tag:+release', 'sha:a:b']) {
         await assert.rejects(() => resolveCapabilitySource(`https://example.com/repo.git#${fragment}`, {
           gsdHome, hostVersion: '1.5.0', execOverrides: { git: fakeGit },
-        }), Error, fragment);
+        }), /Unsafe git ref|typed ref must not be empty/, fragment);
       }
       assert.deepStrictEqual(calls, [], 'normalization must not bypass the unsafe-ref guard or install HEAD');
       assert.strictEqual(fs.existsSync(path.join(gsdHome, '.gsd', 'capabilities')), false);
