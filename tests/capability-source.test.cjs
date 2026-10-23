@@ -897,7 +897,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     return { root, repo, cap, files, spec, clones, execGit };
   }
 
-  test('real staged and promoted clones preserve checkout files, consent, and regular project Git entries', async (t) => {
+  async function stagedFixture(t) {
     const f = fixture(t);
     const project = path.join(f.root, 'project');
     fs.mkdirSync(project);
@@ -918,6 +918,15 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     assert.equal(promoted.integrity, null, 'Git sources keep their existing null byte-SRI result');
     cleanup(staged.stagedDir);
 
+    return { f, project, opts, stagedHash, promoted };
+  }
+
+  test('staged and promoted clones preserve checkout bytes and metadata exclusion', async (t) => {
+    await stagedFixture(t);
+  });
+
+  test('consent stays bound to checkout content', async (t) => {
+    const { f, project, stagedHash, promoted } = await stagedFixture(t);
     const consentHome = path.join(f.root, 'consent-home');
     consent.recordProjectConsent({ gsdHome: consentHome, projectRoot: project, id: f.cap.id,
       integrity: promoted.integrity ?? '', disclosureSignature: 'fixture-disclosure', contentHash: stagedHash });
@@ -928,6 +937,10 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
       contentHash: consent.bundleContentHash(promoted.stagedDir) }), false, 'checkout content remains consent-bound');
     put(promoted.stagedDir, 'skills/git-metadata-skill/SKILL.md', f.files['skills/git-metadata-skill/SKILL.md']);
 
+  });
+
+  test('git add stages regular files rather than an embedded repository', async (t) => {
+    const { f, project } = await stagedFixture(t);
     const add = realExecGit(['-C', project, 'add', '-A'], { timeout: GIT_TIMEOUT_MS });
     assert.equal(add.exitCode, 0, add.stderr);
     assert.doesNotMatch(add.stderr, /embedded git repository/i);
@@ -939,6 +952,10 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     }
     assert.ok(f.clones.every((dir) => !fs.existsSync(dir)), 'temporary clones are cleaned on success');
 
+  });
+
+  test('validation failure cleans scratch and preserves the existing bundle', async (t) => {
+    const { f, project, opts, stagedHash, promoted } = await stagedFixture(t);
     // Validation still rejects a bad replacement, cleans scratch/staging, and preserves the old bundle.
     put(f.repo, 'capability.json', JSON.stringify({ ...f.cap, role: 'invalid-role' }));
     git(f.repo, 'add', '-A');
@@ -949,6 +966,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     assert.ok(f.clones.every((dir) => !fs.existsSync(dir)), 'temporary clones are cleaned on failure');
     assert.ok(fs.existsSync(path.join(f.repo, '.git')), 'the original source repository is untouched');
   });
+
 
   test('property: clone metadata bytes do not affect the staged checkout hash', async (t) => {
     const root = createTempDir('gsd-git-metadata-property-');

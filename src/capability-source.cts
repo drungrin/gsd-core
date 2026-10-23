@@ -1052,7 +1052,7 @@ function resolveGit(
 
     // #5298: clone metadata is not bundle content. Remove it only from this
     // scratch clone before shared staging budgets, validation, and consent hashing.
-    fs.rmSync(path.join(cloneDir, '.git'), { recursive: true, force: true });
+    fs.rmSync(path.join(cloneDir, '.git'), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 
     // Read id from capability.json via the SHARED bounded reader (#1461 finding 2): a cloned repo's
     // oversized/non-regular capability.json is refused, never read unbounded.
