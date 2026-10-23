@@ -1033,6 +1033,9 @@ function resolveGit(
   const ref = classifyGitRef(parsed);
   // Validate AFTER removing typed prefixes: tag:--foo must not bypass parseSpec's
   // raw leading-dash check. Empty typed pins must not fall back to default HEAD.
+  if (ref.value.startsWith('+') || ref.value.includes(':') && !/^(?:tag|sha):$/i.test(ref.value)) {
+    throw new Error(`Unsafe git ref (fetch refspec not allowed): "${parsed.ref}"`);
+  }
   if (ref.value.startsWith('-')) {
     throw new Error(`Unsafe git ref (leading dash not allowed): "${parsed.ref}"`);
   }

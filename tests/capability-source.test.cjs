@@ -341,7 +341,7 @@ describe('#5297 git adapter — exact pinned target', {
   test('an unavailable ref rejects without staging the default tip', async () => {
     await assert.rejects(() => resolveCapabilitySource(`${sourceUrl}#missing-release`, {
       gsdHome, hostVersion: '1.5.0', execOverrides: { git: localGit },
-    }), /git fetch \"missing-release\" failed/);
+    }), /git fetch "missing-release" failed/);
     assert.strictEqual(fs.existsSync(path.join(gsdHome, '.gsd', 'capabilities', 'pinned-cap')), false);
   });
 
