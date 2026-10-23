@@ -2247,7 +2247,7 @@ describe('#5351: covered-input fingerprints normalize only CRLF byte pairs in v4
   // Independent oracle: these fixtures already supply the exact bytes to hash.
   // No production canonicalizer or line-ending helper participates in the answer.
   function expectedDigest(version, entries) {
-    const parts = [...entries].sort(([a], [b]) => a.localeCompare(b)).map(([rel, bytes]) => {
+    const parts = [...entries].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([rel, bytes]) => {
       const hash = crypto.createHash('sha256').update(bytes).digest('hex');
       return `${rel}\n${hash}\n`;
     });
