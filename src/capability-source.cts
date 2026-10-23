@@ -1030,17 +1030,22 @@ function resolveGit(
     throw new Error('integrity pinning is not supported for git sources; pin the commit with #sha:<commit>');
   }
 
+  const rawRef = typeof parsed.ref === 'string' ? parsed.ref.trim() : '';
+  const isEmptyTypedPin = /^(?:tag|sha):$/i.test(rawRef);
+  if (isEmptyTypedPin) {
+    throw new Error(`Invalid git ref: "${parsed.ref}" — typed ref must not be empty`);
+  }
   const ref = classifyGitRef(parsed);
   // Validate AFTER removing typed prefixes: tag:--foo must not bypass parseSpec's
   // raw leading-dash check. Empty typed pins must not fall back to default HEAD.
-  if (ref.value.startsWith('+') || ref.value.includes(':') && !/^(?:tag|sha):$/i.test(ref.value)) {
+  if (ref.value.startsWith('+') || (ref.value.includes(':') && !isEmptyTypedPin)) {
     throw new Error(`Unsafe git ref (fetch refspec not allowed): "${parsed.ref}"`);
   }
   if (ref.value.startsWith('-')) {
     throw new Error(`Unsafe git ref (leading dash not allowed): "${parsed.ref}"`);
   }
-  if (/^(?:tag|sha):$/i.test(ref.value)) {
-    throw new Error(`Invalid git ref: "${parsed.ref}" — typed ref must not be empty`);
+  if (ref.kind === 'sha' && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(ref.value)) {
+    throw new Error(`Invalid git ref: "${parsed.ref}" — sha: pin must be a full 40- or 64-hex object name`);
   }
 
   const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-cap-git-'));
@@ -1068,11 +1073,20 @@ function resolveGit(
       const fetchResult = execGit([
         ...gitConfig, '-C', cloneDir, 'fetch', '--depth', '1', '--no-tags', '--', 'origin', fetchRef,
       ], { timeout: 60_000 });
+      let checkoutTarget = 'FETCH_HEAD';
       if (fetchResult.exitCode !== 0) {
-        throw new Error(`git fetch "${parsed.ref}" failed (exit ${fetchResult.exitCode}): ${fetchResult.stderr}`);
+        // Preserve commit-ish spellings the former shallow-clone checkout
+        // accepted when the target is already present at the cloned tip.
+        const localResult = execGit([
+          ...gitConfig, '-C', cloneDir, 'rev-parse', '--verify', `${ref.value}^{commit}`,
+        ], { timeout: 60_000 });
+        if (localResult.exitCode !== 0) {
+          throw new Error(`git fetch "${parsed.ref}" failed (exit ${fetchResult.exitCode}): ${fetchResult.stderr}`);
+        }
+        checkoutTarget = ref.value;
       }
       const checkoutResult = execGit([
-        ...gitConfig, '-C', cloneDir, 'checkout', '--detach', 'FETCH_HEAD', '--',
+        ...gitConfig, '-C', cloneDir, 'checkout', '--detach', checkoutTarget, '--',
       ], { timeout: 60_000 });
       if (checkoutResult.exitCode !== 0) {
         throw new Error(

@@ -206,6 +206,7 @@ describe('#5297 git adapter — exact pinned target', {
   let env;
   let commits;
   let calls;
+  let cloneDirs;
   let retrieved;
   const sourceUrl = 'https://example.com/pinned-cap.git';
 
@@ -233,6 +234,7 @@ describe('#5297 git adapter — exact pinned target', {
   // while the production parser still receives an allowed HTTPS source spec.
   function localGit(args, opts) {
     calls.push({ args: [...args], timeout: opts?.timeout });
+    if (args.includes('clone')) cloneDirs.push(args.at(-1));
     const localArgs = args.map((arg) => arg === sourceUrl ? pathToFileURL(repo).href : arg);
     const result = execGit(localArgs, { ...opts, env: {
       ...env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '.githooks',
@@ -260,6 +262,7 @@ describe('#5297 git adapter — exact pinned target', {
     fs.writeFileSync(config, '');
     env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: config, GIT_TEMPLATE_DIR: template };
     calls = [];
+    cloneDirs = [];
     retrieved = null;
     fixtureGit(['init', '-b', 'main']);
     fixtureGit(['config', 'user.name', 'Capability fixture']);
@@ -343,6 +346,20 @@ describe('#5297 git adapter — exact pinned target', {
       gsdHome, hostVersion: '1.5.0', execOverrides: { git: localGit },
     }), /git fetch "missing-release" failed/);
     assert.strictEqual(fs.existsSync(path.join(gsdHome, '.gsd', 'capabilities', 'pinned-cap')), false);
+    assert.ok(cloneDirs.every((dir) => !fs.existsSync(path.dirname(dir))), 'fetch failure cleans the scratch directory');
+  });
+
+  test('tip-local commit-ish spellings retain shallow-checkout compatibility', async () => {
+    const branch = fixtureGit(['branch', '--show-current']);
+    for (const fragment of [
+      `#${commits.tip.slice(0, 8)}`,
+      `#origin/${branch}`,
+      '#origin/HEAD',
+      `#${branch}~0`,
+      '#v0.4.0^{}',
+    ]) {
+      await assertTarget(fragment, '0.4.0', 'default branch tip', commits.tip);
+    }
   });
 
   test('PROPERTY (fc): bare and typed tag spellings stage the same exact tagged tree', async () => {
@@ -372,10 +389,26 @@ describe('#5297 git adapter — normalized ref safety', () => {
       return spawnOk('');
     };
     try {
-      for (const fragment of ['tag:--foo', 'sha:--foo', 'TAG:-foo', 'tag:', 'sha:', 'SHA:', 'a:refs/tags/x', '+a:b', 'tag:+release', 'sha:a:b']) {
+      const cases = [
+        ['tag:--foo', /leading dash not allowed/],
+        ['sha:--foo', /leading dash not allowed/],
+        ['TAG:-foo', /leading dash not allowed/],
+        ['tag:', /typed ref must not be empty/],
+        ['sha:', /typed ref must not be empty/],
+        ['SHA:', /typed ref must not be empty/],
+        ['a:refs/tags/x', /fetch refspec not allowed/],
+        ['+a:b', /fetch refspec not allowed/],
+        ['tag:+release', /fetch refspec not allowed/],
+        ['Tag:+x', /fetch refspec not allowed/],
+        ['sha:a:b', /fetch refspec not allowed/],
+        ['tag:tag:', /fetch refspec not allowed/],
+        ['sha:sha:', /fetch refspec not allowed/],
+        ['sha:main', /sha: pin must be a full 40- or 64-hex object name/],
+      ];
+      for (const [fragment, expected] of cases) {
         await assert.rejects(() => resolveCapabilitySource(`https://example.com/repo.git#${fragment}`, {
           gsdHome, hostVersion: '1.5.0', execOverrides: { git: fakeGit },
-        }), /Unsafe git ref|typed ref must not be empty/, fragment);
+        }), expected, fragment);
       }
       assert.deepStrictEqual(calls, [], 'normalization must not bypass the unsafe-ref guard or install HEAD');
       assert.strictEqual(fs.existsSync(path.join(gsdHome, '.gsd', 'capabilities')), false);
