@@ -1292,6 +1292,7 @@ describe('scaffold command', () => {
 
   test('#5202: scaffolded verification reads missing and routes to execute-phase', () => {
     const phaseDir = scaffoldVerification();
+    assert.ok(fs.readFileSync(path.join(phaseDir, '03-VERIFICATION.md'), 'utf8').includes('Goal-Backward Verification'));
     const result = runGsdTools(['verification', 'status', phaseDir], tmpDir);
     assert.equal(result.exitCode, 0, result.error);
     const status = JSON.parse(result.output);
