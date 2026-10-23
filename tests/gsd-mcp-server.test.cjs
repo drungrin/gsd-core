@@ -79,6 +79,16 @@ test('tools/call: required family is validated before dispatch (#5325)', (t) => 
   assert.equal(spawn.mock.callCount(), 0, 'invalid family must never spawn a command');
 });
 
+test('tools/call: explicit null subcommand is a type error without dispatch (#5325)', (t) => {
+  const spawn = t.mock.method(childProcess, 'spawnSync', () => ({ status: 0, stdout: '', stderr: '' }));
+  const res = handleMessage({
+    jsonrpc: '2.0', id: 12, method: 'tools/call',
+    params: { name: 'gsd_invoke_command', arguments: { family: 'config-path', subcommand: null } },
+  });
+  assert.equal(res.result.isError, true);
+  assert.equal(spawn.mock.callCount(), 0);
+});
+
 test('tools/call: a supplied non-string subcommand never dispatches (#5325 property)', async (t) => {
   const spawn = t.mock.method(childProcess, 'spawnSync', () => ({ status: 0, stdout: '', stderr: '' }));
   await fc.assert(fc.property(fc.jsonValue().filter((value) => typeof value !== 'string'), (subcommand) => {
