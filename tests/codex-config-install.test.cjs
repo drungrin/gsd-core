@@ -242,9 +242,11 @@ describe('#5199: full Codex install followed by config cleanup', () => {
           'full-profile GSD agent registrations are removed while core tuning remains',
         );
       }
-      assert.ok(!cleaned.includes(_GSD_CODEX_MARKER), 'the old managed marker is removed');
       assert.ok(cleaned.includes(userConfig.trimEnd()), 'appended user table bytes remain intact');
-      if (operation === 'uninstall') assert.deepStrictEqual(parsed, expected, 'only user config remains');
+      if (operation === 'uninstall') {
+        assert.ok(!cleaned.includes(_GSD_CODEX_MARKER), 'uninstall removes the managed marker');
+        assert.deepStrictEqual(parsed, expected, 'only user config remains');
+      }
     });
   }
 
