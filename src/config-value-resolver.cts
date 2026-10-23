@@ -2,6 +2,10 @@
  * Config Value Resolution Module — per-key precedence with producing-layer provenance.
  * The assembled-object loader remains unchanged; caller adoption belongs to C3/C4.
  *
+ * Containment refuses static planted symlinks. An actively mutating checkout can
+ * replace a path between realpath validation and reopen; that race is outside
+ * this read boundary.
+ *
  * Two rules differ from the loader's whole-config view on purpose (CONTEXT.md):
  * an unusable layer degrades a key only when that layer could have produced it,
  * and a present non-object parent stops the lower files but never the declared

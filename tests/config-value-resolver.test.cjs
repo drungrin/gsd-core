@@ -362,28 +362,36 @@ describe('Config Value Resolution Module (#5096)', () => {
   });
 
   test('layer reads are bounded at limit-1, limit and limit+1 bytes', () => {
-    for (const [size, readable] of [
-      [CONFIG_LAYER_MAX_BYTES - 1, true],
-      [CONFIG_LAYER_MAX_BYTES, true],
-      [CONFIG_LAYER_MAX_BYTES + 1, false],
+    for (const [layer, key, object] of [
+      ['runtime-shared', 'worktree.baseRef', { worktree: { baseRef: 'sized' } }],
+      ['root', 'project_code', { project_code: 'sized' }],
     ]) {
-      withLayers((cwd) => {
-        const file = writeLayer(cwd, 'runtime-shared', {});
-        fs.writeFileSync(file, jsonOfSize({ worktree: { baseRef: 'sized' } }, size), 'utf8');
-        assert.equal(fs.statSync(file).size, size);
-        let result;
-        const diagnostics = captureConfigDiagnostics(() => {
-          result = resolveConfigValue('worktree.baseRef', { cwd });
+      for (const [size, readable] of [
+        [CONFIG_LAYER_MAX_BYTES - 1, true],
+        [CONFIG_LAYER_MAX_BYTES, true],
+        [CONFIG_LAYER_MAX_BYTES + 1, false],
+      ]) {
+        withLayers((cwd) => {
+          delete process.env.GSD_WORKSTREAM;
+          const file = writeLayer(cwd, layer, {});
+          fs.writeFileSync(file, jsonOfSize(object, size), 'utf8');
+          assert.equal(fs.statSync(file).size, size);
+          let result;
+          const diagnostics = captureConfigDiagnostics(() => {
+            result = resolveConfigValue(key, { cwd });
+          });
+          if (readable) {
+            assert.deepEqual(result, { found: true, value: 'sized', layer, reason: 'resolved' });
+            assert.deepEqual(diagnostics, []);
+          } else {
+            assert.deepEqual(result, layer === 'root'
+              ? { found: true, value: null, layer: 'builtin-default', reason: 'config_unreadable' }
+              : { found: false, value: undefined, layer: null, reason: 'config_unreadable' });
+            assert.equal(diagnostics.length, 1);
+            assert.match(diagnostics[0], /could not be read \(EFBIG\)/);
+          }
         });
-        if (readable) {
-          assert.deepEqual(result, { found: true, value: 'sized', layer: 'runtime-shared', reason: 'resolved' });
-          assert.deepEqual(diagnostics, []);
-        } else {
-          assert.deepEqual(result, { found: false, value: undefined, layer: null, reason: 'config_unreadable' });
-          assert.equal(diagnostics.length, 1);
-          assert.match(diagnostics[0], /could not be read \(EFBIG\)/);
-        }
-      });
+      }
     }
   });
 
