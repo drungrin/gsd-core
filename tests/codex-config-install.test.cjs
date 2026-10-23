@@ -235,7 +235,13 @@ describe('#5199: full Codex install followed by config cleanup', () => {
       const parsed = _parseTomlToObject(cleaned);
       const expected = _parseTomlToObject(userConfig);
       for (const key of Object.keys(expected)) assert.deepStrictEqual(parsed[key], expected[key]);
-      assert.strictEqual(parsed.agents, undefined, 'full-profile agent registrations are removed');
+      if (operation === 'core-profile') {
+        assert.deepStrictEqual(
+          Object.keys(parsed.agents || {}).filter((key) => key.startsWith('gsd-')),
+          [],
+          'full-profile GSD agent registrations are removed while core tuning remains',
+        );
+      }
       assert.ok(!cleaned.includes(_GSD_CODEX_MARKER), 'the old managed marker is removed');
       assert.ok(cleaned.includes(userConfig.trimEnd()), 'appended user table bytes remain intact');
       if (operation === 'uninstall') assert.deepStrictEqual(parsed, expected, 'only user config remains');
