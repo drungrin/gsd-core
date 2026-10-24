@@ -778,9 +778,14 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
     cmdGitBaseBranch(cwd, args.slice(2));
   }
 
+  function isFlagToken(arg) {
+    // Keep negative numbers and bare separators available to positional parsers.
+    return typeof arg === 'string' && /^--?[A-Za-z]/.test(arg);
+  }
+
   function rejectUnknownFlags(args, knownFlags, verb) {
     for (const arg of args) {
-      if (typeof arg === 'string' && arg.startsWith('-') && !knownFlags.has(arg)) {
+      if (isFlagToken(arg) && !knownFlags.has(arg)) {
         error(`Unknown flag for ${verb}: ${arg}`, ERROR_REASON.USAGE);
       }
     }
@@ -876,7 +881,7 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
     const CONFIG_NEW_PROJECT_KNOWN_FLAGS = new Set(['--dry-run', '--raw']);
     const positionals = [];
     for (const a of args.slice(1)) {
-      if (typeof a === 'string' && /^--?[A-Za-z]/.test(a)) {
+      if (isFlagToken(a)) {
         if (!CONFIG_NEW_PROJECT_KNOWN_FLAGS.has(a)) {
           error(`Unknown flag for config-new-project: ${a}`, ERROR_REASON.USAGE);
         }

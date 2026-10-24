@@ -605,6 +605,7 @@ node gsd-tools.cjs config-set-model-profile <profile>
 
 # Migrate legacy config keys to their canonical names
 node gsd-tools.cjs migrate-config
+
 # Create config.json for a new project from the chosen settings
 node gsd-tools.cjs config-new-project '<choices-json>' [--dry-run]
 ```
