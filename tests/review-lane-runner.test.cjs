@@ -803,13 +803,12 @@ describe('#5288 reviewer HTTP redirects', () => {
         for (let status = 300; status < 400; status++) {
           const p = plan(lane.slug);
           const calls = [];
-          let gets = 0;
           const d = deps({
             files: { [p.promptPath]: 'SYNTHETIC PROMPT' },
             httpJson: async (url, opts) => {
               calls.push(opts);
               // The availability probe is a separate contract owned by #5266/#5278.
-              if (opts.method === 'GET' && ++gets === 1) return { ok: true, status: 200, body: '{}' };
+              if (opts.probe) return { ok: true, status: 200, body: '{}' };
               return opts.method === method
                 ? { ok: false, status, body: reviewBody }
                 : { ok: true, status: 200, body: '{}' };
@@ -864,14 +863,17 @@ describe('#5288 reviewer HTTP redirects', () => {
       // RunnerDeps and invokes the actual lane. No global mock can leak into neighboring tests.
       const child = runNode(['-e', `
         const [toolsPath, project, runDir, redirectMethod] = process.argv.slice(1);
-        let gets = 0;
-        let cancellations = 0;
-        const calls = [];
+        let redirectedBodyCancelled = false;
+        let everyRequestWasManual = true;
         globalThis.fetch = async (url, opts) => {
-          calls.push(opts.method);
-          const redirect = opts.method === redirectMethod && (redirectMethod !== 'GET' || ++gets > 1);
+          everyRequestWasManual &&= opts.redirect === 'manual';
+          const isModelDiscovery = new URL(url).pathname.endsWith('/v1/models');
+          const redirect = opts.method === redirectMethod && (redirectMethod !== 'GET' || isModelDiscovery);
           return { ok: !redirect, status: redirect ? 307 : 200,
-            body: { cancel: async () => { cancellations++; throw new Error('stream cancellation failed'); } },
+            body: { cancel: async () => {
+              if (redirect) redirectedBodyCancelled = true;
+              throw new Error('stream cancellation failed');
+            } },
             text: async () => JSON.stringify(opts.method === 'GET'
               ? { data: [{ id: 'model' }] }
               : { choices: [{ message: { content: 'NORMAL REVIEW' } }] }) };
@@ -881,7 +883,7 @@ describe('#5288 reviewer HTTP redirects', () => {
         captureStdoutSyncWrites(() => tools.dispatchHostCommand({ command: 'review-lane',
           args: ['review-lane', 'invoke', '--slug', 'ollama', '--run-dir', runDir, '--repo-root', project],
           cwd: project, raw: true, error: (message) => { throw new Error(message); },
-        })).then((output) => process.stdout.write(JSON.stringify({ result: JSON.parse(output), cancellations, calls })))
+        })).then((output) => process.stdout.write(JSON.stringify({ result: JSON.parse(output), redirectedBodyCancelled, everyRequestWasManual })))
           .catch((error) => { process.stderr.write(error.stack); process.exitCode = 1; });
       `, TOOLS_PATH, project, runDir, method], {
         cwd: project, env: installSpawnEnv(), timeoutMs: GSD_TOOLS_CLI_MODERATE_TIMEOUT_MS,
@@ -890,12 +892,12 @@ describe('#5288 reviewer HTTP redirects', () => {
       assert.equal(child.exitCode, 0, child.stderr);
       const observed = JSON.parse(child.stdout);
       const result = observed.result;
-      assert.equal(observed.cancellations, 2, 'both the status-only probe and the refused redirect must cancel their response bodies');
+      assert.equal(observed.redirectedBodyCancelled, true, 'the refused redirect must cancel its response body');
+      assert.equal(observed.everyRequestWasManual, true, 'the HTTP seam must default every request to manual redirects');
       assert.equal(result.ok, false);
       assert.equal(result.reason, 'http_redirect');
       assert.equal(result.stubbed, true);
       assert.ok(result.detail.includes('HTTP redirect 307'));
-      assert.deepStrictEqual(observed.calls, method === 'GET' ? ['GET', 'GET'] : ['GET', 'GET', 'POST']);
     });
   }
 
@@ -1009,6 +1011,22 @@ describe('runner — orchestration', () => {
     assert.equal(r.ok, false);
     assert.equal(r.reason, LANE_UNAVAILABLE.MISSING_BINARY);
     assert.deepStrictEqual(d.warnings, []);
+  });
+
+  test('a redirect from an explicitly requested HTTP lane is surfaced as a warning', async () => {
+    const p = plan('ollama', { 'review.models.ollama': 'pinned' });
+    const d = deps({
+      files: { [p.promptPath]: 'SYNTHETIC PROMPT' },
+      httpJson: async (_url, opts) => opts.probe
+        ? { ok: true, status: 200, body: '' }
+        : { ok: false, status: 307, body: 'redirect body' },
+    });
+
+    const r = await runLane(p, d, { repoRoot: ROOT, explicitlyRequested: true });
+
+    assert.equal(r.reason, LANE_UNAVAILABLE.HTTP_REDIRECT);
+    assert.ok(d.warnings.some((warning) => warning.includes(`explicitly requested reviewer '${p.slug}'`)));
+    assert.ok(d.warnings.some((warning) => warning.includes('HTTP redirect 307 refused')));
   });
 
   test('a file-arg lane reads its review from the file, not stdout', async () => {

@@ -1235,7 +1235,7 @@ export async function runLane(
 
   return plan.transport === 'spawn'
     ? runSpawnLane(plan, deps, opts.repoRoot)
-    : runHttpLane(plan, deps);
+    : runHttpLane(plan, deps, opts.explicitlyRequested === true);
 }
 
 function runSpawnLane(plan: SpawnPlan, deps: RunnerDeps, repoRoot: string): LaneRunResult {
@@ -1322,7 +1322,7 @@ function runSpawnLane(plan: SpawnPlan, deps: RunnerDeps, repoRoot: string): Lane
   return { slug: plan.slug, ok: true, stubbed, model };
 }
 
-async function runHttpLane(plan: HttpPlan, deps: RunnerDeps): Promise<LaneRunResult> {
+async function runHttpLane(plan: HttpPlan, deps: RunnerDeps, explicitlyRequested: boolean): Promise<LaneRunResult> {
   const promptText = deps.exists(plan.promptPath) ? deps.readFile(plan.promptPath) : '';
   const { review, rawBody, model, redirected } = await runOpenAiCompatible(plan, promptText, deps);
   // #3194: same verification on the http path — see runSpawnLane.
@@ -1330,6 +1330,7 @@ async function runHttpLane(plan: HttpPlan, deps: RunnerDeps): Promise<LaneRunRes
   deps.writeFile(plan.errPath, '');
   const { stubbed } = writeReviewOrStub(plan, stamped, deps, rawBody);
   if (redirected) {
+    if (explicitlyRequested) deps.warn(`explicitly requested reviewer '${plan.slug}': ${rawBody}`);
     return { slug: plan.slug, ok: false, reason: LANE_UNAVAILABLE.HTTP_REDIRECT, detail: rawBody, stubbed, model };
   }
   return { slug: plan.slug, ok: true, stubbed, model };
