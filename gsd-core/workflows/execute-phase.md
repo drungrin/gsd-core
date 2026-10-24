@@ -1118,7 +1118,11 @@ When executor returns a checkpoint AND `AUTO_MODE` is `true` (spawn prompt: `exe
    [Awaiting section from agent return]
    ```
 5. User responds: "approved"/"done" | issue description | decision selection
-6. **Spawn continuation agent (NOT resume)** — read and execute `execute-phase/steps/checkpoint-continuation-prompt.md` (#4783).
+6. **Spawn continuation agent (NOT resume)** — read and execute `execute-phase/steps/checkpoint-continuation-prompt.md` (#4783). Its substitution contract includes:
+   - `{completed_tasks_table}`: From checkpoint return, wrapped in a `<completed_tasks>` tag (the executor's continuation handling keys on it)
+   - `{resume_task_number}` + `{resume_task_name}`: Current task
+   - `{user_response}`: What user provided
+   - `{resume_instructions}`: Based on checkpoint type
 7. Continuation agent verifies previous commits, continues from resume point
 8. Repeat until plan completes or user stops
 
