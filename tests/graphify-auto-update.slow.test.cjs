@@ -203,11 +203,7 @@ describe('auto-update', () => {
 
   // ─── hook tests ─────────────────────────────────────────────────────────────
 
-  const bashSkipReason = process.platform === 'win32'
-    ? 'POSIX-only: harness invokes the bash hook and its detached rebuild'
-    : seamRunHook('-c', ['exit 0'], { interpreter: 'bash', timeoutMs: PROBE_TIMEOUT_MS }).exitCode === 0
-      ? false
-      : 'bash is not available on this host';
+  const isWindows = process.platform === 'win32';
   const HOOK = path.join(__dirname, '..', 'hooks', 'gsd-graphify-update.sh');
 
   function createTempGitRepo(opts = {}) {
@@ -338,7 +334,7 @@ describe('auto-update', () => {
   }
 
   describe('hook — bail paths (no side effects)',
-    { skip: bashSkipReason },
+    { skip: isWindows },
     () => {
     test('non-Bash tool call exits 0 with no status file', (t) => {
       const tmpDir = createTempGitRepo({
@@ -503,7 +499,7 @@ describe('auto-update', () => {
   });
 
   describe('hook — dispatch path (all gates pass)',
-    { skip: bashSkipReason },
+    { skip: isWindows },
     () => {
     test('writes status file with status=running synchronously before returning', async (t) => {
       const tmpDir = createTempGitRepo({
@@ -665,7 +661,7 @@ describe('auto-update', () => {
   // the tool name needs normalization. Pre-fix, the Gate 1 `== "Bash"` check
   // never matched on Kimi and the auto-rebuild was silently dormant.
   describe('hook — Kimi tool vocabulary (#2304)',
-    { skip: bashSkipReason },
+    { skip: isWindows },
     () => {
     test('dispatches on Kimi tool_name Shell (all gates pass)', async (t) => {
       const tmpDir = createTempGitRepo({
@@ -730,20 +726,22 @@ describe('auto-update', () => {
     });
   });
 
-  describe('hook — runtime query commit recognition (#5332)', { skip: bashSkipReason }, () => {
+  describe('hook — runtime query commit recognition (#5332)', { skip: isWindows }, () => {
     const runtimeCommands = [
       ['gsd_run', () => 'gsd_run query commit "docs: complete plan" --files .planning/STATE.md'],
       ['canonical multiline launcher', () => fs.readFileSync(
         path.join(__dirname, '..', 'gsd-core/workflows/_runtime-launcher.snippet.sh'), 'utf8',
       ) + '\ngsd_run query commit "docs: complete plan" --files .planning/STATE.md'],
       ['gsd-tools.cjs', () => 'gsd-tools.cjs query commit "docs: complete plan" --files .planning/STATE.md'],
+      ['global --cwd before query', () => 'gsd_run --cwd "$ONBOARDING_ROOT" query commit "docs: complete plan" --files .planning/STATE.md'],
+      ['path-prefixed legacy launcher', () => '/opt/gsd/bin/gsd-tools query commit "docs: complete plan" --files .planning/STATE.md'],
       ['quoted node entrypoint', () => 'node "$HOME/.claude/gsd-core/bin/gsd-tools.cjs" query commit "docs: complete plan" --files .planning/STATE.md'],
       ['single-quoted node entrypoint', () => "node '/tmp/GSD install/gsd-tools.cjs' query commit 'docs: complete plan' --files .planning/STATE.md"],
       ['commit at end of command', () => 'gsd_run query commit'],
       ...[';', '&&', '|', '(', '$(', '`', '\\'].map((prefix) => [
         `left shell boundary ${prefix}`, () => `${prefix}gsd_run query commit`,
       ]),
-      ...[')', '}', '>', '"', "'"].map((suffix) => [
+      ...[')', '}', '>', '"', "'", '`'].map((suffix) => [
         `right shell boundary ${suffix}`, () => `gsd_run query commit${suffix}`,
       ]),
     ];
@@ -850,7 +848,7 @@ describe('auto-update', () => {
   });
 
   describe('hook — HEAD-advancing command matchers',
-    { skip: bashSkipReason },
+    { skip: isWindows },
     () => {
     for (const cmd of [
       'git commit -m fix',
