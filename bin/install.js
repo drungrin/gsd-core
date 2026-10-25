@@ -4542,6 +4542,38 @@ function spliceCodexAgentsScalars(block, scalarLines) {
 }
 
 /**
+ * A TOML section nominally ends at the next table header, but comments directly
+ * above that header conventionally describe the NEXT table. Keep that trailing
+ * comment block when deleting a managed section so uninstall never consumes
+ * user documentation along with GSD-owned bytes (#5199 F2).
+ */
+function managedTomlSectionRemovalEnd(content, section) {
+  if (section.end >= content.length) return section.end;
+  const records = getTomlLineRecords(content).filter((record) =>
+    record.start >= section.headerEnd && record.end + record.eol.length <= section.end
+  );
+  let preserveStart = section.end;
+  let sawComment = false;
+
+  for (let i = records.length - 1; i >= 0; i -= 1) {
+    const record = records[i];
+    const trimmed = record.text.trim();
+    if (!record.startsInMultilineString && trimmed.startsWith('#')) {
+      sawComment = true;
+      preserveStart = record.start;
+      continue;
+    }
+    if (sawComment && trimmed === '') {
+      preserveStart = record.start;
+      continue;
+    }
+    break;
+  }
+
+  return sawComment ? preserveStart : section.end;
+}
+
+/**
  * Strip any managed GSD agent sections from a TOML string.
  *
  * Used by the uninstall path (`stripGsdFromCodexConfig`). Removes only what GSD
@@ -4585,7 +4617,10 @@ function stripCodexGsdAgentSections(content) {
 
   return removeContentRanges(
     content,
-    sections.map(({ start, end }) => ({ start, end })),
+    sections.map((section) => ({
+      start: section.start,
+      end: managedTomlSectionRemovalEnd(content, section),
+    })),
   );
 }
 
@@ -4615,6 +4650,10 @@ function stripGsdFromCodexConfig(content) {
   }
 
   cleaned = stripCodexHooksFeatureAssignments(cleaned, codexHooksOwnership);
+  // Older installers wrote hook tables after the managed marker. The marker
+  // no longer owns marker-to-EOF, so remove those tables through their existing
+  // structural owner before preserving the remaining user content (#5199 F1).
+  cleaned = stripStaleGsdHookBlocks(cleaned);
   // These legacy injected keys belong only to [features]. Identically named
   // user-table keys and text inside multiline values must survive cleanup.
   const injectedFeatureRecords = getTomlLineRecords(cleaned).filter((record) => {
@@ -5264,7 +5303,7 @@ function getManagedCodexHooksOwnership(content, markerRecord) {
   }
 
   const afterMarker = content.slice(markerRecord.end + markerRecord.eol.length);
-  const match = afterMarker.match(/^# GSD codex_hooks ownership: (section|root_dotted)(?:\r?\n|$)/);
+  const match = afterMarker.match(/^# GSD codex_hooks ownership: (section|root_dotted)[ \t]*(?:\r?\n|$)/);
   return match ? match[1] : null;
 }
 
@@ -5278,7 +5317,7 @@ function setManagedCodexHooksOwnership(content, ownership) {
   const markerEnd = markerIndex + GSD_CODEX_MARKER.length;
   const afterMarker = content.slice(markerEnd);
   const normalizedAfterMarker = afterMarker.replace(
-    /^\r?\n# GSD codex_hooks ownership: (?:section|root_dotted)\r?\n/,
+    /^\r?\n# GSD codex_hooks ownership: (?:section|root_dotted)[ \t]*\r?\n/,
     eol
   );
 
