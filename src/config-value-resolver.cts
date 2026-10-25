@@ -1,24 +1,20 @@
 /**
  * Config Value Resolution Module — per-key precedence with producing-layer provenance.
- * The assembled-object loader remains unchanged; caller adoption belongs to C3/C4.
+ * Existing call sites stay on the assembled-object loader; adoption belongs to C3/C4.
  *
- * Containment refuses static planted symlinks. An actively mutating checkout can
- * replace a path between realpath validation and reopen; that race is outside
- * this read boundary.
- *
- * Two rules differ from the loader's whole-config view on purpose (CONTEXT.md):
- * an unusable layer degrades a key only when that layer could have produced it,
- * and a present non-object parent stops the lower files but never the declared
- * defaults, which is what `loadConfig` returns for the same files.
+ * An unusable layer degrades a key only when that layer could have produced it.
+ * A present non-object parent stops every lower layer, including declared defaults.
  */
 
 import os from 'node:os';
 import path from 'node:path';
 import { CONFIG_DEFAULTS, normalizeLegacyKeys, isConfigSection } from './configuration.cjs';
 import { getGlobalConfigDir } from './runtime-homes.cjs';
+import { platformReadSync } from './shell-command-projection.cjs';
+import { parseJsonc } from './settings-jsonc.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import loader = require('./config-loader.cjs');
-const { _readConfigFile, _warnUnusableConfig, CONFIG_REASON } = loader;
+const { CONFIG_REASON } = loader;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import schema = require('./config-schema.cjs');
 const { isCentralConfigKey, getCapabilityConfigSchema } = schema;
@@ -60,9 +56,45 @@ const MERGE_KEYS = Object.freeze({
 } as const);
 type MergeKey = keyof typeof MERGE_KEYS;
 const FAMILY_B_KEYS = new Set(['worktree.baseRef']);
-/** Size ceiling for one layer file; a larger file is unreadable, never parsed. */
-const CONFIG_LAYER_MAX_BYTES = 1024 * 1024;
 const UNSAFE_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+
+type ConfigFault = { reason: ConfigReason; path: string; code: string };
+type LayerRead = { kind: 'ok'; data: Record<string, unknown> }
+  | { kind: 'absent' }
+  | { kind: 'fault'; fault: ConfigFault };
+
+/** Read one layer without changing the assembled Config Loader Module. */
+function readConfigLayer(file: string, family: ConfigFamily): LayerRead {
+  let raw: string | null;
+  try {
+    raw = platformReadSync(file);
+  } catch (err) {
+    return { kind: 'fault', fault: {
+      reason: CONFIG_REASON.CONFIG_UNREADABLE,
+      path: file,
+      code: (err as NodeJS.ErrnoException).code ?? 'EUNKNOWN',
+    } };
+  }
+  if (raw === null) return { kind: 'absent' };
+  let parsed: unknown;
+  try {
+    parsed = family === 'B' ? parseJsonc(raw) : JSON.parse(raw);
+  } catch {
+    return { kind: 'fault', fault: {
+      reason: CONFIG_REASON.CONFIG_UNPARSEABLE,
+      path: file,
+      code: '',
+    } };
+  }
+  if (!isConfigSection(parsed)) {
+    return { kind: 'fault', fault: {
+      reason: CONFIG_REASON.CONFIG_UNPARSEABLE,
+      path: file,
+      code: '',
+    } };
+  }
+  return { kind: 'ok', data: parsed };
+}
 
 function ownValue(obj: unknown, key: string): { found: boolean; value: unknown; blocked: boolean } {
   let current: unknown = obj;
@@ -131,28 +163,25 @@ function keyFamily(key: string, capabilitySchema: () => Record<string, unknown>)
 }
 
 /**
- * The files of one ladder, highest first. `contained` marks the files a cloned
- * repository controls: each must resolve inside its own directory's realpath, so a
- * symlinked `.planning/`, planning scope or `.claude/` keeps working while a planted
- * symlinked file does not. User-level files may be symlinks (dotfile managers).
+ * The files of one ladder, highest first.
  */
-function fileLayers(cwd: string, family: ConfigFamily): Array<{ layer: ConfigLayer; file: string; contained: boolean }> {
+function fileLayers(cwd: string, family: ConfigFamily): Array<{ layer: ConfigLayer; file: string }> {
   if (family === 'A') {
-    const result: Array<{ layer: ConfigLayer; file: string; contained: boolean }> = [];
+    const result: Array<{ layer: ConfigLayer; file: string }> = [];
     const ws = resolveEnvWorkstream();
-    if (ws) result.push({ layer: 'workstream', file: path.join(planningDir(cwd, ws), 'config.json'), contained: true });
-    result.push({ layer: 'root', file: path.join(ws ? planningRoot(cwd) : planningDir(cwd, null), 'config.json'), contained: true });
-    result.push({ layer: 'global-defaults', file: path.join(process.env['GSD_HOME'] || os.homedir(), '.gsd', 'defaults.json'), contained: false });
+    if (ws) result.push({ layer: 'workstream', file: path.join(planningDir(cwd, ws), 'config.json') });
+    result.push({ layer: 'root', file: path.join(ws ? planningRoot(cwd) : planningDir(cwd, null), 'config.json') });
+    result.push({ layer: 'global-defaults', file: path.join(process.env['GSD_HOME'] || os.homedir(), '.gsd', 'defaults.json') });
     return result;
   }
   const projectDir = path.join(cwd, '.claude');
   const userDir = getGlobalConfigDir('claude');
-  const result: Array<{ layer: ConfigLayer; file: string; contained: boolean }> = [
-    { layer: 'runtime-local', file: path.join(projectDir, 'settings.local.json'), contained: true },
-    { layer: 'runtime-shared', file: path.join(projectDir, 'settings.json'), contained: true },
+  const result: Array<{ layer: ConfigLayer; file: string }> = [
+    { layer: 'runtime-local', file: path.join(projectDir, 'settings.local.json') },
+    { layer: 'runtime-shared', file: path.join(projectDir, 'settings.json') },
   ];
   if (path.resolve(userDir) !== path.resolve(projectDir)) {
-    result.push({ layer: 'runtime-user', file: path.join(userDir, 'settings.json'), contained: false });
+    result.push({ layer: 'runtime-user', file: path.join(userDir, 'settings.json') });
   }
   return result;
 }
@@ -174,16 +203,14 @@ function resolveConfigValue(
   const federatedSlice = family === 'A' && !isCentralConfigKey(key)
     ? capabilitySchema()[key] : null;
   const entries: Array<{ layer: ConfigLayer; value: unknown; rank: number }> = [];
-  const faults: Array<{ rank: number; fault: Parameters<typeof _warnUnusableConfig>[0] }> = [];
+  const faults: Array<{ rank: number; fault: ConfigFault }> = [];
   let emptyFile = false;
   let workstreamMissing = false;
+  let blockedByParent = false;
   let detected: string[] | undefined;
   const layers = fileLayers(opts.cwd, family);
-  for (const [rank, { layer, file, contained }] of layers.entries()) {
-    const read = _readConfigFile(file, {
-      format: family === 'B' ? 'jsonc' : 'json',
-      bounded: { maxBytes: CONFIG_LAYER_MAX_BYTES, containedIn: contained ? path.dirname(file) : null },
-    });
+  for (const [rank, { layer, file }] of layers.entries()) {
+    const read = readConfigLayer(file, family);
     if (read.kind === 'fault') {
       faults.push({ rank, fault: read.fault });
       if (layer === 'workstream') workstreamMissing = true;
@@ -215,9 +242,12 @@ function resolveConfigValue(
         && typeMatchesSlice(resolved.value, federatedSlice)))) {
       entries.push({ layer, value: resolved.value, rank });
     }
-    if (resolved.blocked) break;
+    if (resolved.blocked) {
+      blockedByParent = true;
+      break;
+    }
   }
-  if (family === 'A') {
+  if (family === 'A' && !blockedByParent) {
     const schemaDefault = resolveSchemaDefault(opts.cwd, key, capabilitySchema);
     if (schemaDefault.found) entries.push({ layer: 'schema-default', value: schemaDefault.value, rank: layers.length });
     const builtin = ownValue(CONFIG_DEFAULTS, key);
@@ -230,7 +260,9 @@ function resolveConfigValue(
   // loader keeps a global-defaults fault silent once a project config parsed.
   const winnerRank = entries.length === 0 || mergedKey !== null ? Infinity : entries[0].rank;
   const relevant = faults.filter(({ rank }) => rank < winnerRank);
-  for (const { fault } of relevant) _warnUnusableConfig(fault, 'this key resolves from the remaining layers instead');
+  for (const { fault } of relevant) {
+    warnUnusableInput({ reason: UNUSABLE_REASON.CONFIG_UNREADABLE, source: fault.path });
+  }
   const faultReason = relevant.length > 0 ? relevant[0].fault.reason : null;
   if (entries.length === 0) {
     return missing(faultReason ?? (emptyFile ? CONFIG_REASON.CONFIGURED_EMPTY : CONFIG_REASON.NOT_CONFIGURED));
@@ -258,4 +290,4 @@ function resolveConfigValue(
     ...(isConfigSection(value) ? { composite } : {}) };
 }
 
-export = { resolveConfigValue, CONFIG_LAYER_MAX_BYTES };
+export = { resolveConfigValue };

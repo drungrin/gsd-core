@@ -40,13 +40,6 @@ import { CONFIG_DEFAULTS as CANONICAL_CONFIG_DEFAULTS, normalizeLegacyKeys, isCo
 import configSchema = require('./config-schema.cjs');
 const { VALID_CONFIG_KEYS, DYNAMIC_KEY_PATTERNS, isCentralConfigKey: _isCentralConfigKeyFn } = configSchema;
 import { KNOWN_RUNTIMES, KNOWN_PROVIDERS, ADAPTIVE_TIER_VALUES } from './model-catalog.cjs';
-// #5096: the resolver's layer read — JSONC for runtime settings, the shared fd-bounded
-// regular-file reader, and the canonical realpath containment comparison.
-import { parseJsonc } from './settings-jsonc.cjs';
-import { isContainedIn } from './security.cjs';
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-import ledgerModule = require('./capability-ledger.cjs');
-const { readSmallRegularFile } = ledgerModule;
 // #3760: the ADR-1411 out-of-band diagnostic seam. loadConfig returns `.config`
 // alone, so an in-band `skipped` record would be unreachable to nearly every
 // caller — "a reason no caller reads is an unreachable field" (ADR-1411).
@@ -133,6 +126,37 @@ function _getConfigNested(parsed: Record<string, unknown>, section: string, fiel
     return (sec as Record<string, unknown>)[field];
   }
   return undefined;
+}
+
+/**
+ * A present non-object section is an explicit inheritance barrier. Remove every
+ * projection the assembled loader would otherwise repopulate from defaults so
+ * its effective object agrees with per-key resolution (#5096 Major 2).
+ */
+const BLOCKED_SECTION_PROJECTIONS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  workflow: [
+    'workflow', 'research', 'plan_checker', 'verifier', 'nyquist_validation',
+    'post_planning_gaps', 'mvp_mode', 'tdd_mode', 'text_mode', 'auto_advance',
+    '_auto_chain_active', 'subagent_timeout',
+  ],
+  git: [
+    'git', 'branching_strategy', 'base_branch', 'protected_branches',
+    'allow_default_branch_commits', 'phase_branch_template',
+    'milestone_branch_template', 'quick_branch_template',
+  ],
+  planning: ['planning', 'commit_docs', 'search_gitignored', 'sub_repos', 'pr_strict'],
+  planner: ['planner', 'planner_stall_detection_enabled'],
+  review: ['review'],
+});
+
+function _removeBlockedSectionDefaults(
+  parsed: Record<string, unknown>,
+  assembled: Record<string, unknown>,
+): void {
+  for (const [section, projections] of Object.entries(BLOCKED_SECTION_PROJECTIONS)) {
+    if (!Object.prototype.hasOwnProperty.call(parsed, section) || isConfigSection(parsed[section])) continue;
+    for (const projection of projections) delete assembled[projection];
+  }
 }
 
 const CONFIG_DEFAULTS = {
@@ -596,49 +620,17 @@ interface ConfigResolution {
 }
 
 /**
- * How the Config Value Resolution Module reads a layer (#5096). The format is a
- * closed choice, not an injected parser, so no caller can bypass the shape check
- * below. `bounded` opts into a fd-bounded read of a regular file of at most
- * `maxBytes`; a non-null `containedIn` also refuses a file whose realpath leaves
- * that directory's realpath (a repository-plantable symlink). The loader's own
- * reads pass neither, so `loadConfig` is unchanged.
- */
-interface ConfigFileReadOptions {
-  format?: 'json' | 'jsonc';
-  bounded?: { maxBytes: number; containedIn: string | null };
-}
-
-/** Synthetic errno for a bounded read refused because the file escapes its root. */
-const CONFIG_OUTSIDE_ROOT_CODE = 'EOUTSIDEROOT';
-
-function _readBoundedConfigText(filePath: string, bounds: { maxBytes: number; containedIn: string | null }): string | null {
-  if (bounds.containedIn !== null) {
-    let realFile: string;
-    try {
-      realFile = fs.realpathSync(filePath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
-      throw err;
-    }
-    if (!isContainedIn(realFile, fs.realpathSync(bounds.containedIn))) {
-      throw Object.assign(new Error(`${filePath} resolves outside ${bounds.containedIn}`), { code: CONFIG_OUTSIDE_ROOT_CODE });
-    }
-  }
-  return readSmallRegularFile(filePath, bounds.maxBytes);
-}
-
-/**
  * Read + parse a config file, keeping *absent* distinguishable from
  * *unusable*. `platformReadSync` returns null on ENOENT and re-throws every
  * other errno, which is the seam that makes this separable at all.
  */
-function _readConfigFile(filePath: string, options: ConfigFileReadOptions = {}):
+function _readConfigFile(filePath: string):
   | { kind: 'ok'; data: Record<string, unknown> }
   | { kind: 'absent' }
   | { kind: 'fault'; fault: ConfigFault } {
   let raw: string | null;
   try {
-    raw = options.bounded ? _readBoundedConfigText(filePath, options.bounded) : platformReadSync(filePath);
+    raw = platformReadSync(filePath);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code ?? 'EUNKNOWN';
     return { kind: 'fault', fault: { reason: CONFIG_REASON.CONFIG_UNREADABLE, path: filePath, code } };
@@ -646,7 +638,7 @@ function _readConfigFile(filePath: string, options: ConfigFileReadOptions = {}):
   if (raw === null) return { kind: 'absent' };
   let parsed: unknown;
   try {
-    parsed = options.format === 'jsonc' ? parseJsonc(raw) : JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
     return { kind: 'fault', fault: { reason: CONFIG_REASON.CONFIG_UNPARSEABLE, path: filePath, code: '' } };
   }
@@ -676,7 +668,7 @@ const _warnedUnusableConfig = new Set<string>();
  * is unreachable to almost every consumer, and the user whose config was
  * silently discarded still gets no signal. That was the whole defect in #1880.
  */
-function _warnUnusableConfig(fault: ConfigFault, consequence = 'using defaults instead'): void {
+function _warnUnusableConfig(fault: ConfigFault): void {
   // The NUL separators are load-bearing: without them `path`+`reason`+`code` is bare
   // concatenation and two distinct faults can key alike. They are written as escapes rather
   // than literal 0x00 bytes because a literal NUL makes the whole file binary to file(1) and
@@ -690,7 +682,7 @@ function _warnUnusableConfig(fault: ConfigFault, consequence = 'using defaults i
     ? 'is not valid JSON'
     : `could not be read (${fault.code})`;
   process.stderr.write(
-    `gsd-tools: warning: ${fault.path} ${what} — its settings were NOT applied; ${consequence}\n`,
+    `gsd-tools: warning: ${fault.path} ${what} — its settings were NOT applied; using defaults instead\n`,
   );
 }
 
@@ -1039,6 +1031,8 @@ function loadConfigResolvedInternal(cwd: string, options: Record<string, unknown
       // Defensive: keep no-throw contract
     }
 
+    _removeBlockedSectionDefaults(parsed, _baseConfig);
+
     // A1 vs A2: disambiguate by whether a real workstream was requested.
     // Fix 4: empty-string ws ('') resolves the root path → source:'root'.
     const source: ConfigSource = wsRequested ? 'workstream' : 'root';
@@ -1242,8 +1236,6 @@ export = {
   loadConfig,
   loadConfigResolved,
   CONFIG_REASON,
-  _readConfigFile,
-  _warnUnusableConfig,
   _warnedUnusableConfig,
   isGitIgnored,
   CONFIG_DEFAULTS,
