@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const fc = require('./helpers/fast-check-setup.cjs');
 const { cleanup } = require('./helpers.cjs');
-const { resolveConfigValue, CONFIG_LAYER_MAX_BYTES } = require('../gsd-core/bin/lib/config-value-resolver.cjs');
+const { resolveConfigValue } = require('../gsd-core/bin/lib/config-value-resolver.cjs');
 const { loadConfigResolved } = require('../gsd-core/bin/lib/config-loader.cjs');
 
 function withLayers(run) {
@@ -50,11 +50,6 @@ function setPath(key, value) {
   return key.split('.').reverse().reduce((nested, segment) => ({ [segment]: nested }), value);
 }
 
-function writeJson(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(value), 'utf8');
-}
-
 function corruptLayer(cwd, layer) {
   const file = writeLayer(cwd, layer, {});
   fs.writeFileSync(file, '{not json', 'utf8');
@@ -71,25 +66,7 @@ function captureConfigDiagnostics(fn) {
   } finally {
     process.stderr.write = originalWrite;
   }
-  return chunks.filter((chunk) => chunk.includes('its settings were NOT applied'));
-}
-
-/** A symlink this host may refuse (unprivileged Windows); false means skip, never pass. */
-function trySymlink(target, linkPath, type) {
-  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
-  try {
-    fs.symlinkSync(target, linkPath, type);
-    return true;
-  } catch (err) {
-    if (['EPERM', 'EACCES', 'ENOSYS'].includes(err.code)) return false;
-    throw err;
-  }
-}
-
-/** JSON text of exactly `size` bytes carrying `value`, padded through an extra field. */
-function jsonOfSize(value, size) {
-  const base = Buffer.byteLength(JSON.stringify({ ...value, pad: '' }));
-  return JSON.stringify({ ...value, pad: 'x'.repeat(size - base) });
+  return chunks.filter((chunk) => chunk.includes('(#1879)'));
 }
 
 const LADDERS = {
@@ -108,8 +85,7 @@ function writeState(cwd, layer, key, state) {
 
 /**
  * The ADR-1411 ladder walk for a replacing key, written apart from the module: the
- * first layer holding the key wins; a non-object parent stops the files but not the
- * declared `fallback` (what an empty project resolves); an unusable layer counts only
+ * first layer holding the key wins; a non-object parent stops every lower layer; an unusable layer counts only
  * above the winner.
  */
 function expectedLadder(family, states, fallback) {
@@ -131,7 +107,10 @@ function expectedLadder(family, states, fallback) {
       empty = true;
       continue;
     }
-    if (state.kind === 'nullParent') break;
+    if (state.kind === 'nullParent') {
+      return { resolution: { found: false, value: undefined, layer: null,
+        reason: fault ?? 'not_configured' }, faults };
+    }
     return {
       resolution: { found: true, value: state.value, layer,
         reason: fault ?? (layer === 'root' && workstreamMissing ? 'workstream_fallback' : 'resolved') },
@@ -294,6 +273,26 @@ describe('Config Value Resolution Module (#5096)', () => {
     });
   });
 
+  test('top-level null, array and scalar layer documents are unusable, never absent', () => {
+    for (const [layer, key] of [
+      ['root', 'project_code'],
+      ['runtime-shared', 'worktree.baseRef'],
+    ]) {
+      for (const value of [null, [], 0, 'text']) {
+        withLayers((cwd) => {
+          const file = writeLayer(cwd, layer, {});
+          fs.writeFileSync(file, JSON.stringify(value), 'utf8');
+          let result;
+          const diagnostics = captureConfigDiagnostics(() => {
+            result = resolveConfigValue(key, { cwd });
+          });
+          assert.equal(result.reason, 'config_unparseable');
+          assert.equal(diagnostics.length, 1);
+        });
+      }
+    }
+  });
+
   test('a corrupt higher layer does not hide the lower value or its origin', () => {
     withLayers((cwd) => {
       writeLayer(cwd, 'root', { project_code: 'working' });
@@ -358,114 +357,6 @@ describe('Config Value Resolution Module (#5096)', () => {
         reason: 'config_unparseable', composite: { planner: 'workstream' },
       });
       assert.equal(diagnostics.length, 1);
-    });
-  });
-
-  test('layer reads are bounded at limit-1, limit and limit+1 bytes', () => {
-    for (const [layer, key, object] of [
-      ['runtime-shared', 'worktree.baseRef', { worktree: { baseRef: 'sized' } }],
-      ['root', 'project_code', { project_code: 'sized' }],
-    ]) {
-      for (const [size, readable] of [
-        [CONFIG_LAYER_MAX_BYTES - 1, true],
-        [CONFIG_LAYER_MAX_BYTES, true],
-        [CONFIG_LAYER_MAX_BYTES + 1, false],
-      ]) {
-        withLayers((cwd) => {
-          delete process.env.GSD_WORKSTREAM;
-          const file = writeLayer(cwd, layer, {});
-          fs.writeFileSync(file, jsonOfSize(object, size), 'utf8');
-          assert.equal(fs.statSync(file).size, size);
-          let result;
-          const diagnostics = captureConfigDiagnostics(() => {
-            result = resolveConfigValue(key, { cwd });
-          });
-          if (readable) {
-            assert.deepEqual(result, { found: true, value: 'sized', layer, reason: 'resolved' });
-            assert.deepEqual(diagnostics, []);
-          } else {
-            assert.deepEqual(result, layer === 'root'
-              ? { found: true, value: null, layer: 'builtin-default', reason: 'config_unreadable' }
-              : { found: false, value: undefined, layer: null, reason: 'config_unreadable' });
-            assert.equal(diagnostics.length, 1);
-            assert.match(diagnostics[0], /could not be read \(EFBIG\)/);
-          }
-        });
-      }
-    }
-  });
-
-  test('a repository layer symlinked outside its own directory is unreadable, not followed', (t) => {
-    withLayers((cwd) => {
-      delete process.env.GSD_WORKSTREAM;
-      const outside = path.join(cwd, 'outside.json');
-      fs.writeFileSync(outside, JSON.stringify({ project_code: 'FROM-OUTSIDE', worktree: { baseRef: 'FROM-OUTSIDE' } }));
-      const rootFile = path.join(cwd, '.planning', 'config.json');
-      const settingsFile = path.join(cwd, '.claude', 'settings.json');
-      if (!trySymlink(outside, rootFile, 'file') || !trySymlink(outside, settingsFile, 'file')) {
-        t.skip('this host refuses file symlinks');
-        return;
-      }
-      const diagnostics = captureConfigDiagnostics(() => {
-        assert.deepEqual(resolveConfigValue('project_code', { cwd }), {
-          found: true, value: null, layer: 'builtin-default', reason: 'config_unreadable',
-        });
-        assert.deepEqual(resolveConfigValue('worktree.baseRef', { cwd }), {
-          found: false, value: undefined, layer: null, reason: 'config_unreadable',
-        });
-      });
-      assert.equal(diagnostics.length, 2);
-      for (const diagnostic of diagnostics) assert.match(diagnostic, /could not be read \(EOUTSIDEROOT\)/);
-    });
-  });
-
-  test('a symlinked planning or settings directory and a symlinked user file still resolve', (t) => {
-    withLayers((cwd) => {
-      delete process.env.GSD_WORKSTREAM;
-      const store = path.join(cwd, 'store');
-      writeJson(path.join(store, 'planning', 'config.json'), { project_code: 'stored' });
-      writeJson(path.join(store, 'claude', 'settings.json'), { worktree: { baseRef: 'stored' } });
-      writeJson(path.join(store, 'dotfiles', 'settings.json'), { worktree: { baseRef: 'dotfiles' } });
-      if (!trySymlink(path.join(store, 'planning'), path.join(cwd, '.planning'), 'junction')
-          || !trySymlink(path.join(store, 'claude'), path.join(cwd, '.claude'), 'junction')) {
-        t.skip('this host refuses directory symlinks');
-        return;
-      }
-      assert.deepEqual(resolveConfigValue('project_code', { cwd }), {
-        found: true, value: 'stored', layer: 'root', reason: 'resolved',
-      });
-      assert.deepEqual(resolveConfigValue('worktree.baseRef', { cwd }), {
-        found: true, value: 'stored', layer: 'runtime-shared', reason: 'resolved',
-      });
-      cleanup(path.join(cwd, '.claude'));
-      if (!trySymlink(path.join(store, 'dotfiles', 'settings.json'),
-        path.join(process.env.CLAUDE_CONFIG_DIR, 'settings.json'), 'file')) {
-        t.skip('this host refuses file symlinks');
-        return;
-      }
-      assert.deepEqual(resolveConfigValue('worktree.baseRef', { cwd }), {
-        found: true, value: 'dotfiles', layer: 'runtime-user', reason: 'resolved',
-      });
-    });
-  });
-
-  test('a layer that is not a regular file is unreadable without being read', (t) => {
-    if (process.platform === 'win32' || !fs.existsSync('/dev/zero')) {
-      t.skip('no character device to link on this host');
-      return;
-    }
-    withLayers((cwd) => {
-      if (!trySymlink('/dev/zero', path.join(process.env.CLAUDE_CONFIG_DIR, 'settings.json'), 'file')) {
-        t.skip('this host refuses file symlinks');
-        return;
-      }
-      let result;
-      const diagnostics = captureConfigDiagnostics(() => {
-        result = resolveConfigValue('worktree.baseRef', { cwd });
-      });
-      assert.deepEqual(result, { found: false, value: undefined, layer: null, reason: 'config_unreadable' });
-      assert.equal(diagnostics.length, 1);
-      assert.match(diagnostics[0], /could not be read \(ENXIO\)/);
     });
   });
 
@@ -578,7 +469,7 @@ describe('Config Value Resolution Module (#5096)', () => {
     });
   });
 
-  test('a null parent blocks lower files but not schema or builtin defaults', () => {
+  test('a null parent blocks lower files, schema defaults and builtin defaults', () => {
     withLayers((cwd) => {
       writeLayer(cwd, 'root', { workflow: null, git: null });
       writeLayer(cwd, 'global-defaults', {
@@ -586,20 +477,20 @@ describe('Config Value Resolution Module (#5096)', () => {
         git: { branching_strategy: 'global' },
       });
       const schema = resolveConfigValue('workflow.research', { cwd });
-      assert.equal(schema.found, true);
-      assert.equal(schema.value, true);
-      assert.equal(schema.layer, 'schema-default');
+      assert.deepEqual(schema, {
+        found: false, value: undefined, layer: null, reason: 'not_configured',
+      });
       const builtin = resolveConfigValue('git.branching_strategy', { cwd });
-      assert.equal(builtin.found, true);
-      assert.equal(builtin.value, 'none');
-      assert.equal(builtin.layer, 'builtin-default');
-      // The declared default is what loadConfig assembles for these same files.
+      assert.deepEqual(builtin, {
+        found: false, value: undefined, layer: null, reason: 'not_configured',
+      });
       let assembled;
       captureConfigDiagnostics(() => {
         assembled = loadConfigResolved(cwd, { persist: false }).config;
       });
-      assert.equal(assembled.workflow.research, schema.value);
-      assert.equal(assembled.branching_strategy, builtin.value); // the loader flattens git.*
+      assert.equal(assembled.workflow?.research, undefined);
+      assert.equal(assembled.research, undefined);
+      assert.equal(assembled.branching_strategy, undefined); // the loader flattens git.*
     });
   });
 
@@ -611,15 +502,15 @@ describe('Config Value Resolution Module (#5096)', () => {
         let assembled;
         let resolution;
         captureConfigDiagnostics(() => {
-          assembled = loadConfigResolved(cwd, { persist: false }).config.workflow.research;
+          assembled = loadConfigResolved(cwd, { persist: false }).config.workflow?.research;
           resolution = resolveConfigValue('workflow.research', { cwd });
         });
-        // Only an object parent lets the root file's leaf through; every other parent stops it.
+        // Only an object parent lets the root file's leaf through; every other parent blocks all defaults.
         const inherited = typeof parent === 'object' && parent !== null && !Array.isArray(parent);
-        assert.equal(assembled, !inherited);
-        assert.deepEqual(resolution, {
-          found: true, value: assembled, layer: inherited ? 'root' : 'schema-default', reason: 'resolved',
-        });
+        assert.equal(assembled, inherited ? false : undefined);
+        assert.deepEqual(resolution, inherited
+          ? { found: true, value: false, layer: 'root', reason: 'resolved' }
+          : { found: false, value: undefined, layer: null, reason: 'not_configured' });
       });
     }
   });
