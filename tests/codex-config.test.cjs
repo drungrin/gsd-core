@@ -2131,6 +2131,67 @@ describe('stripGsdFromCodexConfig', () => {
     assert.strictEqual(stripGsdFromCodexConfig(cleaned), cleaned);
   });
 
+  test('#5199 F1: marker cleanup removes legacy hook blocks and preserves the following user table', () => {
+    const content = [
+      GSD_CODEX_MARKER,
+      '',
+      '[agents]',
+      'max_depth = 1',
+      '',
+      '# GSD Hooks',
+      '[[hooks.SessionStart]]',
+      '',
+      '[[hooks.SessionStart.hooks]]',
+      'type = "command"',
+      'command = "node /tmp/hooks/gsd-check-update.js"',
+      '',
+      '[mcp_servers.user]',
+      'command = "keep"',
+      '',
+    ].join('\n');
+    const cleaned = stripGsdFromCodexConfig(content);
+    assert.deepStrictEqual(parseTomlToObject(cleaned), {
+      mcp_servers: { user: { command: 'keep' } },
+    });
+    assert.strictEqual(stripGsdFromCodexConfig(cleaned), cleaned);
+  });
+
+  test('#5199 F2: cleanup preserves a trailing user comment with the table it describes', () => {
+    const content = [
+      GSD_CODEX_MARKER,
+      '[agents]',
+      'max_depth = 1',
+      '',
+      '# my MCP notes',
+      '[mcp_servers.user]',
+      'command = "keep"',
+      '',
+    ].join('\n');
+    const cleaned = stripGsdFromCodexConfig(content);
+    assert.deepStrictEqual(parseTomlToObject(cleaned), {
+      mcp_servers: { user: { command: 'keep' } },
+    });
+    assert.ok(cleaned.includes('# my MCP notes\n[mcp_servers.user]'),
+      'the comment immediately above a user table belongs to that table');
+  });
+
+  test('#5199 N1: hooks ownership accepts trailing horizontal whitespace', () => {
+    const content = [
+      GSD_CODEX_MARKER,
+      '# GSD codex_hooks ownership: section  \t',
+      '[features]',
+      'hooks = true',
+      '',
+      '[mcp_servers.user]',
+      'command = "keep"',
+      '',
+    ].join('\n');
+    const cleaned = stripGsdFromCodexConfig(content);
+    assert.deepStrictEqual(parseTomlToObject(cleaned), {
+      mcp_servers: { user: { command: 'keep' } },
+    });
+  });
+
   test('#5199: marker and legacy feature text inside user values are preserved', () => {
     const user = [
       `literal_marker = ${JSON.stringify(GSD_CODEX_MARKER)}`,
