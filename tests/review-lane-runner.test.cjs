@@ -781,7 +781,7 @@ describe('#5288 reviewer HTTP redirects', () => {
   const reviewBody = JSON.stringify({ model: 'redirected', choices: [{ message: { content: 'REDIRECT REVIEW' } }] });
 
   for (const lane of httpLanes) {
-    test(`${lane.slug}: model discovery and chat request manual redirects`, async () => {
+    test(`${lane.slug}: model discovery and chat use the execution request paths`, async () => {
       const calls = [];
       const d = deps({
         httpJson: async (url, opts) => {
@@ -793,8 +793,8 @@ describe('#5288 reviewer HTTP redirects', () => {
       });
       const r = await runOpenAiCompatible(plan(lane.slug), 'SYNTHETIC PROMPT', d);
       assert.equal(r.review, 'REDIRECT REVIEW');
-      assert.deepStrictEqual(calls.map(({ opts }) => [opts.method, opts.redirect]), [
-        ['GET', 'manual'], ['POST', 'manual'],
+      assert.deepStrictEqual(calls.map(({ url, opts }) => [new URL(url).pathname, opts.method, opts.probe === true]), [
+        ['/v1/models', 'GET', false], ['/v1/chat/completions', 'POST', false],
       ]);
     });
 
@@ -874,6 +874,7 @@ describe('#5288 reviewer HTTP redirects', () => {
               if (redirect) redirectedBodyCancelled = true;
               throw new Error('stream cancellation failed');
             } },
+            headers: { get: () => null },
             text: async () => JSON.stringify(opts.method === 'GET'
               ? { data: [{ id: 'model' }] }
               : { choices: [{ message: { content: 'NORMAL REVIEW' } }] }) };
@@ -897,7 +898,7 @@ describe('#5288 reviewer HTTP redirects', () => {
       assert.equal(result.ok, false);
       assert.equal(result.reason, 'http_redirect');
       assert.equal(result.stubbed, true);
-      assert.ok(result.detail.includes('HTTP redirect 307'));
+      assert.ok(result.detail.includes('HTTP 307'));
     });
   }
 
@@ -971,7 +972,7 @@ describe('#5288 reviewer HTTP redirects', () => {
         assert.equal(f.result.ok, false);
         assert.equal(f.result.reason, 'http_redirect');
         assert.equal(f.result.stubbed, true);
-        assert.ok(f.result.detail.includes(`HTTP redirect ${status}`));
+        assert.ok(f.result.detail.includes(`HTTP ${status}`));
         assert.ok(!f.review.includes('REDIRECT REVIEW'));
         const posts = f.hostRequests.filter((r) => r.method === 'POST');
         if (method === 'GET') assert.deepStrictEqual(posts, []);
