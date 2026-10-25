@@ -108,9 +108,19 @@ node gsd-tools.cjs state update-progress
 node gsd-tools.cjs state add-decision --summary "..." [--phase N] [--rationale "..."]
 # Or from files:
 node gsd-tools.cjs state add-decision --summary-file path [--rationale-file path]
+# Text-file inputs (--summary-file, --rationale-file, --text-file, --note-file) are
+# read once and copied into STATE.md, so any readable regular file of up to 256 KiB is
+# accepted, including one in a temp/scratch directory outside the project; a relative
+# path resolves against the project root. A file that cannot be read, a FIFO, device
+# or directory, a file over 256 KiB, a required field left blank (an empty or
+# whitespace-only --summary, --text or --note, inline or as a file), or a missing
+# STATE.md is refused on stderr with a non-zero exit (reason "usage") and STATE.md is
+# not touched. A blank rationale, inline or file, just means no rationale.
+# (add-decision, add-blocker and add-roadmap-evolution only.)
 
 # Add/resolve blockers
 node gsd-tools.cjs state add-blocker --text "..."
+node gsd-tools.cjs state add-blocker --text-file path
 node gsd-tools.cjs state resolve-blocker --text "..."
 
 # Record session continuity (at least one of --stopped-at / --resume-file is required)
@@ -592,7 +602,56 @@ node gsd-tools.cjs config-get <key>
 
 # Set model profile
 node gsd-tools.cjs config-set-model-profile <profile>
+
+# Create config.json for a new project from the chosen settings
+node gsd-tools.cjs config-new-project '<choices-json>' [--dry-run]
 ```
+
+`config-new-project` takes the chosen settings as one JSON object, nested by section
+(`'{"mode":"yolo","workflow":{"research":false}}'`), and layers them over the built-in and
+user defaults. It checks each choice with the same key and value rules as `config-set` and
+creates nothing if any choice is refused: an unknown key, a value the key does not accept,
+or a dotted key (`"workflow.research"`) in place of a nested one. A `null` choice is treated
+as not chosen: its key is still checked, and it takes the value it would have had without the
+choice (the built-in or user default). That is the creation-time counterpart of `config-set
+<key> null`, which removes the key from an existing config.
+
+An object is read as a section whenever settings live under its key, and its entries are
+checked one by one. An empty section sets nothing (`"workflow":{}`, `"agent_skills":{}`), with
+one exception: below the first level of a dynamic key family
+(`"model_profile_overrides":{"claude":{}}`) an empty object is refused as an unknown key, as
+`config-set` refuses it. Under a key with no settings below it, an object is a value, held to
+that key's rule as `config-set` holds it (`"model_overrides":{"gsd-executor":{}}` is written,
+`"mode":{}` is refused). Under a name that is neither, it is refused as an unknown key. A
+section given anything but an object is refused, unless its key is itself a setting
+(`agent_tools`), where the value is held to that setting's rule as `config-set` holds it. An
+empty or blank choices argument is the same as none.
+
+Two differences from `config-set` follow from the input being JSON rather than typed text:
+
+- Values are JSON-typed and never coerced. `config-set workflow.research true` parses the
+  text `true` to a boolean; the choice `"research":"true"` is a string and is refused.
+- A setting that also has per-entry settings under it (`review.max_prompt_tokens_per_reviewer`,
+  `agent_tools`) takes an object of those entries, each checked as `config-set` checks that
+  entry's own key: for the reviewer budget `{"codex":5000}` is accepted and `{"a":1}` is
+  refused, where `config-set` stores any object given to the setting whole.
+  `review.max_prompt_tokens_per_reviewer` also takes a number for itself.
+
+One difference does not: a `null` choice under `__proto__`, `prototype` or `constructor`, for a
+key that is otherwise known (`{"model_overrides":{"constructor":null}}`), is refused by the
+prototype-pollution guard.
+`config-set model_overrides.constructor null` reaches that guard only when the config has a
+`model_overrides` section; without one it finds nothing to remove and exits 0, having checked
+that the key is known but not that guard. The default config (`config-new-project '{}'`) has
+some of these sections (`agent_skills`) and not others (`model_overrides`, `agent_tools`,
+`features`), so the difference can hold after creation too.
+
+`--dry-run` prints the config that would be created and writes nothing, with secret keys
+masked as `config-set` masks them; any other flag is refused. The choices are checked first,
+so a refused choice, malformed JSON included, fails even when `config.json` already exists;
+with valid choices and an existing `config.json`, the command reports `already_exists` and
+leaves it untouched. The user defaults file is read only to build a new config, so a problem in
+it is not reported when the config already exists.
 
 ---
 
@@ -908,7 +967,7 @@ Reads the phase's `*-VERIFICATION.md` frontmatter and answers with one member of
 | `unparseable` | The report's frontmatter is not YAML | `""` (fix the report itself) |
 | `phase_dir_not_found` | There is no phase directory at that path | `""` (a usage error — see below) |
 
-The JSON result carries `status`, `next_action`, `next_command` (the route projected for the project's runtime, for example `/gsd-execute-phase 3` or `$gsd-execute-phase 3` on Codex), and — additive since #5118 — `route`, the bare command from the same table entry, so the two can never disagree. `message` is present only where a usage error needs one. `uncovered_artifacts` (#4817) is present only on a `stale` result for an older v1/v2 report that never declared some current plan or summary in `covered_files`: it lists those file names, and `next_action` names them and says whether a covered file also changed, so "a covered file changed" and "an artifact was never covered" read differently. The remedy and route are the same. A report written by the current fingerprint verb (v3) cannot reach that state: it covers the phase's own artifacts itself. `moved_files` (#4857) is present on a `stale` result whose digest moved and names the declared covered files modified after the report was written (by clean commit time, or mtime for an uncommitted edit; report paths and shared planning documents are excluded exactly as the digest excludes them), so an edit to a covered file reads differently from a missing artifact or a self-covering report. It is advisory: the digest alone decides staleness, and a stale report that carries no `moved_files` was not invalidated by an edit to a file it covers. `staleCheckIndeterminate` is unchanged. The `init *` bundles expose the same bare command as `verification_route` beside `verification_next_command`, and each `planning inspect` phase carries `verification.route` beside `verification.status`.
+The JSON result carries `status`, `next_action`, `next_command` (the route projected for the project's runtime, for example `/gsd-execute-phase 3` or `$gsd-execute-phase 3` on Codex), and — additive since #5118 — `route`, the bare command from the same table entry, so the two can never disagree. `message` is present only where a usage error needs one. `uncovered_artifacts` (#4817) is present only on a `stale` result for an older v1/v2 report that never declared some current plan or summary in `covered_files`: it lists those file names, and `next_action` names them and says whether a covered file also changed, so "a covered file changed" and "an artifact was never covered" read differently. The remedy and route are the same. A report written by the current fingerprint verb (v4) cannot reach that state: it covers the phase's own artifacts itself. Newly written v4 fingerprints hash CRLF byte pairs as LF, preserving every other byte (including lone CR and non-UTF-8 input), so a line-ending-only checkout rewrite leaves the report fresh. Stored v1–v3 fingerprints are recomputed with their original raw-byte semantics; upgrading does not re-fingerprint them. `moved_files` (#4857) is present on a `stale` result whose digest moved and names the declared covered files modified after the report was written (by clean commit time, or mtime for an uncommitted edit; report paths and shared planning documents are excluded exactly as the digest excludes them), so an edit to a covered file reads differently from a missing artifact or a self-covering report. It is advisory: the digest alone decides staleness, and a stale report that carries no `moved_files` was not invalidated by an edit to a file it covers. `staleCheckIndeterminate` is unchanged. The `init *` bundles expose the same bare command as `verification_route` beside `verification_next_command`, and each `planning inspect` phase carries `verification.route` beside `verification.status`.
 
 - **`phase_dir_not_found`** is a usage error, not a verification state: nothing was there to look in (a dangling symlink and a path that is a regular file both read this way). It has no next command — re-running `execute-phase` could re-run a phase already archived under `.planning/milestones/`. Resolve the directory with `find-phase`.
 - **`unknown` no longer exists.** A `status` outside the set used to route as `unknown` to `execute-phase`; that is now the hard error below, and no command emits `unknown`.
