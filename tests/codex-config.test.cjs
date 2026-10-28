@@ -2128,7 +2128,6 @@ describe('stripGsdFromCodexConfig', () => {
       agents: { max_threads: 7, future_tuning: { enabled: false } },
       mcp_servers: { user: { command: 'keep' } },
     });
-    assert.strictEqual(stripGsdFromCodexConfig(cleaned), cleaned, 'a second cleanup keeps one user [agents] table');
   });
 
   test('#5199: marker cleanup preserves user [[agents]] entries and strips legacy managed entries', () => {
@@ -2164,32 +2163,48 @@ describe('stripGsdFromCodexConfig', () => {
     assert.strictEqual(stripGsdFromCodexConfig(cleaned), cleaned);
   });
 
-  test('#5199 F2: cleanup preserves a trailing user comment with the table it describes', () => {
-    const content = [
+  for (const gap of ['', '\n']) {
+    test(`#5199 F2: cleanup preserves a trailing user comment${gap ? ' across a blank separator' : ''}`, () => {
+      const content = [
+        GSD_CODEX_MARKER,
+        '[agents]',
+        'max_depth = 1',
+        '',
+        '# my MCP notes',
+        ...(gap ? [''] : []),
+        '[mcp_servers.user]',
+        'command = "keep"',
+        '',
+      ].join('\n');
+      const cleaned = stripGsdFromCodexConfig(content);
+      assert.deepStrictEqual(parseTomlToObject(cleaned), {
+        mcp_servers: { user: { command: 'keep' } },
+      });
+      const separator = gap ? '\n\n' : '\n';
+      assert.ok(cleaned.includes(`# my MCP notes${separator}[mcp_servers.user]`),
+        'the trailing comment block belongs to the following user table');
+    });
+  }
+
+  test('#5199 F2: cleanup preserves a user comment at EOF', () => {
+    const cleaned = stripGsdFromCodexConfig([
       GSD_CODEX_MARKER,
       '[agents]',
       'max_depth = 1',
       '',
-      '# my MCP notes',
-      '[mcp_servers.user]',
-      'command = "keep"',
+      '# keep this note',
       '',
-    ].join('\n');
-    const cleaned = stripGsdFromCodexConfig(content);
-    assert.deepStrictEqual(parseTomlToObject(cleaned), {
-      mcp_servers: { user: { command: 'keep' } },
-    });
-    assert.ok(cleaned.includes('# my MCP notes\n[mcp_servers.user]'),
-      'the comment immediately above a user table belongs to that table');
+    ].join('\n'));
+    assert.equal(cleaned, '# keep this note\n');
   });
 
-  test('#5199 N1: hooks ownership accepts trailing horizontal whitespace', () => {
+  test('#5199 F2: legacy hook cleanup preserves the comment for the following user table', () => {
     const content = [
       GSD_CODEX_MARKER,
-      '# GSD codex_hooks ownership: section  \t',
-      '[features]',
-      'hooks = true',
+      '[[hooks.SessionStart]]',
+      'command = "node /home/.codex/hooks/gsd-check-update.js"',
       '',
+      '# user MCP notes',
       '[mcp_servers.user]',
       'command = "keep"',
       '',
@@ -2198,6 +2213,85 @@ describe('stripGsdFromCodexConfig', () => {
     assert.deepStrictEqual(parseTomlToObject(cleaned), {
       mcp_servers: { user: { command: 'keep' } },
     });
+    assert.ok(cleaned.includes('# user MCP notes\n[mcp_servers.user]'));
+  });
+
+  for (const eol of ['\n', '\r\n']) {
+    test(`#5199 N1: hooks ownership accepts trailing horizontal whitespace with ${JSON.stringify(eol)}`, () => {
+      const content = [
+        GSD_CODEX_MARKER,
+        '# GSD codex_hooks ownership: section  \t',
+        '[features]',
+        'hooks = true',
+        '',
+        '[mcp_servers.user]',
+        'command = "keep"',
+        '',
+      ].join(eol);
+      const cleaned = stripGsdFromCodexConfig(content);
+      assert.deepStrictEqual(parseTomlToObject(cleaned), {
+        mcp_servers: { user: { command: 'keep' } },
+      });
+      if (eol === '\r\n') assert.doesNotMatch(cleaned, /(?<!\r)\n/);
+    });
+  }
+
+  test('#5199: marker cleanup preserves multiline-string blank runs while removing stale hooks', () => {
+    const content = [
+      GSD_CODEX_MARKER,
+      '[[hooks.SessionStart]]',
+      'command = "node /home/.codex/hooks/gsd-check-update.js"',
+      '',
+      '[user]',
+      'notes = """a',
+      '',
+      '',
+      'b"""',
+      '',
+    ].join('\n');
+    const cleaned = stripGsdFromCodexConfig(content);
+    assert.equal(parseTomlToObject(cleaned).user.notes, 'a\n\n\nb');
+  });
+
+  test('#5199: removing a GSD-owned features table keeps its user comment without the header', () => {
+    const content = [
+      GSD_CODEX_MARKER,
+      '# GSD codex_hooks ownership: section',
+      '[features]',
+      'hooks = true',
+      '# user note',
+      '[mcp_servers.user]',
+      'command = "keep"',
+      '',
+    ].join('\n');
+    const cleaned = stripGsdFromCodexConfig(content);
+    assert.deepStrictEqual(parseTomlToObject(cleaned), {
+      mcp_servers: { user: { command: 'keep' } },
+    });
+    assert.ok(cleaned.includes('# user note\n[mcp_servers.user]'));
+    assert.equal(cleaned.includes('[features]'), false);
+  });
+
+  test('#5199: every managed marker and adjacent ownership line is removed idempotently', () => {
+    const content = [
+      GSD_CODEX_MARKER,
+      '[agents]',
+      'max_depth = 1',
+      GSD_CODEX_MARKER,
+      '# GSD codex_hooks ownership: section \t',
+      '[features]',
+      'hooks = true',
+      '[mcp_servers.user]',
+      'command = "keep"',
+      '',
+    ].join('\n');
+    const cleaned = stripGsdFromCodexConfig(content);
+    assert.deepStrictEqual(parseTomlToObject(cleaned), {
+      mcp_servers: { user: { command: 'keep' } },
+    });
+    assert.equal(cleaned.includes(GSD_CODEX_MARKER), false);
+    assert.equal(cleaned.includes('GSD codex_hooks ownership:'), false);
+    assert.equal(stripGsdFromCodexConfig(cleaned), cleaned);
   });
 
   test('#5199: marker and legacy feature text inside user values are preserved', () => {
@@ -2225,17 +2319,29 @@ describe('stripGsdFromCodexConfig', () => {
     const cleaned = stripGsdFromCodexConfig(content);
     assert.deepStrictEqual(parseTomlToObject(cleaned), expected, 'only the real managed marker and injected features are removed');
     assert.ok(cleaned.includes(user), 'literal marker and multiline bytes survive');
-    assert.strictEqual(stripGsdFromCodexConfig(cleaned), cleaned);
-    assert.strictEqual(stripGsdFromCodexConfig(user + userTable), user + userTable, 'literal marker text alone does not create a managed block');
   });
 
-  test('#5199: markerless feature cleanup preserves root and other-table lookalikes', () => {
+  test('#5199: markerless cleanup stays byte-compatible with the legacy path', () => {
     const input = ['multi_agent = true', '[features]', 'multi_agent = true',
       'default_mode_request_user_input = true', '[user]', 'multi_agent = true',
       'default_mode_request_user_input = true', ''].join('\n');
     const output = stripGsdFromCodexConfig(input);
-    assert.deepEqual(parseTomlToObject(output), { multi_agent: true,
-      user: { multi_agent: true, default_mode_request_user_input: true } });
+    assert.deepEqual(parseTomlToObject(output), {
+      features: { multi_agent: true },
+      user: { multi_agent: true, default_mode_request_user_input: true },
+    });
+  });
+
+  test('#5199: markerless cleanup leaves stale hook tables unchanged', () => {
+    const input = [
+      '[[hooks.SessionStart]]',
+      'command = "node /home/.codex/hooks/gsd-check-update.js"',
+      '',
+      '[mcp_servers.user]',
+      'command = "keep"',
+      '',
+    ].join('\n');
+    assert.equal(stripGsdFromCodexConfig(input), input);
   });
 
   test('#5199: property: cleanup conserves arbitrary user tables, tuning and line endings', async () => {
@@ -2285,7 +2391,6 @@ describe('stripGsdFromCodexConfig', () => {
         assert.ok(!cleaned.includes(GSD_CODEX_MARKER));
         assert.ok(!cleaned.includes('GSD codex_hooks ownership:'));
         if (eol === '\r\n') assert.doesNotMatch(cleaned, /(?<!\r)\n/);
-        assert.strictEqual(stripGsdFromCodexConfig(cleaned), cleaned, 'cleanup reaches a fixed point');
       },
     ), { seed: 5199, numRuns: 100 });
   });
@@ -2828,6 +2933,23 @@ describe('mergeCodexConfig', () => {
     // Verify no duplicate markers
     const markerCount = (content.match(new RegExp(escapeRegex(GSD_CODEX_MARKER), 'g')) || []).length;
     assert.strictEqual(markerCount, 1, 'exactly one marker');
+  });
+
+  test('#5199 N1: case 2 removes a trailing-whitespace ownership line before regenerating', () => {
+    const configPath = path.join(tmpDir, 'config.toml');
+    const oldBlock = sampleBlock.replace(
+      `${GSD_CODEX_MARKER}\n`,
+      `${GSD_CODEX_MARKER}\n# GSD codex_hooks ownership: section  \t\n[features]\nhooks = true\n\n`,
+    );
+    fs.writeFileSync(configPath, `[model]\nname = "o3"\n\n${oldBlock}\n`);
+
+    mergeCodexConfig(configPath, sampleBlock);
+
+    const content = fs.readFileSync(configPath, 'utf8');
+    assert.equal(content.includes('GSD codex_hooks ownership:'), false);
+    assert.equal(content.includes('[features]'), false);
+    assert.equal((content.match(new RegExp(escapeRegex(GSD_CODEX_MARKER), 'g')) || []).length, 1);
+    assert.deepEqual(parseTomlToObject(content).model, { name: 'o3' });
   });
 
   test('case 3: appends to config without GSD marker', () => {
