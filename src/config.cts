@@ -92,6 +92,9 @@ const SHIP_PR_BODY_TEMPLATE_TOKENS = new Set([
 ]);
 const SHIP_PR_BODY_SOURCE_RE = /^(ROADMAP|PLAN|SUMMARY|VERIFICATION|STATE|REQUIREMENTS|CONTEXT)\.md\s+##\s+[^\r\n#][^\r\n]*$/;
 
+/** Allowed values of `git.repo_tagging` (#5706): `single` is the default. */
+const VALID_REPO_TAGGING_MODES: readonly string[] = Object.freeze(['single', 'per_repo']);
+
 // ADR-612 PR-5: configuration accepts every convention the runtime can read.
 // Keep this distinct from roadmap-upgrade's supported target set: sequential
 // is valid project configuration but is not a migration destination.
@@ -318,6 +321,7 @@ function planNewProjectConfig(userChoices: Record<string, unknown>): NewProjectC
     git: {
       branching_strategy: CONFIG_DEFAULTS.branching_strategy,
       create_tag: true,
+      repo_tagging: 'single',
       phase_branch_template: CONFIG_DEFAULTS.phase_branch_template,
       milestone_branch_template: CONFIG_DEFAULTS.milestone_branch_template,
       quick_branch_template: CONFIG_DEFAULTS.quick_branch_template,
@@ -1171,6 +1175,9 @@ function validateConfigValue(cwd: string, kp: string, parsedValue: unknown, val:
       error(`Invalid git.create_tag '${val}'. Must be a boolean (true or false).`);
     }
   }
+
+  // #5706 (epic #3628): per-repository milestone tagging mode, enum only.
+  if (kp === 'git.repo_tagging') assertEnumValue(parsedValue, val, VALID_REPO_TAGGING_MODES, 'git.repo_tagging');
 
   if (kp === 'git.protected_branches') {
     if (!isValidProtectedBranches(parsedValue)) {

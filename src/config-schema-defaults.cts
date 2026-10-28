@@ -20,6 +20,9 @@ const SCHEMA_DEFAULTS: Record<string, unknown> = {
   'planner.stall_detect_interval_minutes': 5,
   'planner.stall_threshold_minutes': 10,
   'git.create_tag': true,
+  // #5706 (epic #3628): per-repository milestone tagging mode. `single` is
+  // exactly the pre-existing behavior; `per_repo` is opt-in.
+  'git.repo_tagging': 'single',
   // #1689: per-plan agent_hint executor routing — default-on. A no-op for plans
   // without an agent_hint field, so existing dispatch is byte-identical.
   'workflow.agent_hint_routing': true,
