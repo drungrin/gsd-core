@@ -14,7 +14,7 @@
  *   - staging atomicity: validation failure leaves no dir under capabilities/
  */
 
-const { describe, test, beforeEach, afterEach } = require('node:test');
+const { describe, test, beforeEach, afterEach, mock } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -929,6 +929,52 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
     assert.equal(promoted.integrity, null, 'Git sources keep their existing null byte-SRI result');
   });
 
+  test('real clone with a pinned ref checks out before metadata removal', async (t) => {
+    const f = fixture(t);
+    git(f.repo, 'tag', 'metadata-fixture-ref');
+    const project = path.join(f.root, 'ref-project');
+    fs.mkdirSync(project);
+    const result = await resolveCapabilitySource(`${f.spec}#metadata-fixture-ref`, {
+      gsdHome: project,
+      hostVersion: '1.16.0',
+      promote: false,
+      execOverrides: { git: f.execGit },
+    });
+    t.after(() => cleanup(result.stagedDir));
+    assert.equal(result.id, f.cap.id);
+    assert.equal(fs.existsSync(path.join(result.stagedDir, '.git')), false);
+    assert.ok(f.clones.length > 0, 'fixture must observe the real scratch clone');
+  });
+
+  test('metadata removal failure rejects before staging and cleans the scratch clone', async (t) => {
+    const f = fixture(t);
+    const project = path.join(f.root, 'remove-failure-project');
+    fs.mkdirSync(project);
+    const originalRmSync = fs.rmSync;
+    mock.method(fs, 'rmSync', (target, options) => {
+      if (path.basename(target) === '.git' && f.clones.includes(path.dirname(target))) {
+        throw new Error('metadata removal refused by fixture');
+      }
+      // eslint-disable-next-line local/no-raw-rmsync-in-tests -- delegate non-target cleanup through the saved implementation while rmSync is mocked
+      return originalRmSync(target, options);
+    });
+    t.after(() => mock.restoreAll());
+
+    await assert.rejects(() => resolveCapabilitySource(f.spec, {
+      gsdHome: project,
+      hostVersion: '1.16.0',
+      execOverrides: { git: f.execGit },
+    }), /metadata removal refused by fixture/);
+    const stagingRoot = path.join(project, '.gsd', 'capabilities', '.staging');
+    assert.equal(
+      fs.existsSync(stagingRoot) ? fs.readdirSync(stagingRoot).length : 0,
+      0,
+      'shared staging must not start after metadata removal fails',
+    );
+    assert.ok(f.clones.length > 0, 'fixture must observe the scratch clone');
+    assert.ok(f.clones.every((dir) => !fs.existsSync(dir)), 'failure must clean every scratch clone');
+  });
+
   test('consent stays bound to checkout content', async (t) => {
     const { f, project, stagedHash, promoted } = await stagedFixture(t);
     const consentHome = path.join(f.root, 'consent-home');
@@ -943,7 +989,7 @@ describe('#5298 — Git source excludes only cloned .git metadata', () => {
 
   test('git add stages regular files rather than an embedded repository', async (t) => {
     const { f, project } = await stagedFixture(t);
-    const add = realExecGit(['-C', project, 'add', '-A'], { timeout: GIT_TIMEOUT_MS });
+    const add = realExecGit(['-c', 'core.excludesFile=', '-C', project, 'add', '-A'], { timeout: GIT_TIMEOUT_MS });
     assert.equal(add.exitCode, 0, add.stderr);
     assert.doesNotMatch(add.stderr, /embedded git repository/i);
     const entries = splitLines(git(project, 'ls-files', '--stage')).filter(Boolean);
