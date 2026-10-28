@@ -16,6 +16,7 @@ const path = require('path');
 const os = require('os');
 const { runGsdTools, createTempProject, createTempDir, cleanup } = require('./helpers.cjs');
 const { splitLines } = require('../gsd-core/bin/lib/text-lines.cjs');
+const { collectSections, tokenizeHeadings } = require('../gsd-core/bin/lib/markdown-sectionizer.cjs');
 const fc = require('./helpers/fast-check-setup.cjs');
 const { gitOrThrow, throwIfFailed } = require('./helpers/git-fixture.cjs');
 const { runNode } = require('./helpers/process-seam.cjs');
@@ -1292,6 +1293,7 @@ describe('scaffold command', () => {
 
   test('#5202: scaffolded verification reads missing and routes to execute-phase', () => {
     const phaseDir = scaffoldVerification();
+    const reportPath = path.join(phaseDir, '03-VERIFICATION.md');
     const result = runGsdTools(['verification', 'status', phaseDir], tmpDir);
     assert.equal(result.exitCode, 0, result.error);
     const status = JSON.parse(result.output);
@@ -1299,9 +1301,28 @@ describe('scaffold command', () => {
     assert.equal(status.route, 'execute-phase');
     assert.equal(status.next_command, '/gsd-execute-phase 03');
 
-    const frontmatter = runGsdTools(['frontmatter', 'get', path.join(phaseDir, '03-VERIFICATION.md')], tmpDir);
+    const frontmatter = runGsdTools(['frontmatter', 'get', reportPath], tmpDir);
     assert.equal(frontmatter.exitCode, 0, frontmatter.error);
-    assert.equal(Object.hasOwn(JSON.parse(frontmatter.output), 'status'), false);
+    const metadata = JSON.parse(frontmatter.output);
+    assert.deepEqual(Object.keys(metadata).sort(), ['created', 'name', 'phase']);
+    assert.equal(metadata.phase, '03');
+    assert.equal(metadata.name, 'api');
+    assert.equal(Number.isNaN(Date.parse(metadata.created)), false, 'created must be an ISO-compatible date');
+
+    const document = fs.readFileSync(reportPath, 'utf8');
+    assert.deepEqual(
+      tokenizeHeadings(document).map(({ level, text }) => ({ level, text })),
+      [
+        { level: 1, text: 'Phase 3: api — Verification' },
+        { level: 2, text: 'Goal-Backward Verification' },
+        { level: 2, text: 'Checks' },
+        { level: 2, text: 'Result' },
+      ],
+    );
+    const resultSection = collectSections(document, (heading) => heading.level <= 2)
+      .find((section) => section.heading.text === 'Result');
+    assert.ok(resultSection, 'scaffold must contain a Result section');
+    assert.equal(resultSection.body.trim(), '_Pending verification_');
   });
 
   test('#5202: scaffolded verification gives phase uat-passed a negative verdict without a vocabulary error', () => {
