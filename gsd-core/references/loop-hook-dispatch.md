@@ -35,7 +35,8 @@ Dispatch the referenced unit. Exactly one of `ref.skill`, `ref.agent`, or `ref.c
 
 - `ref.skill` present → keep `activeHooks[].ref.skill` bare and dispatch it as
   `Skill(skill="gsd-" + ref.skill)`. The rendered `### Step N: skill:gsd-<name>` heading already
-  displays that prefixed id; never apply another prefix to the rendered heading text.
+  displays that prefixed id: the invocable id is exactly the text after `skill:`. Never apply
+  another prefix to the rendered heading text or include the `skill:` label in the id.
 - `ref.agent` present → dispatch via the Agent tool with `subagent_type` = `ref.agent`.
   Before dispatching an agent, print the canonical liveness banner so users know silence
   is expected and do not kill a healthy agent:

@@ -838,7 +838,10 @@ describe('renderLoopHooks', () => {
   test('skill prefix projection is deterministic and does not mutate any hook refs', async () => {
     await fc.assert(fc.property(
       fc.constantFrom(...CANONICAL_POINTS),
-      fc.array(fc.stringMatching(/^[a-z][a-z0-9-]{0,39}$/), { minLength: 1, maxLength: 8 }),
+      fc.array(
+        fc.stringMatching(/^[a-z][a-z0-9-]{0,39}$/).filter((skill) => !skill.startsWith('gsd-')),
+        { minLength: 1, maxLength: 8 },
+      ),
       (point, skills) => {
         const steps = skills.map((skill, index) => ({ capId: `cap-${index}`, point, ref: { skill } }));
         steps.push(
