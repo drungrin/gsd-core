@@ -87,15 +87,7 @@ Present plan identification, wait for confirmation.
 </step>
 
 <step name="record_start_time">
-This step starts a fresh workflow invocation: overwrite any abandoned marker from an
-earlier attempt and discard its cached result. Checkpoint continuation inside this invocation
-resumes after this step and therefore keeps the original start (#5212).
-```bash
-TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
-TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-rm -f -- "$TIMING_FILE.result"
-printf '%s\n' "$(date +%s)" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$TIMING_FILE"
-```
+Read and execute `gsd-core/workflows/execute-plan/steps/record-start-time.md`. Replace `{timing_attempt}` with `fresh` for a new workflow invocation, or `continuation` when resuming completed-task/checkpoint state. The part's shell guard decides whether to replace or preserve the marker (#5212).
 </step>
 
 <step name="parse_segments">
@@ -432,31 +424,8 @@ handles STATE.md/ROADMAP.md updates centrally after merging worktrees to avoid
 merge conflicts).
 
 Update STATE.md using gsd_run query (or legacy gsd-tools) state mutations:
-
-```bash
-# Auto-detect parallel mode: .git is a file in worktrees, a directory in main repo
-IS_WORKTREE=$([ -f .git ] && echo "true" || echo "false")
-
-# Skip in parallel mode — orchestrator handles STATE.md centrally
-if [ "$IS_WORKTREE" != "true" ]; then
-  # Resolve the metric before the first STATE mutation. A missing/corrupt
-  # result must not leave STATE.md half-updated.
-  TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
-  TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-  DURATION=$(tail -n 1 "$TIMING_FILE.result") || exit 1
-
-  # Advance plan counter (handles last-plan edge case)
-  gsd_run query state.advance-plan
-
-  # Recalculate progress bar from disk state
-  gsd_run query state.update-progress
-
-  # Record execution metrics
-  gsd_run query state.record-metric \
-    --phase "{phase}" --plan "{plan}" --duration "${DURATION}" \
-    --tasks "${TASK_COUNT}" --files "${FILE_COUNT}"
-fi
-```
+Read and execute `gsd-core/workflows/execute-plan/steps/update-current-position.md`.
+The part validates the cached measured duration before any STATE write; a missing or malformed result stops without partial progress.
 </step>
 
 <step name="extract_decisions_and_issues">
@@ -503,7 +472,7 @@ IS_WORKTREE=$([ -f .git ] && echo "true" || echo "false")
 
 if [ "$IS_WORKTREE" != "true" ]; then
   # use_worktrees: false → this handler is the sole post-plan sync point (#2661)
-  gsd_run query roadmap.update-plan-progress "${PHASE}"
+  PROGRESS=$(gsd_run query roadmap.update-plan-progress "${PHASE}") && REASON=$(jq -er '.reason//""' <<<"$PROGRESS") && [ "$REASON" != missing_phase_details ] || { echo "ERROR: ROADMAP update-plan-progress did not complete for ${PHASE}-${PLAN} (missing_phase_details decline, failed query, or jq not installed). STOP: skip this plan's completion steps." >&2; exit 1; }
 fi
 ```
 Counts PLAN vs SUMMARY files on disk. Updates progress table row with correct count and status (`In Progress` or `Complete` with date).
@@ -571,11 +540,7 @@ gsd_run query commit "" --files .planning/codebase/*.md --amend
 
 <step name="clear_plan_timing">
 After successful close-out (including intentional metadata skips), remove the markers. Retain them on checkpoints or failures for continuation.
-```bash
-TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
-TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-rm -f -- "$TIMING_FILE" "$TIMING_FILE.result"
-```
+Read and execute `gsd-core/workflows/execute-plan/steps/clear-plan-timing.md`.
 </step>
 
 <step name="offer_next">

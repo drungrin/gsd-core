@@ -102,13 +102,7 @@ Parse: frontmatter (phase, plan, type, autonomous, wave, depends_on), objective,
 </step>
 
 <step name="record_start_time">
-Fresh: overwrite timing. Continuation (`<completed_tasks>`): skip and retain the start (#5212).
-```bash
-TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
-TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-rm -f -- "$TIMING_FILE.result"
-printf '%s\n' "$(date +%s)" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$TIMING_FILE"
-```
+Read and execute `gsd-core/workflows/execute-plan/steps/record-start-time.md`. Replace `{timing_attempt}` with `fresh` when this prompt has no `<completed_tasks>` payload, or `continuation` when it does. The part's shell guard, not step-skipping prose, decides whether the marker is replaced or preserved (#5212).
 </step>
 
 <worktree_metadata_capture>
@@ -646,22 +640,7 @@ file individually. If a file appears untracked but is not part of your task, lea
 </destructive_git_prohibition>
 
 <step name="record_completion_time">
-After verification, before SUMMARY; rerun after more work to refresh completion.
-```bash
-TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
-TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-{ read -r PLAN_START_EPOCH; read -r PLAN_START_TIME; } < "$TIMING_FILE" || exit 1
-[[ "$PLAN_START_EPOCH" =~ ^[0-9]+$ ]] || exit 1
-PLAN_END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-DURATION_MIN=$(( ($(date +%s) - PLAN_START_EPOCH) / 60 ))
-if [[ $DURATION_MIN -ge 60 ]]; then
-  DURATION="$(( DURATION_MIN / 60 ))h $(( DURATION_MIN % 60 ))m"
-else
-  DURATION="${DURATION_MIN} min"
-fi
-printf '%s\n' "$PLAN_START_TIME" "$PLAN_END_TIME" "$DURATION" > "$TIMING_FILE.result"
-printf '{"duration":"%s","started":"%s","completed":"%s"}\n' "$DURATION" "$PLAN_START_TIME" "$PLAN_END_TIME"
-```
+After verification, before SUMMARY, read and execute `gsd-core/workflows/execute-plan/steps/record-completion-time.md`; rerun it after more work to refresh completion. A continuation must use the original worktree whose Git metadata owns the marker; follow the part's recovery diagnostic instead of creating a new start.
 </step>
 
 <summary_creation>
@@ -790,36 +769,17 @@ Do NOT skip. Do NOT proceed to state updates if self-check fails.
 </self_check>
 
 <state_updates>
-After SUMMARY.md, update STATE.md using `gsd-tools query` state handlers (named flags):
+After SUMMARY.md, update ROADMAP.md progress FIRST, then STATE.md. The ROADMAP write is the step that can decline (`missing_phase_details`), and a decline stops the plan before any STATE.md write, so STATE.md never advances past a plan the ROADMAP did not record:
 
 ```bash
-# Resolve first; a bad result must leave STATE untouched.
-TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
-TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-DURATION=$(tail -n 1 "$TIMING_FILE.result") || exit 1
-
-gsd_run query state.advance-plan
-gsd_run query state.update-progress
-gsd_run query state.record-metric \
-  --phase "{phase}" --plan "{plan}" --duration "${DURATION}" \
-  --tasks "${TASK_COUNT}" --files "${FILE_COUNT}"
-
-# Add decisions (extract from SUMMARY.md key-decisions)
-# --phase is required here: without it the verb falls back to STATE.md's global
-# pointer, which misattributes decisions when plans execute out of pointer order (#4763).
-for decision in "${DECISIONS[@]}"; do
-  gsd_run query state.add-decision --phase "${PHASE}" --summary "${decision}"
-done
-
-# Update session info (stopped-at, resume-file; timestamp set automatically)
-gsd_run query state.record-session \
-  --stopped-at "Completed ${PHASE}-${PLAN}-PLAN.md" --resume-file "None"
+# Update ROADMAP.md progress for this phase (plan counts, status). A decline stops here, before STATE.md moves.
+PROGRESS=$(gsd_run query roadmap.update-plan-progress "${PHASE_NUMBER}") && REASON=$(jq -er '.reason//""' <<<"$PROGRESS") && [ "$REASON" != missing_phase_details ] || { echo "ERROR: ROADMAP update-plan-progress did not complete for ${PHASE_NUMBER}-${PLAN} (missing_phase_details decline, failed query, or jq not installed). STOP: skip this plan's completion steps." >&2; exit 1; }
 ```
 
-```bash
-# Update ROADMAP.md progress for this phase (plan counts, status)
-gsd_run query roadmap.update-plan-progress "${PHASE_NUMBER}"
+Then update STATE.md using `gsd-tools query` state handlers (named flags):
+Read and execute `gsd-core/workflows/execute-plan/steps/executor-state-updates.md`. It resolves and validates the cached duration before the first STATE mutation, then records the metric, decisions, and session.
 
+```bash
 # Mark completed requirements from PLAN.md frontmatter
 # Extract the `requirements` array from the plan's frontmatter, then mark each complete
 gsd_run query requirements.mark-complete ${REQ_IDS}
@@ -886,14 +846,10 @@ the regression #3678 reported, where the agent leaks `.planning/` artifacts
 into the user's project history.
 </final_commit>
 
-<plan_timing_cleanup>
+<clear_plan_timing>
 On successful close-out remove markers; retain them for checkpoint/failure continuation.
-```bash
-TIMING_KEY=$(printf '%s\0%s' "{phase}" "{plan}" | git hash-object --stdin) || exit 1
-TIMING_FILE=$(git rev-parse --git-path "gsd-plan-timing-$TIMING_KEY") || exit 1
-rm -f -- "$TIMING_FILE" "$TIMING_FILE.result"
-```
-</plan_timing_cleanup>
+Read and execute `gsd-core/workflows/execute-plan/steps/clear-plan-timing.md`.
+</clear_plan_timing>
 
 <completion_format>
 ```markdown
