@@ -304,6 +304,14 @@ describe('#5297 git adapter — exact pinned target', {
     }
   }
 
+  function assertScratchClonesRemoved(context) {
+    assert.ok(cloneDirs.length > 0, `${context}: fixture must observe at least one scratch clone`);
+    assert.ok(
+      cloneDirs.every((dir) => !fs.existsSync(path.dirname(dir))),
+      `${context}: every scratch clone must be removed`,
+    );
+  }
+
   for (const fragment of ['#v0.3.0', '#tag:v0.3.0', '#TAG:v0.3.0']) {
     test(`${fragment} installs the annotated tag behind the default tip`, async () => {
       await assertTarget(fragment, '0.3.0', 'annotated tag behind default tip', commits.tag);
@@ -346,7 +354,44 @@ describe('#5297 git adapter — exact pinned target', {
       gsdHome, hostVersion: '1.5.0', execOverrides: { git: localGit },
     }), /git fetch "missing-release" failed/);
     assert.strictEqual(fs.existsSync(path.join(gsdHome, '.gsd', 'capabilities', 'pinned-cap')), false);
-    assert.ok(cloneDirs.every((dir) => !fs.existsSync(path.dirname(dir))), 'fetch failure cleans the scratch directory');
+    assertScratchClonesRemoved('fetch failure');
+  });
+
+  for (const fragment of ['#tag:main', '#tag:HEAD', '#tag:origin/main']) {
+    test(`${fragment} cannot fall back from a missing typed tag to a local commit-ish`, async () => {
+      await assert.rejects(() => resolveCapabilitySource(`${sourceUrl}${fragment}`, {
+        gsdHome, hostVersion: '1.5.0', execOverrides: { git: localGit },
+      }), /git fetch .* failed/);
+      assert.strictEqual(fs.existsSync(path.join(gsdHome, '.gsd', 'capabilities', 'pinned-cap')), false);
+      assertScratchClonesRemoved(`${fragment} fetch failure`);
+    });
+  }
+
+  test('checkout failure cleans the scratch clone', async () => {
+    const checkoutFailGit = (args, opts) => {
+      if (args.includes('checkout')) {
+        return { exitCode: 1, stdout: '', stderr: 'checkout refused', signal: null, error: null };
+      }
+      return localGit(args, opts);
+    };
+    await assert.rejects(() => resolveCapabilitySource(`${sourceUrl}#v0.3.0`, {
+      gsdHome, hostVersion: '1.5.0', execOverrides: { git: checkoutFailGit },
+    }), /git checkout .* failed/);
+    assertScratchClonesRemoved('checkout failure');
+  });
+
+  test('missing cloned manifest cleans the scratch clone', async () => {
+    const missingManifestGit = (args, opts) => {
+      const result = localGit(args, opts);
+      if (result.exitCode === 0 && args.includes('clone')) {
+        cleanup(path.join(args.at(-1), 'capability.json'));
+      }
+      return result;
+    };
+    await assert.rejects(() => resolveCapabilitySource(sourceUrl, {
+      gsdHome, hostVersion: '1.5.0', execOverrides: { git: missingManifestGit },
+    }), /capability\.json not found/);
+    assertScratchClonesRemoved('missing manifest');
   });
 
   test('tip-local commit-ish spellings retain shallow-checkout compatibility', async () => {
@@ -404,6 +449,11 @@ describe('#5297 git adapter — normalized ref safety', () => {
         ['tag:tag:', /fetch refspec not allowed/],
         ['sha:sha:', /fetch refspec not allowed/],
         ['sha:main', /sha: pin must be a full 40- or 64-hex object name/],
+        [`sha:${'a'.repeat(39)}`, /sha: pin must be a full 40- or 64-hex object name/],
+        [`sha:${'a'.repeat(41)}`, /sha: pin must be a full 40- or 64-hex object name/],
+        [`sha:${'a'.repeat(63)}`, /sha: pin must be a full 40- or 64-hex object name/],
+        [`sha:${'a'.repeat(65)}`, /sha: pin must be a full 40- or 64-hex object name/],
+        [`sha:${'g'.repeat(40)}`, /sha: pin must be a full 40- or 64-hex object name/],
       ];
       for (const [fragment, expected] of cases) {
         await assert.rejects(() => resolveCapabilitySource(`https://example.com/repo.git#${fragment}`, {
@@ -414,6 +464,27 @@ describe('#5297 git adapter — normalized ref safety', () => {
       assert.strictEqual(fs.existsSync(path.join(gsdHome, '.gsd', 'capabilities')), false);
     } finally {
       cleanup(gsdHome);
+    }
+  });
+
+  test('full 40- and 64-hex sha pins pass validation and reach Git', async (t) => {
+    const gsdHome = createTempDir('gsd-ref-full-sha-');
+    t.after(() => cleanup(gsdHome));
+    for (const value of ['a'.repeat(40), 'b'.repeat(64)]) {
+      const calls = [];
+      const fakeGit = (args) => {
+        calls.push([...args]);
+        if (args.includes('clone')) {
+          fs.mkdirSync(args.at(-1), { recursive: true });
+          fs.writeFileSync(path.join(args.at(-1), 'capability.json'), JSON.stringify(featureCap(`sha-${value.length}`)));
+        }
+        return spawnOk('');
+      };
+      const result = await resolveCapabilitySource(`https://example.com/repo.git#sha:${value}`, {
+        gsdHome, hostVersion: '1.5.0', promote: false, execOverrides: { git: fakeGit },
+      });
+      assert.ok(calls.some((args) => args.includes('fetch')), `${value.length}-hex pin must reach fetch`);
+      cleanup(result.stagedDir);
     }
   });
 });

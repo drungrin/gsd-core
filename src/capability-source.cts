@@ -1038,7 +1038,7 @@ function resolveGit(
   const ref = classifyGitRef(parsed);
   // Validate AFTER removing typed prefixes: tag:--foo must not bypass parseSpec's
   // raw leading-dash check. Empty typed pins must not fall back to default HEAD.
-  if (ref.value.startsWith('+') || (ref.value.includes(':') && !isEmptyTypedPin)) {
+  if (ref.value.startsWith('+') || ref.value.includes(':')) {
     throw new Error(`Unsafe git ref (fetch refspec not allowed): "${parsed.ref}"`);
   }
   if (ref.value.startsWith('-')) {
@@ -1075,8 +1075,11 @@ function resolveGit(
       ], { timeout: 60_000 });
       let checkoutTarget = 'FETCH_HEAD';
       if (fetchResult.exitCode !== 0) {
+        if (ref.kind !== 'bare') {
+          throw new Error(`git fetch "${parsed.ref}" failed (exit ${fetchResult.exitCode}): ${fetchResult.stderr}`);
+        }
         // Preserve commit-ish spellings the former shallow-clone checkout
-        // accepted when the target is already present at the cloned tip.
+        // accepted when a BARE target is already present at the cloned tip.
         const localResult = execGit([
           ...gitConfig, '-C', cloneDir, 'rev-parse', '--verify', `${ref.value}^{commit}`,
         ], { timeout: 60_000 });
