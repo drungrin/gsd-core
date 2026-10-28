@@ -334,7 +334,7 @@ describe('auto-update', () => {
   }
 
   describe('hook — bail paths (no side effects)',
-    { skip: isWindows },
+    { skip: isWindows ? 'POSIX-only: harness spawns bash + kill -0 + sleep; the hook itself is a bash script under test' : false },
     () => {
     test('non-Bash tool call exits 0 with no status file', (t) => {
       const tmpDir = createTempGitRepo({
@@ -499,7 +499,7 @@ describe('auto-update', () => {
   });
 
   describe('hook — dispatch path (all gates pass)',
-    { skip: isWindows },
+    { skip: isWindows ? 'POSIX-only: harness spawns bash + kill -0 + sleep; the hook itself is a bash script under test' : false },
     () => {
     test('writes status file with status=running synchronously before returning', async (t) => {
       const tmpDir = createTempGitRepo({
@@ -661,7 +661,7 @@ describe('auto-update', () => {
   // the tool name needs normalization. Pre-fix, the Gate 1 `== "Bash"` check
   // never matched on Kimi and the auto-rebuild was silently dormant.
   describe('hook — Kimi tool vocabulary (#2304)',
-    { skip: isWindows },
+    { skip: isWindows ? 'POSIX-only: harness spawns bash to invoke the .sh hook under test' : false },
     () => {
     test('dispatches on Kimi tool_name Shell (all gates pass)', async (t) => {
       const tmpDir = createTempGitRepo({
@@ -726,14 +726,15 @@ describe('auto-update', () => {
     });
   });
 
-  describe('hook — runtime query commit recognition (#5332)', { skip: isWindows }, () => {
+  describe('hook — runtime query commit recognition (#5332)', {
+    skip: isWindows ? 'POSIX-only: harness spawns bash to invoke the .sh hook under test' : false,
+  }, () => {
     const runtimeCommands = [
       ['gsd_run', () => 'gsd_run query commit "docs: complete plan" --files .planning/STATE.md'],
       ['canonical multiline launcher', () => fs.readFileSync(
         path.join(__dirname, '..', 'gsd-core/workflows/_runtime-launcher.snippet.sh'), 'utf8',
       ) + '\ngsd_run query commit "docs: complete plan" --files .planning/STATE.md'],
       ['gsd-tools.cjs', () => 'gsd-tools.cjs query commit "docs: complete plan" --files .planning/STATE.md'],
-      ['global --cwd before query', () => 'gsd_run --cwd "$ONBOARDING_ROOT" query commit "docs: complete plan" --files .planning/STATE.md'],
       ['path-prefixed legacy launcher', () => '/opt/gsd/bin/gsd-tools query commit "docs: complete plan" --files .planning/STATE.md'],
       ['quoted node entrypoint', () => 'node "$HOME/.claude/gsd-core/bin/gsd-tools.cjs" query commit "docs: complete plan" --files .planning/STATE.md'],
       ['single-quoted node entrypoint', () => "node '/tmp/GSD install/gsd-tools.cjs' query commit 'docs: complete plan' --files .planning/STATE.md"],
@@ -792,6 +793,24 @@ describe('auto-update', () => {
       }
     }
 
+    for (const command of [
+      'gsd_run --cwd "/tmp/other project" query commit "docs: plan" --files .planning/STATE.md',
+      'gsd_run --cwd=/tmp/other query commit "docs: plan" --files .planning/STATE.md',
+      'gsd_run --ws feature query commit "docs: plan" --files .planning/STATE.md',
+      'gsd_run --raw query commit "docs: plan" --files .planning/STATE.md',
+      'gsd_run --cwd /tmp/other --raw query commit "docs: plan" --files .planning/STATE.md',
+    ]) {
+      test(`does not dispatch a global-flag command whose target context the hook cannot resolve: ${command}`, (t) => {
+        const tmpDir = createTempGitRepo({ config: { graphify: { enabled: true, auto_update: true } } });
+        t.after(() => cleanupHookRepo(tmpDir));
+        const mockBin = makeMockGraphifyBin(tmpDir);
+        const result = runHook(tmpDir, { tool_name: 'Bash', tool_input: { command } }, { pathPrepend: mockBin });
+        assert.strictEqual(result.status, 0);
+        assert.ok(!fs.existsSync(path.join(tmpDir, '.planning/graphs/.last-build-status.json')),
+          'a global-flag command must not dispatch against the hook process cwd');
+      });
+    }
+
     for (const launcher of ['gsd_run', 'gsd-tools', 'node "$HOME/.claude/gsd-core/bin/gsd-tools.cjs"']) {
       for (const verb of ['commi', 'commits', 'config-get graphify.enabled', 'phase.complete 1', 'commit-to-subrepo "docs: plan" --files packages/foo']) {
         test(`does not dispatch for ${launcher} query ${verb}`, (t) => {
@@ -848,7 +867,7 @@ describe('auto-update', () => {
   });
 
   describe('hook — HEAD-advancing command matchers',
-    { skip: isWindows },
+    { skip: isWindows ? 'POSIX-only: harness spawns bash to invoke the .sh hook under test' : false },
     () => {
     for (const cmd of [
       'git commit -m fix',
