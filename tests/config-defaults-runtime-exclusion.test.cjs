@@ -11,7 +11,7 @@ const path = require('node:path');
 const { runGsdTools, createTempDir, cleanup, TOOLS_PATH, TEST_ENV_BASE } = require('./helpers.cjs');
 const fc = require('./helpers/fast-check-setup.cjs');
 const { MODEL_ALIAS_MAP, RUNTIME_PROFILE_MAP } = require('../gsd-core/bin/lib/model-catalog.cjs');
-const { PROJECT_MODEL_OMIT_WARNING } = require('../gsd-core/bin/lib/model-resolver.cjs');
+const { MODEL_RESOLVER_DIAGNOSTIC, PROJECT_MODEL_OMIT_WARNING } = require('../gsd-core/bin/lib/model-resolver.cjs');
 const { runNode, OUTCOME } = require('./helpers/process-seam.cjs');
 const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
@@ -97,13 +97,14 @@ describe('#5329 — shared omit must not become explicit project model intent', 
   });
   afterEach(() => cleanup(root));
 
-  function seed(defaults, command, choices = {}, cwd = project) {
+  function seed(defaults, command, choices = {}, cwd = project, activeRuntime = 'claude') {
     fs.writeFileSync(path.join(store, '.gsd', 'defaults.json'), JSON.stringify(defaults));
     const args = command === 'config-new-project'
       ? [command, JSON.stringify(choices)]
       : command === 'config-set-model-profile' ? [command, 'balanced'] : [command];
-    const result = runGsdTools(args, cwd, env);
+    const result = runGsdTools(args, cwd, { ...env, GSD_RUNTIME: activeRuntime });
     assert.equal(result.exitCode, 0, result.error);
+    assert.equal(result.error ?? '', '', 'project creation must not emit an omit diagnostic');
     const response = JSON.parse(result.output);
     if (command === 'config-set-model-profile') assert.equal(response.updated, true);
     else assert.equal(response.created, true);
@@ -150,8 +151,17 @@ describe('#5329 — shared omit must not become explicit project model intent', 
 
   for (const runtime of ['codex', 'opencode']) {
     test(`${runtime} still resolves its runtime tier map after project seeding`, () => {
-      seed({ resolve_model_ids: 'omit', runtime }, 'config-new-project');
+      seed({ resolve_model_ids: 'omit', runtime }, 'config-new-project', {}, project, runtime);
       assert.equal(resolve('gsd-executor', runtime).model, RUNTIME_PROFILE_MAP[runtime].sonnet.model);
+    });
+  }
+
+  for (const runtime of ['cline', 'kimi', 'kimi-code', 'cursor', 'windsurf', 'zcode', 'augment', 'trae', 'codebuddy', 'antigravity']) {
+    test(`${runtime} keeps shared omit because it has no runtime tier map`, () => {
+      const config = seed({ resolve_model_ids: 'omit', runtime }, 'config-new-project', {}, project, runtime);
+      assert.equal(config.resolve_model_ids, 'omit');
+      assert.equal(Object.hasOwn(config, 'runtime'), false);
+      assert.equal(resolve('gsd-executor', runtime).model, '');
     });
   }
 
@@ -173,6 +183,7 @@ describe('#5329 — shared omit must not become explicit project model intent', 
     assert.equal(result.exitCode, 0);
     assert.equal(JSON.parse(result.stdout).model, '');
     assert.equal(result.stderr, PROJECT_MODEL_OMIT_WARNING + '\n');
+    assert.equal(MODEL_RESOLVER_DIAGNOSTIC.PROJECT_MODEL_OMIT, 'project_model_omit');
     assert.deepEqual(fs.readFileSync(configPath), bytes);
   });
 

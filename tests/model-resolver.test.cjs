@@ -7074,6 +7074,20 @@ describe('#5329 — existing Claude project omit diagnostic', () => {
       }
       assert.equal(writes.length, 1, 'one project warning must cover all omitted agents');
       assert.deepEqual(writes, [modelResolver.PROJECT_MODEL_OMIT_WARNING + '\n']);
+      assert.equal(modelResolver.MODEL_RESOLVER_DIAGNOSTIC.PROJECT_MODEL_OMIT, 'project_model_omit');
+    });
+  });
+
+  test('global-only omit does not warn a Claude project', () => {
+    fs.mkdirSync(path.join(home, '.gsd'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.gsd', 'defaults.json'), JSON.stringify({ resolve_model_ids: 'omit' }));
+    withConfig({ model_profile: 'balanced' }, 'claude', writes => {
+      assert.equal(modelResolver.resolveModelInternal(project, 'gsd-executor'), 'sonnet');
+      assert.equal(
+        writes.includes(modelResolver.PROJECT_MODEL_OMIT_WARNING + '\n'),
+        false,
+        'a shared-only omit must not emit the project-omit diagnostic',
+      );
     });
   });
 
@@ -7119,5 +7133,21 @@ describe('#5329 — existing Claude project omit diagnostic', () => {
       assert.equal(modelResolver.resolveModelInternal(secondProject, 'gsd-planner'), '');
       assert.equal(secondWrites.length, 1);
     }, secondProject);
+  });
+
+  test('warning dedupe is scoped independently to each workstream', () => {
+    const config = { model_profile: 'balanced', resolve_model_ids: 'omit' };
+    withConfig(config, 'claude', writes => {
+      for (const workstream of ['alpha', 'beta']) {
+        process.env.GSD_WORKSTREAM = workstream;
+        const workstreamDir = path.join(project, '.planning', 'workstreams', workstream);
+        fs.mkdirSync(workstreamDir, { recursive: true });
+        fs.writeFileSync(path.join(workstreamDir, 'config.json'), JSON.stringify(config));
+        assert.equal(modelResolver.resolveModelInternal(project, 'gsd-executor'), '');
+        assert.equal(modelResolver.resolveModelInternal(project, 'gsd-planner'), '');
+      }
+      delete process.env.GSD_WORKSTREAM;
+      assert.equal(writes.length, 2, 'each workstream must emit its own first diagnostic');
+    });
   });
 });
