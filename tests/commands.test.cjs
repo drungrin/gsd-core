@@ -2637,6 +2637,57 @@ describe('websearch command', () => {
     assert.ok(output.error.includes('401'), 'error should include status code');
   });
 
+  for (const status of [301, 302, 303, 307, 308, 399]) {
+    test(`does not follow ${status} redirects (token must not leave Brave)`, async () => {
+      process.env.BRAVE_API_KEY = 'test-key';
+      let calls = 0;
+      let seenRedirect;
+
+      global.fetch = async (_url, init) => {
+        calls++;
+        seenRedirect = init.redirect;
+        return { ok: false, status, headers: new Headers({ location: 'http://other.example/x' }) };
+      };
+
+      await cmdWebsearch('test query', {}, false);
+
+      const output = JSON.parse(captured);
+      assert.strictEqual(seenRedirect, 'manual');
+      assert.strictEqual(output.available, false);
+      assert.strictEqual(output.error, `API error: ${status}`);
+      assert.strictEqual(calls, 1, 'no retry / second request');
+      assert.ok(!('attempts' in output), 'no attempts field');
+    });
+  }
+
+  test('real fetch: token never reaches the redirect target', async () => {
+    process.env.BRAVE_API_KEY = 'test-key';
+    const http = require('node:http');
+    const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+    const tHits = [];
+    let rHits = 0;
+    const T = http.createServer((req, res) => { tHits.push(req.headers['x-subscription-token']); res.end('{}'); });
+    const tPort = await listen(T);
+    const R = http.createServer((req, res) => {
+      rHits++;
+      res.writeHead(307, { Location: `http://127.0.0.1:${tPort}/x` });
+      res.end();
+    });
+    const rPort = await listen(R);
+    try {
+      global.fetch = (_url, init) => origFetch(`http://127.0.0.1:${rPort}/res/v1/web/search`, init);
+      await cmdWebsearch('test query', {}, false);
+      const output = JSON.parse(captured);
+      assert.strictEqual(output.available, false);
+      assert.strictEqual(output.error, 'API error: 307');
+      assert.strictEqual(rHits, 1);
+      assert.deepStrictEqual(tHits, [], 'token must never arrive at redirect target');
+    } finally {
+      R.close();
+      T.close();
+    }
+  });
+
   test('handles network failure', async () => {
     process.env.BRAVE_API_KEY = 'test-key';
 
@@ -4680,6 +4731,47 @@ describe('feat-3251: generated aliases dispatch through real gsd-tools behavior'
       const beforeFiles = snapshotProjectState(projectDir);
 
       const result = runGsdTools(['phase', 'mvp-mode', '1'], projectDir);
+      assert.equal(result.status, 0, result.stderr);
+
+      const output = JSON.parse(result.stdout);
+      assert.equal(output.active, true);
+      assert.equal(output.source, 'roadmap');
+      assert.equal(output.roadmap_mode, 'mvp');
+      assert.equal(output.config_mvp_mode, false);
+      assert.equal(output.cli_flag_present, false);
+      assert.deepEqual(snapshotProjectState(projectDir), beforeFiles);
+    } finally {
+      cleanup(projectDir);
+    }
+  });
+
+  test('phase.mvp-mode resolves persisted ROADMAP mode under a bracket heading without mutating files', () => {
+    const projectDir = createProject();
+    try {
+      fs.writeFileSync(
+        path.join(projectDir, '.planning', 'config.json'),
+        JSON.stringify({ project_code: 'CK', phase_id_convention: 'bracket' }, null, 2) + '\n',
+      );
+      fs.writeFileSync(
+        path.join(projectDir, '.planning', 'STATE.md'),
+        '---\nmilestone: v2.0\n---\n',
+      );
+      fs.writeFileSync(
+        path.join(projectDir, '.planning', 'ROADMAP.md'),
+        [
+          '# Roadmap',
+          '',
+          '## [CK.02] v2.0 — Current',
+          '',
+          '### [CK.02] 02: MVP feature',
+          '**Goal:** Ship the slice.',
+          '**Mode:** mvp',
+          '',
+        ].join('\n'),
+      );
+      const beforeFiles = snapshotProjectState(projectDir);
+
+      const result = runGsdTools(['phase', 'mvp-mode', '2'], projectDir);
       assert.equal(result.status, 0, result.stderr);
 
       const output = JSON.parse(result.stdout);
