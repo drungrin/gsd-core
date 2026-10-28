@@ -778,14 +778,21 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
     cmdGitBaseBranch(cwd, args.slice(2));
   }
 
-  function isFlagToken(arg) {
-    // Keep negative numbers and bare separators available to positional parsers.
+  function isConfigNewProjectFlagToken(arg) {
+    // This JSON-valued verb deliberately keeps negative numbers and bare separators
+    // available to its positional parser.
     return typeof arg === 'string' && /^--?[A-Za-z]/.test(arg);
+  }
+
+  function isClosedWorldFlagToken(arg) {
+    // Closed mutation verbs accept no dash-led positional values. Refuse typo
+    // shapes such as ---dry-run, --5, --, -1 and - before any write occurs.
+    return typeof arg === 'string' && arg.startsWith('-');
   }
 
   function rejectUnknownFlags(args, knownFlags, verb) {
     for (const arg of args) {
-      if (isFlagToken(arg) && !knownFlags.has(arg)) {
+      if (isClosedWorldFlagToken(arg) && !knownFlags.has(arg)) {
         error(`Unknown flag for ${verb}: ${arg}`, ERROR_REASON.USAGE);
       }
     }
@@ -881,7 +888,7 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
     const CONFIG_NEW_PROJECT_KNOWN_FLAGS = new Set(['--dry-run', '--raw']);
     const positionals = [];
     for (const a of args.slice(1)) {
-      if (isFlagToken(a)) {
+      if (isConfigNewProjectFlagToken(a)) {
         if (!CONFIG_NEW_PROJECT_KNOWN_FLAGS.has(a)) {
           error(`Unknown flag for config-new-project: ${a}`, ERROR_REASON.USAGE);
         }

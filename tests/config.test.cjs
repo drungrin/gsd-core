@@ -1601,6 +1601,7 @@ describe('#5286: config mutation routes reject unsupported flags before writing'
     { command: 'config-set-model-profile', positionals: ['quality'] },
     { command: 'migrate-config', positionals: [] },
   ];
+  const unsupportedFlags = ['--dry-run', '--bogus-flag', '---dry-run', '--5', '--', '-1', '-'];
   // Noncanonical bytes and a real legacy key expose both rewriting and migration.
   const legacyBytes = '{ "depth" : "comprehensive", "model_profile" : "balanced", "commit_docs" : false }\n';
 
@@ -1634,7 +1635,7 @@ describe('#5286: config mutation routes reject unsupported flags before writing'
     for (const prefix of [[], ['query']]) {
       const invocation = [...prefix, command].join(' ');
       for (const existing of [false, true]) {
-        for (const flag of ['--dry-run', '--bogus-flag']) {
+        for (const flag of unsupportedFlags) {
           test(`${invocation} ${flag} preserves ${existing ? 'existing' : 'absent'} config`, (t) => {
             const f = fixture(existing);
             t.after(() => cleanup(f.dir));
